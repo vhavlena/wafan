@@ -225,7 +225,7 @@ class TestSubsumptionSmt2:
         assert "str.lower" in smt2
 
     def test_unsupported_transform_raises(self):
-        r1 = make_rule(pattern="x", transforms=["urlDecode"])
+        r1 = make_rule(pattern="x", transforms=["__unknown_transform__"])
         r2 = make_rule(pattern="y")
         with pytest.raises(UnsupportedTransformError):
             subsumption_smt2(r1, r2)
@@ -286,7 +286,7 @@ class TestCheckPair:
 
     def test_unsupported_transform_returns_unknown(self):
         checker = SubsumptionChecker(ConstantSolver(SolverResult.UNSAT))
-        r1 = make_rule(transforms=["urlDecode"])
+        r1 = make_rule(transforms=["__unknown_transform__"])
         r2 = make_rule()
         assert checker.check_pair(r1, r2).result == SolverResult.UNKNOWN
 
@@ -546,7 +546,7 @@ class TestIntersectionSmt2:
         assert "str.lower" in intersection_smt2(r1, r2)
 
     def test_unsupported_transform_raises(self):
-        r1 = make_rule(pattern="x", transforms=["urlDecode"])
+        r1 = make_rule(pattern="x", transforms=["__unknown_transform__"])
         r2 = make_rule(pattern="y")
         with pytest.raises(UnsupportedTransformError):
             intersection_smt2(r1, r2)
@@ -586,7 +586,7 @@ class TestIntersectionCheckPair:
 
     def test_unsupported_transform_returns_unknown(self):
         checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
-        r1 = make_rule(transforms=["urlDecode"])
+        r1 = make_rule(transforms=["__unknown_transform__"])
         r2 = make_rule()
         assert checker.check_pair(r1, r2).result == SolverResult.UNKNOWN
 

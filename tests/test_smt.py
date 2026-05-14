@@ -9,6 +9,7 @@ from wafan.smt import (
     rules_to_smt,
     extract_transforms,
     apply_transforms_smt,
+    transform_preamble,
     SmtFormula,
     SMT_LOGIC,
     UnsupportedTransformError,
@@ -136,8 +137,8 @@ class TestApplyTransformsSmt:
         assert result == "(str.upper (str.lower BODY))"
 
     def test_unsupported_transform_raises(self):
-        with pytest.raises(UnsupportedTransformError, match="urlDecode"):
-            apply_transforms_smt("BODY", ["urlDecode"])
+        with pytest.raises(UnsupportedTransformError):
+            apply_transforms_smt("BODY", ["__unknown__"])
 
     def test_unsupported_transform_message_contains_name(self):
         with pytest.raises(UnsupportedTransformError) as exc_info:
@@ -269,9 +270,9 @@ class TestRxRuleToSmt:
         f = rx_rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["lowercase", "uppercase"]))
         assert "(str.upper (str.lower BODY))" in f.assertion
 
-    def test_unsupported_transform_raises(self):
+    def test_truly_unknown_transform_raises(self):
         with pytest.raises(UnsupportedTransformError):
-            rx_rule_to_smt(make_rule(transforms=["urlDecode"]))
+            rx_rule_to_smt(make_rule(transforms=["__unknown_transform__"]))
 
     def test_transform_applied_to_all_variables(self):
         rule = SecRule(
@@ -300,6 +301,182 @@ class TestRxRuleToSmt:
 # ---------------------------------------------------------------------------
 # rules_to_smt
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Uninterpreted transforms – apply_transforms_smt
+# ---------------------------------------------------------------------------
+
+UNINTERPRETED = [
+    "urlDecode", "urlDecodeUni", "htmlEntityDecode",
+    "removeWhitespace", "compressWhitespace", "removeNulls",
+    "trim", "trimLeft", "trimRight",
+    "normalizePath", "normalizePathWin",
+]
+
+SMT_NAMES = {
+    "urlDecode": "t_urlDecode",
+    "urlDecodeUni": "t_urlDecodeUni",
+    "htmlEntityDecode": "t_htmlEntityDecode",
+    "removeWhitespace": "t_removeWhitespace",
+    "compressWhitespace": "t_compressWhitespace",
+    "removeNulls": "t_removeNulls",
+    "trim": "t_trim",
+    "trimLeft": "t_trimLeft",
+    "trimRight": "t_trimRight",
+    "normalizePath": "t_normalizePath",
+    "normalizePathWin": "t_normalizePathWin",
+}
+
+
+class TestUninterpretedTransformExpression:
+    @pytest.mark.parametrize("t", UNINTERPRETED)
+    def test_wraps_with_smt_function(self, t):
+        result = apply_transforms_smt("VAR", [t])
+        assert f"({SMT_NAMES[t]} VAR)" == result
+
+    @pytest.mark.parametrize("t", UNINTERPRETED)
+    def test_case_insensitive_lookup(self, t):
+        result = apply_transforms_smt("VAR", [t.lower()])
+        assert SMT_NAMES[t] in result
+
+    def test_stacked_with_direct(self):
+        result = apply_transforms_smt("VAR", ["urlDecode", "lowercase"])
+        assert result == "(str.lower (t_urlDecode VAR))"
+
+    def test_unknown_still_raises(self):
+        with pytest.raises(UnsupportedTransformError):
+            apply_transforms_smt("VAR", ["__no_such_transform__"])
+
+
+class TestTransformPreamble:
+    @pytest.mark.parametrize("t", UNINTERPRETED)
+    def test_returns_fun_decl(self, t):
+        fun_decls, _ = transform_preamble([t])
+        assert len(fun_decls) == 1
+        assert f"(declare-fun {SMT_NAMES[t]}" in fun_decls[0]
+
+    @pytest.mark.parametrize("t", UNINTERPRETED)
+    def test_returns_axioms(self, t):
+        _, axioms = transform_preamble([t])
+        assert len(axioms) > 0
+
+    @pytest.mark.parametrize("t", UNINTERPRETED)
+    def test_axioms_are_assertions(self, t):
+        _, axioms = transform_preamble([t])
+        assert all(a.startswith("(assert ") for a in axioms)
+
+    def test_direct_transform_no_decl(self):
+        fun_decls, axioms = transform_preamble(["lowercase"])
+        assert fun_decls == []
+        assert axioms == []
+
+    def test_empty_transforms_empty_preamble(self):
+        assert transform_preamble([]) == ([], [])
+
+    def test_duplicate_transform_deduped(self):
+        fd1, ax1 = transform_preamble(["urlDecode"])
+        fd2, ax2 = transform_preamble(["urlDecode", "urlDecode"])
+        assert fd1 == fd2
+        assert ax1 == ax2
+
+    def test_two_different_transforms_two_decls(self):
+        fun_decls, _ = transform_preamble(["urlDecode", "htmlEntityDecode"])
+        assert len(fun_decls) == 2
+
+    def test_unknown_raises(self):
+        with pytest.raises(UnsupportedTransformError):
+            transform_preamble(["__unknown__"])
+
+    # Specific axiom content checks
+    def test_urldecode_idempotent_axiom(self):
+        _, axioms = transform_preamble(["urlDecode"])
+        assert any("t_urlDecode (t_urlDecode" in a for a in axioms)
+
+    def test_urldecode_length_axiom(self):
+        _, axioms = transform_preamble(["urlDecode"])
+        assert any("str.len" in a for a in axioms)
+
+    def test_urldecode_empty_axiom(self):
+        _, axioms = transform_preamble(["urlDecode"])
+        assert any('""' in a for a in axioms)
+
+    def test_removewhitespace_no_space_axiom(self):
+        _, axioms = transform_preamble(["removeWhitespace"])
+        combined = " ".join(axioms)
+        assert "str.contains" in combined
+        assert "not" in combined
+
+    def test_compresswhitespace_no_double_space_axiom(self):
+        _, axioms = transform_preamble(["compressWhitespace"])
+        assert any("  " in a for a in axioms)
+
+    def test_normalizepath_no_dotdot_axiom(self):
+        _, axioms = transform_preamble(["normalizePath"])
+        assert any("/../" in a for a in axioms)
+
+    def test_normalizepathwin_no_dotdot_axiom(self):
+        _, axioms = transform_preamble(["normalizePathWin"])
+        assert any("\\\\..\\\\" in a or "\\..\\".encode() in a.encode() for a in axioms)
+
+
+class TestSmtFormulaWithPreamble:
+    def test_fun_declarations_in_to_smt2(self):
+        rule = make_rule(var_name="BODY", pattern="x", transforms=["urlDecode"])
+        f = rx_rule_to_smt(rule)
+        smt2 = f.to_smt2()
+        assert "(declare-fun t_urlDecode" in smt2
+
+    def test_axioms_in_to_smt2(self):
+        rule = make_rule(var_name="BODY", pattern="x", transforms=["urlDecode"])
+        f = rx_rule_to_smt(rule)
+        smt2 = f.to_smt2()
+        assert "(assert (forall" in smt2
+
+    def test_fun_decl_before_declare_const(self):
+        rule = make_rule(var_name="BODY", pattern="x", transforms=["urlDecode"])
+        smt2 = rx_rule_to_smt(rule).to_smt2()
+        assert smt2.index("declare-fun") < smt2.index("declare-const")
+
+    def test_axioms_before_assert(self):
+        rule = make_rule(var_name="BODY", pattern="x", transforms=["urlDecode"])
+        smt2 = rx_rule_to_smt(rule).to_smt2()
+        # All forall axioms must appear before the final (assert (str.in_re
+        forall_pos = smt2.rfind("(assert (forall")
+        main_pos   = smt2.index("(assert (str.in_re")
+        assert forall_pos < main_pos
+
+    def test_uninterpreted_fn_in_assertion(self):
+        rule = make_rule(var_name="BODY", pattern="x", transforms=["urlDecode"])
+        f = rx_rule_to_smt(rule)
+        assert "t_urlDecode BODY" in f.assertion
+
+    def test_no_preamble_for_direct_transforms(self):
+        rule = make_rule(transforms=["lowercase"])
+        f = rx_rule_to_smt(rule)
+        assert f.fun_declarations == []
+        assert f.axioms == []
+
+    def test_stacked_uninterpreted_and_direct(self):
+        rule = make_rule(var_name="V", pattern="p", transforms=["urlDecode", "lowercase"])
+        f = rx_rule_to_smt(rule)
+        assert "str.lower (t_urlDecode V)" in f.assertion
+        assert len(f.fun_declarations) == 1
+
+    def test_htmlentitydecode_produces_preamble(self):
+        rule = make_rule(transforms=["htmlEntityDecode"])
+        f = rx_rule_to_smt(rule)
+        assert any("htmlEntityDecode" in d for d in f.fun_declarations)
+
+    @pytest.mark.parametrize("t", UNINTERPRETED)
+    def test_all_uninterpreted_produce_well_formed_smt2(self, t):
+        rule = make_rule(var_name="BODY", pattern="test", transforms=[t])
+        smt2 = rx_rule_to_smt(rule).to_smt2()
+        assert "(set-logic" in smt2
+        assert "(declare-fun" in smt2
+        assert "(declare-const" in smt2
+        assert "(assert (forall" in smt2
+        assert "(check-sat)" in smt2
+
 
 class TestRulesToSmt:
     def test_skips_non_rx_rules(self):

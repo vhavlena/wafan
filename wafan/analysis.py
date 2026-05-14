@@ -28,6 +28,7 @@ from .smt import (
     _escape_smt_string,
     apply_transforms_smt,
     extract_transforms,
+    transform_preamble,
 )
 
 
@@ -74,6 +75,16 @@ class SubprocessSolver:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _merge_unique(a: list[str], b: list[str]) -> list[str]:
+    """Concatenate two lists, dropping duplicates from b that already appear in a."""
+    seen = set(a)
+    return a + [x for x in b if x not in seen]
+
+
+# ---------------------------------------------------------------------------
 # Subsumption query generation
 # ---------------------------------------------------------------------------
 
@@ -89,14 +100,18 @@ def subsumption_smt2(rule1: SecRule, rule2: SecRule) -> str:
     The query asks: does there exist an input x that triggers rule1 but NOT
     rule2?  If UNSAT, no such x exists, so rule1 ⊆ rule2.
 
-    Both rules' transformation chains are applied to the same free variable x,
-    so transforms are correctly reflected in the subsumption condition.
+    Both rules' transformation chains are applied to the same free variable x.
+    Uninterpreted transforms are declared and axiomatised in the preamble.
 
-    Raises UnsupportedTransformError if either rule uses a transform without
-    an SMT-LIB counterpart.
+    Raises UnsupportedTransformError if either rule uses an unknown transform.
     """
     transforms1 = extract_transforms(rule1.actions)
     transforms2 = extract_transforms(rule2.actions)
+
+    fd1, ax1 = transform_preamble(transforms1)
+    fd2, ax2 = transform_preamble(transforms2)
+    fun_decls = _merge_unique(fd1, fd2)
+    axioms    = _merge_unique(ax1, ax2)
 
     negated1 = rule1.negated or rule1.operator == "!@rx"
     negated2 = rule2.negated or rule2.operator == "!@rx"
@@ -104,16 +119,15 @@ def subsumption_smt2(rule1: SecRule, rule2: SecRule) -> str:
     var_expr1 = apply_transforms_smt("x", transforms1)
     var_expr2 = apply_transforms_smt("x", transforms2)
 
-    # rule1 triggers for x
     assert1 = _match_assertion(var_expr1, rule1.operator_argument, negated1)
-    # rule2 does NOT trigger for x  (counterexample condition)
-    assert2_triggers = _match_assertion(var_expr2, rule2.operator_argument, negated2)
-    assert2 = f"(not {assert2_triggers})"
+    assert2 = f"(not {_match_assertion(var_expr2, rule2.operator_argument, negated2)})"
 
     lines = [
         f"(set-logic {SMT_LOGIC})",
         f"; subsumption check: rule {rule1.rule_id} subsumed by rule {rule2.rule_id}?",
         "; UNSAT => subsumed  |  SAT => not subsumed (witness exists)",
+        *fun_decls,
+        *axioms,
         "(declare-const x String)",
         f"(assert {assert1})",
         f"(assert {assert2})",
@@ -131,12 +145,17 @@ def intersection_smt2(rule1: SecRule, rule2: SecRule) -> str:
     non-empty intersection (some input triggers both rules simultaneously).
 
     Both rules' transformation chains are applied to the same free variable x.
+    Uninterpreted transforms are declared and axiomatised in the preamble.
 
-    Raises UnsupportedTransformError if either rule uses a transform without
-    an SMT-LIB counterpart.
+    Raises UnsupportedTransformError if either rule uses an unknown transform.
     """
     transforms1 = extract_transforms(rule1.actions)
     transforms2 = extract_transforms(rule2.actions)
+
+    fd1, ax1 = transform_preamble(transforms1)
+    fd2, ax2 = transform_preamble(transforms2)
+    fun_decls = _merge_unique(fd1, fd2)
+    axioms    = _merge_unique(ax1, ax2)
 
     negated1 = rule1.negated or rule1.operator == "!@rx"
     negated2 = rule2.negated or rule2.operator == "!@rx"
@@ -151,6 +170,8 @@ def intersection_smt2(rule1: SecRule, rule2: SecRule) -> str:
         f"(set-logic {SMT_LOGIC})",
         f"; intersection check: rule {rule1.rule_id} ∩ rule {rule2.rule_id} ≠ ∅?",
         "; SAT => non-empty intersection  |  UNSAT => disjoint",
+        *fun_decls,
+        *axioms,
         "(declare-const x String)",
         f"(assert {assert1})",
         f"(assert {assert2})",
