@@ -44,9 +44,13 @@ class TestArgumentParser:
         args = _build_parser().parse_args([str(REAL_CONF)])
         assert args.timeout == 30
 
-    def test_analysis_choices(self):
+    def test_analysis_subsumption(self):
         args = _build_parser().parse_args([str(REAL_CONF), "--analysis", "subsumption"])
         assert args.analysis == "subsumption"
+
+    def test_analysis_intersection(self):
+        args = _build_parser().parse_args([str(REAL_CONF), "--analysis", "intersection"])
+        assert args.analysis == "intersection"
 
     def test_invalid_analysis_rejected(self):
         with pytest.raises(SystemExit):
@@ -88,9 +92,12 @@ class TestMainFunction:
     def test_missing_file_returns_1(self):
         assert main(["nonexistent.conf"]) == 1
 
-    def test_valid_file_returns_0_with_missing_solver(self):
-        # Solver binary doesn't exist → all queries return UNKNOWN → no pairs → exit 0
+    def test_subsumption_returns_0_with_missing_solver(self):
         rc = main([str(SUBSUMPTION_CONF), "--solver", "__no_such_solver__"])
+        assert rc == 0
+
+    def test_intersection_returns_0_with_missing_solver(self):
+        rc = main([str(SUBSUMPTION_CONF), "--solver", "__no_such_solver__", "--analysis", "intersection"])
         assert rc == 0
 
     def test_help_exits(self):

@@ -1,9 +1,13 @@
 """SMT-based analysis of ModSecurity SecRule rulesets.
 
-Currently implemented analysis:
-  SubsumptionChecker – detects pairs of @rx rules where one rule's match
-  condition is a subset of another's (rule1 subsumed by rule2 means every
-  input triggering rule1 also triggers rule2).
+Implemented analyses:
+
+  SubsumptionChecker – detects pairs where one rule's match condition is a
+  subset of another's (rule1 subsumed by rule2 means every input triggering
+  rule1 also triggers rule2).
+
+  IntersectionChecker – detects pairs with a non-empty intersection, i.e.
+  there exists at least one input that triggers both rules simultaneously.
 
 The module is solver-agnostic: any object implementing SolverBackend can be
 supplied.  SubprocessSolver calls an external binary (default: z3-noodler)
@@ -119,6 +123,43 @@ def subsumption_smt2(rule1: SecRule, rule2: SecRule) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Intersection query generation
+# ---------------------------------------------------------------------------
+
+def intersection_smt2(rule1: SecRule, rule2: SecRule) -> str:
+    """Return an SMT-LIB2 string that is SAT iff rule1 and rule2 have a
+    non-empty intersection (some input triggers both rules simultaneously).
+
+    Both rules' transformation chains are applied to the same free variable x.
+
+    Raises UnsupportedTransformError if either rule uses a transform without
+    an SMT-LIB counterpart.
+    """
+    transforms1 = extract_transforms(rule1.actions)
+    transforms2 = extract_transforms(rule2.actions)
+
+    negated1 = rule1.negated or rule1.operator == "!@rx"
+    negated2 = rule2.negated or rule2.operator == "!@rx"
+
+    var_expr1 = apply_transforms_smt("x", transforms1)
+    var_expr2 = apply_transforms_smt("x", transforms2)
+
+    assert1 = _match_assertion(var_expr1, rule1.operator_argument, negated1)
+    assert2 = _match_assertion(var_expr2, rule2.operator_argument, negated2)
+
+    lines = [
+        f"(set-logic {SMT_LOGIC})",
+        f"; intersection check: rule {rule1.rule_id} ∩ rule {rule2.rule_id} ≠ ∅?",
+        "; SAT => non-empty intersection  |  UNSAT => disjoint",
+        "(declare-const x String)",
+        f"(assert {assert1})",
+        f"(assert {assert2})",
+        "(check-sat)",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Variable compatibility
 # ---------------------------------------------------------------------------
 
@@ -146,6 +187,60 @@ class SubsumptionResult:
     @property
     def is_subsumed(self) -> bool:
         return self.result == SolverResult.UNSAT
+
+
+@dataclass
+class IntersectionResult:
+    """Outcome of checking whether rule1 and rule2 have a non-empty intersection."""
+
+    rule1: SecRule
+    rule2: SecRule
+    result: SolverResult
+
+    @property
+    def has_intersection(self) -> bool:
+        return self.result == SolverResult.SAT
+
+
+class IntersectionChecker:
+    """Check whether pairs of @rx SecRules share a non-empty intersection."""
+
+    def __init__(self, solver: SolverBackend) -> None:
+        self._solver = solver
+
+    def check_pair(self, rule1: SecRule, rule2: SecRule) -> IntersectionResult:
+        """Check if there is an input that triggers both rule1 and rule2.
+
+        Returns UNKNOWN if either rule uses an unsupported transform or if the
+        rules target disjoint sets of variables.
+        """
+        if not rules_share_variable(rule1, rule2):
+            return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN)
+
+        try:
+            smt2 = intersection_smt2(rule1, rule2)
+        except UnsupportedTransformError:
+            return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN)
+
+        result = self._solver.solve(smt2)
+        return IntersectionResult(rule1, rule2, result)
+
+    def find_intersecting(self, rules: Sequence[SecRule]) -> list[IntersectionResult]:
+        """Return all unordered pairs (R1, R2) whose intersection is non-empty.
+
+        Only @rx / !@rx rules are considered.  Each unordered pair is checked
+        once; pairs where the solver returns UNKNOWN are excluded.
+        """
+        rx_rules = [r for r in rules if r.operator in ("@rx", "!@rx")]
+        results: list[IntersectionResult] = []
+
+        for i, r1 in enumerate(rx_rules):
+            for r2 in rx_rules[i + 1:]:
+                res = self.check_pair(r1, r2)
+                if res.result != SolverResult.UNKNOWN:
+                    results.append(res)
+
+        return results
 
 
 class SubsumptionChecker:

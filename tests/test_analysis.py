@@ -1,8 +1,8 @@
-"""Tests for wafan.analysis – subsumption checking.
+"""Tests for wafan.analysis – subsumption and intersection checking.
 
-The e2e tests use a PythonReSolver that resolves subsumption queries by
-extracting patterns from the SMT2 text and checking them with Python's re
-module.  This is only sound for the simple patterns used in the test fixture;
+The e2e tests use a PythonReSolver that resolves queries by extracting
+patterns from the SMT2 text and checking them with Python's re module.
+This is only sound for the simple patterns used in the test fixture;
 it is intentionally NOT used for production code.
 """
 
@@ -22,6 +22,9 @@ from wafan.analysis import (
     SubsumptionResult,
     SubsumptionChecker,
     subsumption_smt2,
+    IntersectionResult,
+    IntersectionChecker,
+    intersection_smt2,
     rules_share_variable,
 )
 
@@ -79,11 +82,12 @@ class CallbackSolver:
 
 
 class PythonReSolver:
-    """Approximate subsumption solver using Python's re module.
+    """Approximate solver using Python's re module for e2e tests.
 
-    Extracts both patterns from the SMT2 text produced by subsumption_smt2,
-    then searches a fixed set of candidate strings for a counterexample
-    (a string matching pattern1 but NOT pattern2).
+    Extracts both assert lines from the SMT2 text, parses each condition
+    (handling (not …) wrappers), then searches a fixed set of candidate
+    strings.  If any candidate satisfies both asserts the query is SAT,
+    otherwise UNSAT.
 
     Only reliable for simple patterns without complex features.  Intended
     for e2e tests only.
@@ -98,51 +102,40 @@ class PythonReSolver:
         "foo bar", "foo|bar",
     ]
 
+    @staticmethod
+    def _parse_assert(line: str) -> tuple[str, bool]:
+        """Return (pattern, effective_negation) for one (assert …) line."""
+        inner = line[len("(assert "):-1]
+        nots = 0
+        while inner.startswith("(not "):
+            inner = inner[5:-1]
+            nots += 1
+        m = _re.search(r're\.from_ecma2020 "([^"]*)"', inner)
+        if not m:
+            return ("", False)
+        pat = m.group(1).replace("\\\\", "\\")
+        return (pat, nots % 2 == 1)
+
+    def _eval(self, pattern: str, negated: bool, s: str) -> bool:
+        try:
+            matched = bool(_re.fullmatch(pattern, s))
+        except _re.error:
+            return False
+        return (not matched) if negated else matched
+
     def solve(self, smt2: str) -> SolverResult:
-        # Extract (pattern, negated) pairs from the two (assert …) lines.
-        # Lines look like:
-        #   (assert (str.in_re …))            – positive
-        #   (assert (not (str.in_re …)))       – negated
-        #   (assert (not (not (str.in_re …)))) – double-negated (negated rule, counterexample)
         assert_lines = [l.strip() for l in smt2.splitlines() if l.strip().startswith("(assert")]
         if len(assert_lines) != 2:
             return SolverResult.UNKNOWN
 
-        def parse_assert(line: str) -> tuple[str, bool]:
-            """Return (pattern, negated_for_candidate_check)."""
-            # Count leading (not  wrappers
-            inner = line[len("(assert "):-1]  # strip (assert …)
-            nots = 0
-            while inner.startswith("(not "):
-                inner = inner[5:-1]
-                nots += 1
-            m = _re.search(r're\.from_ecma2020 "([^"]*)"', inner)
-            if not m:
-                return ("", False)
-            pat = m.group(1).replace("\\\\", "\\")
-            # The final assert is a (not match2) so effective negation = nots % 2 == 1
-            negated = (nots % 2 == 1)
-            return (pat, negated)
-
-        pat1, neg1 = parse_assert(assert_lines[0])
-        pat2, neg2 = parse_assert(assert_lines[1])
+        pat1, neg1 = self._parse_assert(assert_lines[0])
+        pat2, neg2 = self._parse_assert(assert_lines[1])
 
         if not pat1 or not pat2:
             return SolverResult.UNKNOWN
 
         for s in self._CANDIDATES:
-            try:
-                m1 = bool(_re.search(pat1, s))
-                m2 = bool(_re.search(pat2, s))
-            except _re.error:
-                return SolverResult.UNKNOWN
-
-            triggers1 = (not m1) if neg1 else m1
-            triggers2 = (not m2) if neg2 else m2  # already negated in assert
-
-            if triggers1 and triggers2:
-                # assert2 says "not triggered by rule2", and triggers2 means
-                # candidate satisfies the (not match2) condition → SAT
+            if self._eval(pat1, neg1, s) and self._eval(pat2, neg2, s):
                 return SolverResult.SAT
 
         return SolverResult.UNSAT
@@ -480,3 +473,260 @@ class TestSubprocessSolver:
     def test_missing_binary_returns_unknown(self):
         s = SubprocessSolver(argv=["__no_such_binary__"])
         assert s.solve("(check-sat)") == SolverResult.UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# intersection_smt2 – structure tests
+# ---------------------------------------------------------------------------
+
+class TestIntersectionSmt2:
+    def test_returns_string(self):
+        r1, r2 = make_rule(pattern="foo"), make_rule(pattern="bar")
+        assert isinstance(intersection_smt2(r1, r2), str)
+
+    def test_contains_set_logic(self):
+        r1, r2 = make_rule(pattern="a"), make_rule(pattern="b")
+        assert "(set-logic" in intersection_smt2(r1, r2)
+
+    def test_declares_single_variable_x(self):
+        r1, r2 = make_rule(pattern="a"), make_rule(pattern="b")
+        assert "(declare-const x String)" in intersection_smt2(r1, r2)
+
+    def test_both_patterns_present(self):
+        r1 = make_rule(pattern="ALPHA")
+        r2 = make_rule(pattern="BETA")
+        smt2 = intersection_smt2(r1, r2)
+        assert "ALPHA" in smt2
+        assert "BETA" in smt2
+
+    def test_two_re_from_ecma2020(self):
+        r1, r2 = make_rule(pattern="x"), make_rule(pattern="y")
+        assert intersection_smt2(r1, r2).count("re.from_ecma2020") == 2
+
+    def test_ends_with_check_sat(self):
+        r1, r2 = make_rule(pattern="x"), make_rule(pattern="y")
+        assert intersection_smt2(r1, r2).strip().endswith("(check-sat)")
+
+    def test_two_assert_lines(self):
+        r1, r2 = make_rule(pattern="x"), make_rule(pattern="y")
+        asserts = [l for l in intersection_smt2(r1, r2).splitlines() if "(assert" in l]
+        assert len(asserts) == 2
+
+    def test_positive_rules_no_leading_not(self):
+        r1 = make_rule(pattern="x", negated=False)
+        r2 = make_rule(pattern="y", negated=False)
+        smt2 = intersection_smt2(r1, r2)
+        asserts = [l.strip() for l in smt2.splitlines() if l.strip().startswith("(assert")]
+        assert not asserts[0].startswith("(assert (not")
+        assert not asserts[1].startswith("(assert (not")
+
+    def test_negated_rule1_has_not(self):
+        r1 = make_rule(pattern="x", negated=True)
+        r2 = make_rule(pattern="y", negated=False)
+        smt2 = intersection_smt2(r1, r2)
+        asserts = [l.strip() for l in smt2.splitlines() if l.strip().startswith("(assert")]
+        assert asserts[0].startswith("(assert (not")
+        assert not asserts[1].startswith("(assert (not")
+
+    def test_negated_rule2_has_not(self):
+        r1 = make_rule(pattern="x", negated=False)
+        r2 = make_rule(pattern="y", negated=True)
+        smt2 = intersection_smt2(r1, r2)
+        asserts = [l.strip() for l in smt2.splitlines() if l.strip().startswith("(assert")]
+        assert not asserts[0].startswith("(assert (not")
+        assert asserts[1].startswith("(assert (not")
+
+    def test_differs_from_subsumption_smt2(self):
+        r1, r2 = make_rule(pattern="x"), make_rule(pattern="y")
+        assert intersection_smt2(r1, r2) != subsumption_smt2(r1, r2)
+
+    def test_transform_reflected(self):
+        r1 = make_rule(pattern="foo", transforms=["lowercase"])
+        r2 = make_rule(pattern="bar")
+        assert "str.lower" in intersection_smt2(r1, r2)
+
+    def test_unsupported_transform_raises(self):
+        r1 = make_rule(pattern="x", transforms=["urlDecode"])
+        r2 = make_rule(pattern="y")
+        with pytest.raises(UnsupportedTransformError):
+            intersection_smt2(r1, r2)
+
+    def test_rule_ids_in_comment(self):
+        r1 = make_rule(rule_id="11")
+        r2 = make_rule(rule_id="22")
+        smt2 = intersection_smt2(r1, r2)
+        assert "11" in smt2 and "22" in smt2
+
+
+# ---------------------------------------------------------------------------
+# IntersectionChecker.check_pair – unit tests
+# ---------------------------------------------------------------------------
+
+class TestIntersectionCheckPair:
+    def test_sat_gives_has_intersection(self):
+        checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
+        res = checker.check_pair(make_rule(rule_id="1"), make_rule(rule_id="2"))
+        assert res.has_intersection
+
+    def test_unsat_gives_no_intersection(self):
+        checker = IntersectionChecker(ConstantSolver(SolverResult.UNSAT))
+        res = checker.check_pair(make_rule(rule_id="1"), make_rule(rule_id="2"))
+        assert not res.has_intersection
+
+    def test_unknown_propagates(self):
+        checker = IntersectionChecker(ConstantSolver(SolverResult.UNKNOWN))
+        res = checker.check_pair(make_rule(rule_id="1"), make_rule(rule_id="2"))
+        assert res.result == SolverResult.UNKNOWN
+
+    def test_disjoint_variables_returns_unknown(self):
+        checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
+        r1 = make_rule(var_name="ARGS")
+        r2 = make_rule(var_name="RESPONSE_BODY")
+        assert checker.check_pair(r1, r2).result == SolverResult.UNKNOWN
+
+    def test_unsupported_transform_returns_unknown(self):
+        checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
+        r1 = make_rule(transforms=["urlDecode"])
+        r2 = make_rule()
+        assert checker.check_pair(r1, r2).result == SolverResult.UNKNOWN
+
+    def test_result_carries_both_rules(self):
+        r1 = make_rule(rule_id="A")
+        r2 = make_rule(rule_id="B")
+        checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
+        res = checker.check_pair(r1, r2)
+        assert res.rule1.rule_id == "A"
+        assert res.rule2.rule_id == "B"
+
+    def test_result_is_intersection_result(self):
+        checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
+        assert isinstance(checker.check_pair(make_rule(), make_rule()), IntersectionResult)
+
+    def test_solver_receives_smt2_text(self):
+        received: list[str] = []
+
+        def capture(smt2: str) -> SolverResult:
+            received.append(smt2)
+            return SolverResult.SAT
+
+        checker = IntersectionChecker(CallbackSolver(capture))
+        checker.check_pair(make_rule(pattern="foo"), make_rule(pattern="bar"))
+        assert len(received) == 1
+        assert "foo" in received[0]
+        assert "bar" in received[0]
+
+
+# ---------------------------------------------------------------------------
+# IntersectionChecker.find_intersecting – unit tests
+# ---------------------------------------------------------------------------
+
+class TestFindIntersecting:
+    def test_returns_list(self):
+        checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
+        assert isinstance(checker.find_intersecting([make_rule()]), list)
+
+    def test_single_rule_no_pairs(self):
+        checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
+        assert checker.find_intersecting([make_rule()]) == []
+
+    def test_non_rx_rules_skipped(self):
+        r_pm = make_rule()
+        r_pm.operator = "@pm"
+        checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
+        assert checker.find_intersecting([r_pm, r_pm]) == []
+
+    def test_unknown_results_excluded(self):
+        checker = IntersectionChecker(ConstantSolver(SolverResult.UNKNOWN))
+        rules = [make_rule(rule_id="1"), make_rule(rule_id="2")]
+        assert checker.find_intersecting(rules) == []
+
+    def test_three_rules_unordered_pairs(self):
+        # 3 rules → 3 unordered pairs
+        rules = [make_rule(rule_id=str(i)) for i in range(3)]
+        checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
+        assert len(checker.find_intersecting(rules)) == 3
+
+    def test_each_pair_checked_once(self):
+        calls: list[tuple[str, str]] = []
+
+        def capture(smt2: str) -> SolverResult:
+            ids = [l.split()[-1] for l in smt2.splitlines() if l.startswith("; intersection")]
+            calls.append(tuple(ids[0].split("∩")) if ids else ("?", "?"))
+            return SolverResult.SAT
+
+        rules = [make_rule(rule_id=str(i)) for i in range(3)]
+        IntersectionChecker(CallbackSolver(capture)).find_intersecting(rules)
+        assert len(calls) == 3
+
+    def test_disjoint_variable_pairs_excluded(self):
+        r1 = make_rule(rule_id="1", var_name="ARGS")
+        r2 = make_rule(rule_id="2", var_name="RESPONSE_BODY")
+        checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
+        assert checker.find_intersecting([r1, r2]) == []
+
+
+# ---------------------------------------------------------------------------
+# E2E intersection tests with PythonReSolver
+# ---------------------------------------------------------------------------
+
+class TestIntersectionE2E:
+    def test_100_and_200_intersect(self, sub_rules, py_solver):
+        r100 = next(r for r in sub_rules if r.rule_id == "100")
+        r200 = next(r for r in sub_rules if r.rule_id == "200")
+        res = IntersectionChecker(py_solver).check_pair(r100, r200)
+        assert res.has_intersection, "foo matches both foo and foo|bar"
+
+    def test_100_and_300_disjoint(self, sub_rules, py_solver):
+        r100 = next(r for r in sub_rules if r.rule_id == "100")
+        r300 = next(r for r in sub_rules if r.rule_id == "300")
+        res = IntersectionChecker(py_solver).check_pair(r100, r300)
+        assert not res.has_intersection, "foo and baz are disjoint"
+
+    def test_200_and_300_disjoint(self, sub_rules, py_solver):
+        r200 = next(r for r in sub_rules if r.rule_id == "200")
+        r300 = next(r for r in sub_rules if r.rule_id == "300")
+        res = IntersectionChecker(py_solver).check_pair(r200, r300)
+        assert not res.has_intersection, "foo|bar and baz are disjoint"
+
+    def test_100_and_400_intersect(self, sub_rules, py_solver):
+        r100 = next(r for r in sub_rules if r.rule_id == "100")
+        r400 = next(r for r in sub_rules if r.rule_id == "400")
+        res = IntersectionChecker(py_solver).check_pair(r100, r400)
+        assert res.has_intersection, "foo matches .+"
+
+    def test_300_and_400_intersect(self, sub_rules, py_solver):
+        r300 = next(r for r in sub_rules if r.rule_id == "300")
+        r400 = next(r for r in sub_rules if r.rule_id == "400")
+        res = IntersectionChecker(py_solver).check_pair(r300, r400)
+        assert res.has_intersection, "baz matches .+"
+
+    def test_600_and_100_unknown_different_vars(self, sub_rules, py_solver):
+        r100 = next(r for r in sub_rules if r.rule_id == "100")
+        r600 = next(r for r in sub_rules if r.rule_id == "600")
+        res = IntersectionChecker(py_solver).check_pair(r100, r600)
+        assert res.result == SolverResult.UNKNOWN
+
+    def test_find_intersecting_finds_expected_pairs(self, sub_rules, py_solver):
+        results = IntersectionChecker(py_solver).find_intersecting(sub_rules)
+        pairs = {frozenset([r.rule1.rule_id, r.rule2.rule_id]) for r in results if r.has_intersection}
+        assert frozenset(["100", "200"]) in pairs
+        assert frozenset(["100", "400"]) in pairs
+        assert frozenset(["200", "400"]) in pairs
+        assert frozenset(["300", "400"]) in pairs
+
+    def test_find_intersecting_excludes_disjoint(self, sub_rules, py_solver):
+        results = IntersectionChecker(py_solver).find_intersecting(sub_rules)
+        pairs = {frozenset([r.rule1.rule_id, r.rule2.rule_id]) for r in results if r.has_intersection}
+        assert frozenset(["100", "300"]) not in pairs
+        assert frozenset(["200", "300"]) not in pairs
+
+    def test_smt2_for_real_conf_intersection_is_well_formed(self):
+        rules = parse_rx_rules(CONF)
+        for r1 in rules[:3]:
+            for r2 in rules[:3]:
+                if r1.rule_id == r2.rule_id:
+                    continue
+                smt2 = intersection_smt2(r1, r2)
+                assert "(set-logic" in smt2
+                assert "(declare-const x String)" in smt2
+                assert smt2.strip().endswith("(check-sat)")

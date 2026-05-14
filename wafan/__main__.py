@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .analysis import SubprocessSolver, SubsumptionChecker
+from .analysis import SubprocessSolver, SubsumptionChecker, IntersectionChecker
 from .parser import parse_file
 
 
@@ -32,7 +32,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--analysis",
-        choices=["subsumption"],
+        choices=["subsumption", "intersection"],
         default="subsumption",
         help="Analysis to run (default: subsumption).",
     )
@@ -78,6 +78,30 @@ def _run_subsumption(conf: Path, solver: SubprocessSolver) -> int:
     return 0
 
 
+def _run_intersection(conf: Path, solver: SubprocessSolver) -> int:
+    rules = parse_file(conf)
+    checker = IntersectionChecker(solver)
+    results = checker.find_intersecting(rules)
+
+    intersecting = [r for r in results if r.has_intersection]
+    disjoint = [r for r in results if not r.has_intersection]
+
+    if not intersecting:
+        print("No intersecting rule pairs found.")
+        return 0
+
+    print(f"Found {len(intersecting)} intersecting pair(s):\n")
+    for res in intersecting:
+        r1, r2 = res.rule1, res.rule2
+        print(
+            f"  rule {r1.rule_id:>8}  ∩  rule {r2.rule_id:<8}"
+            f"  ({r1.operator_argument[:60]})"
+        )
+
+    print(f"\n{len(disjoint)} pair(s) checked and found disjoint.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -90,6 +114,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.analysis == "subsumption":
         return _run_subsumption(args.conf, solver)
+    if args.analysis == "intersection":
+        return _run_intersection(args.conf, solver)
 
     print(f"error: unknown analysis '{args.analysis}'", file=sys.stderr)
     return 1
