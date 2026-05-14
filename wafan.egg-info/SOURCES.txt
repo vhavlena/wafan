@@ -1,12 +1,16 @@
 README.md
 pyproject.toml
+tests/test_analysis.py
 tests/test_parser.py
 tests/test_smt.py
 wafan/__init__.py
+wafan/__main__.py
+wafan/analysis.py
 wafan/parser.py
 wafan/smt.py
 wafan.egg-info/PKG-INFO
 wafan.egg-info/SOURCES.txt
 wafan.egg-info/dependency_links.txt
+wafan.egg-info/entry_points.txt
 wafan.egg-info/requires.txt
 wafan.egg-info/top_level.txt

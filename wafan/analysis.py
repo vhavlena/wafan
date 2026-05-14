@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, Sequence
 
-from .parser import SecRule, SecRuleVariable
+from .parser import SecRule
 from .smt import (
     SMT_LOGIC,
     UnsupportedTransformError,

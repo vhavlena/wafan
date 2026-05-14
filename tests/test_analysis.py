@@ -14,11 +14,10 @@ from typing import Callable
 
 import pytest
 
-from wafan.parser import parse_file, parse_rx_rules, SecRule, SecRuleVariable, SecRuleAction
+from wafan.parser import parse_rx_rules, SecRule, SecRuleVariable, SecRuleAction
 from wafan.smt import UnsupportedTransformError
 from wafan.analysis import (
     SolverResult,
-    SolverBackend,
     SubprocessSolver,
     SubsumptionResult,
     SubsumptionChecker,
@@ -65,7 +64,7 @@ class ConstantSolver:
     def __init__(self, result: SolverResult) -> None:
         self._result = result
 
-    def solve(self, smt2: str) -> SolverResult:
+    def solve(self, _smt2: str) -> SolverResult:
         return self._result
 
 
