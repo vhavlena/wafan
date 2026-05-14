@@ -1,0 +1,4 @@
+msc-pyparser>=1.2
+
+[dev]
+pytest>=7
