@@ -2,17 +2,36 @@
 
 Currently only @rx (ECMA regex matching) is supported via the
 `re.from_ecma2020` SMT-LIB function, targeting the z3-noodler backend.
+
+Supported SecRule transformations (t: actions) that have direct SMT-LIB
+counterparts are applied inline as wrappers around the variable expression:
+  none            – resets the transform chain (identity)
+  lowercase       – str.lower
+  uppercase       – str.upper
+
+Transforms without SMT-LIB counterparts raise UnsupportedTransformError.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
-from .parser import SecRule, SecRuleVariable
+from .parser import SecRule, SecRuleAction, SecRuleVariable
 
 
 SMT_LOGIC = "QF_SLIA"
+
+# Maps normalised transform name → function that wraps an SMT expression.
+# "none" is handled separately (it resets the chain) and is not in this map.
+_TRANSFORM_SMT: dict[str, Callable[[str], str]] = {
+    "lowercase": lambda e: f"(str.lower {e})",
+    "uppercase": lambda e: f"(str.upper {e})",
+}
+
+
+class UnsupportedTransformError(Exception):
+    """Raised when a SecRule transformation has no SMT-LIB counterpart."""
 
 
 @dataclass
@@ -35,6 +54,50 @@ class SmtFormula:
         return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Transformation helpers
+# ---------------------------------------------------------------------------
+
+def extract_transforms(actions: Sequence[SecRuleAction]) -> list[str]:
+    """Return the effective ordered list of transformation names from actions.
+
+    ``t:none`` resets any previously accumulated transforms (ModSecurity
+    semantics: "removes all transformations configured for the current rule").
+    """
+    transforms: list[str] = []
+    for action in actions:
+        if action.name == "t":
+            if action.arg.lower() == "none":
+                transforms = []
+            else:
+                transforms.append(action.arg)
+    return transforms
+
+
+def apply_transforms_smt(var_expr: str, transforms: Sequence[str]) -> str:
+    """Wrap *var_expr* with SMT-LIB transformation functions.
+
+    Transforms are applied left-to-right (innermost = first applied), e.g.
+    ``[lowercase, uppercase]`` produces ``(str.upper (str.lower var))``.
+
+    Raises UnsupportedTransformError for any transform not in _TRANSFORM_SMT.
+    """
+    expr = var_expr
+    for t in transforms:
+        key = t.lower()
+        fn = _TRANSFORM_SMT.get(key)
+        if fn is None:
+            raise UnsupportedTransformError(
+                f"Transform '{t}' has no SMT-LIB counterpart"
+            )
+        expr = fn(expr)
+    return expr
+
+
+# ---------------------------------------------------------------------------
+# Variable / pattern helpers
+# ---------------------------------------------------------------------------
+
 def _smt_var_name(variable: SecRuleVariable) -> str:
     """Produce a sanitised SMT identifier for a ModSecurity variable."""
     name = variable.name
@@ -48,20 +111,29 @@ def _escape_smt_string(pattern: str) -> str:
     return pattern.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _rx_assertion(var_name: str, pattern: str, negated: bool) -> str:
+def _rx_assertion(var_expr: str, pattern: str, negated: bool) -> str:
     escaped = _escape_smt_string(pattern)
-    inner = f'(str.in_re {var_name} (re.from_ecma2020 "{escaped}"))'
+    inner = f'(str.in_re {var_expr} (re.from_ecma2020 "{escaped}"))'
     return f"(not {inner})" if negated else inner
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def rx_rule_to_smt(rule: SecRule) -> SmtFormula:
     """Convert a single @rx SecRule to an SmtFormula.
+
+    Transformation actions (t:) are extracted and applied as SMT-LIB wrappers
+    around each variable expression before the regex assertion is built.
 
     Each ModSecurity variable targeted by the rule becomes a free String
     constant.  When a rule targets multiple variables the assertion is a
     disjunction (any variable matching triggers the rule).
 
-    Raises ValueError for rules whose operator is not @rx / !@rx.
+    Raises:
+        ValueError: if the operator is not @rx / !@rx.
+        UnsupportedTransformError: if a t: action has no SMT-LIB counterpart.
     """
     if rule.operator not in ("@rx", "!@rx"):
         raise ValueError(
@@ -70,9 +142,10 @@ def rx_rule_to_smt(rule: SecRule) -> SmtFormula:
 
     negated = rule.negated or rule.operator == "!@rx"
     pattern = rule.operator_argument
+    transforms = extract_transforms(rule.actions)
 
     declarations: list[str] = []
-    var_names: list[str] = []
+    assertions: list[str] = []
     seen: set[str] = set()
 
     for variable in rule.variables:
@@ -80,14 +153,13 @@ def rx_rule_to_smt(rule: SecRule) -> SmtFormula:
         if v not in seen:
             declarations.append(f"(declare-const {v} String)")
             seen.add(v)
-        var_names.append(v)
+        var_expr = apply_transforms_smt(v, transforms)
+        assertions.append(_rx_assertion(var_expr, pattern, negated))
 
-    if len(var_names) == 1:
-        assertion = _rx_assertion(var_names[0], pattern, negated)
+    if len(assertions) == 1:
+        assertion = assertions[0]
     else:
-        parts = [_rx_assertion(v, pattern, negated) for v in var_names]
-        inner = "(or " + " ".join(parts) + ")"
-        assertion = inner
+        assertion = "(or " + " ".join(assertions) + ")"
 
     return SmtFormula(
         rule_id=rule.rule_id,
