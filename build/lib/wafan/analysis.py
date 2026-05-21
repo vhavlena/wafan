@@ -22,6 +22,7 @@ from enum import Enum
 from typing import Protocol, Sequence
 
 from .parser import SecRule
+from .regex_conv import pcre_to_ecma2020
 from .smt import (
     SMT_LOGIC,
     UnsupportedTransformError,
@@ -116,11 +117,14 @@ def subsumption_smt2(rule1: SecRule, rule2: SecRule) -> str:
     negated1 = rule1.negated or rule1.operator == "!@rx"
     negated2 = rule2.negated or rule2.operator == "!@rx"
 
+    conv1 = pcre_to_ecma2020(rule1.operator_argument)
+    conv2 = pcre_to_ecma2020(rule2.operator_argument)
+
     var_expr1 = apply_transforms_smt("x", transforms1)
     var_expr2 = apply_transforms_smt("x", transforms2)
 
-    assert1 = _match_assertion(var_expr1, rule1.operator_argument, negated1)
-    assert2 = f"(not {_match_assertion(var_expr2, rule2.operator_argument, negated2)})"
+    assert1 = _match_assertion(var_expr1, conv1.pattern, negated1)
+    assert2 = f"(not {_match_assertion(var_expr2, conv2.pattern, negated2)})"
 
     lines = [
         f"(set-logic {SMT_LOGIC})",
@@ -160,11 +164,14 @@ def intersection_smt2(rule1: SecRule, rule2: SecRule) -> str:
     negated1 = rule1.negated or rule1.operator == "!@rx"
     negated2 = rule2.negated or rule2.operator == "!@rx"
 
+    conv1 = pcre_to_ecma2020(rule1.operator_argument)
+    conv2 = pcre_to_ecma2020(rule2.operator_argument)
+
     var_expr1 = apply_transforms_smt("x", transforms1)
     var_expr2 = apply_transforms_smt("x", transforms2)
 
-    assert1 = _match_assertion(var_expr1, rule1.operator_argument, negated1)
-    assert2 = _match_assertion(var_expr2, rule2.operator_argument, negated2)
+    assert1 = _match_assertion(var_expr1, conv1.pattern, negated1)
+    assert2 = _match_assertion(var_expr2, conv2.pattern, negated2)
 
     lines = [
         f"(set-logic {SMT_LOGIC})",
@@ -246,7 +253,7 @@ class IntersectionChecker:
 
         try:
             smt2 = intersection_smt2(rule1, rule2)
-            print(smt2)
+            print(smt2)  # debug
         except UnsupportedTransformError as exc:
             if self._verbose:
                 print(f"skipped (unsupported transform: {exc})")

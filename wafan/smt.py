@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import Sequence
 
 from .parser import SecRule, SecRuleAction, SecRuleVariable
+from .regex_conv import UnsupportedPatternError, pcre_to_ecma2020
 
 
 SMT_LOGIC = "QF_SLIA"
@@ -318,7 +319,8 @@ def rx_rule_to_smt(rule: SecRule) -> SmtFormula:
         )
 
     negated = rule.negated or rule.operator == "!@rx"
-    pattern = rule.operator_argument
+    conv = pcre_to_ecma2020(rule.operator_argument)
+    pattern = conv.pattern
     transforms = extract_transforms(rule.actions)
     fun_decls, axioms = transform_preamble(transforms)
 

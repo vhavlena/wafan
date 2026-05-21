@@ -171,8 +171,13 @@ class TestRxRuleToSmt:
         assert "re.from_ecma2020" in f.assertion
 
     def test_pattern_embedded_in_assertion(self):
+        # (?i) is expanded in-place: letters become [xX] classes
         f = rx_rule_to_smt(make_rule(pattern="(?i)[a-z]+inetpub"))
-        assert "(?i)[a-z]+inetpub" in f.assertion
+        assert "re.from_ecma2020" in f.assertion
+        assert "re.from_ecma2020_flags" not in f.assertion
+        # [a-z] expanded to [a-zA-Z], literal letters wrapped
+        assert "[a-zA-Z]" in f.assertion
+        assert "[iI]" in f.assertion
 
     def test_positive_assertion_no_not(self):
         f = rx_rule_to_smt(make_rule(negated=False))
