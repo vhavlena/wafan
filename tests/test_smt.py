@@ -15,7 +15,7 @@ from wafan.smt import (
     UnsupportedTransformError,
 )
 
-CONF = Path(__file__).parent.parent / "RESPONSE-954-DATA-LEAKAGES-IIS.conf"
+CONF = Path(__file__).parent / "data" / "subsumption.conf"
 
 
 def make_action(name: str, arg: str = "") -> SecRuleAction:
@@ -294,12 +294,14 @@ class TestRxRuleToSmt:
         assert "(str.lower A)" in f.assertion
         assert "(str.lower B)" in f.assertion
 
-    def test_conf_file_rules_with_t_none(self):
-        # All rules in the test conf use t:none; they should produce no wrapping
+    def test_conf_file_rules_translate_with_expected_transforms(self):
         rules = parse_rx_rules(CONF)
         for rule in rules:
             f = rx_rule_to_smt(rule)
-            assert "str.lower" not in f.assertion
+            if rule.rule_id == "500":
+                assert "str.lower" in f.assertion
+            else:
+                assert "str.lower" not in f.assertion
             assert "str.upper" not in f.assertion
 
 

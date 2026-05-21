@@ -8,7 +8,7 @@ from wafan.__main__ import main, _build_parser, _make_solver
 from wafan.analysis import SubprocessSolver
 
 SUBSUMPTION_CONF = Path(__file__).parent / "data" / "subsumption.conf"
-REAL_CONF = Path(__file__).parent.parent / "RESPONSE-954-DATA-LEAKAGES-IIS.conf"
+REAL_CONF = SUBSUMPTION_CONF
 
 
 class TestArgumentParser:

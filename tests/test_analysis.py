@@ -28,7 +28,7 @@ from wafan.analysis import (
     rules_share_variable,
 )
 
-CONF = Path(__file__).parent.parent / "RESPONSE-954-DATA-LEAKAGES-IIS.conf"
+CONF = Path(__file__).parent / "data" / "subsumption.conf"
 SUBSUMPTION_CONF = Path(__file__).parent / "data" / "subsumption.conf"
 
 
