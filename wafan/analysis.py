@@ -253,7 +253,6 @@ class IntersectionChecker:
 
         try:
             smt2 = intersection_smt2(rule1, rule2)
-            print(smt2)  # debug
         except UnsupportedTransformError as exc:
             if self._verbose:
                 print(f"skipped (unsupported transform: {exc})")
