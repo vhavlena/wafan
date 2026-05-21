@@ -233,9 +233,9 @@ class IntersectionResult:
 class IntersectionChecker:
     """Check whether pairs of @rx SecRules share a non-empty intersection."""
 
-    def __init__(self, solver: SolverBackend, verbose: bool = False) -> None:
+    def __init__(self, solver: SolverBackend, verbosity: int = 0) -> None:
         self._solver = solver
-        self._verbose = verbose
+        self._verbosity = verbosity
 
     def check_pair(self, rule1: SecRule, rule2: SecRule) -> IntersectionResult:
         """Check if there is an input that triggers both rule1 and rule2.
@@ -243,23 +243,26 @@ class IntersectionChecker:
         Returns UNKNOWN if either rule uses an unsupported transform or if the
         rules target disjoint sets of variables.
         """
-        if self._verbose:
+        if self._verbosity >= 1:
             print(f"  checking intersection: rule {rule1.rule_id} ∩ rule {rule2.rule_id} ...", end=" ", flush=True)
 
         if not rules_share_variable(rule1, rule2):
-            if self._verbose:
+            if self._verbosity >= 1:
                 print("skipped (no shared variable)")
             return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN)
 
         try:
             smt2 = intersection_smt2(rule1, rule2)
         except UnsupportedTransformError as exc:
-            if self._verbose:
+            if self._verbosity >= 1:
                 print(f"skipped (unsupported transform: {exc})")
             return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN)
 
+        if self._verbosity >= 2:
+            print(f"\n[smt2]\n{smt2}\n[/smt2]", flush=True)
+
         result = self._solver.solve(smt2)
-        if self._verbose:
+        if self._verbosity >= 1:
             label = {
                 SolverResult.SAT: "INTERSECTING",
                 SolverResult.UNSAT: "disjoint",
@@ -275,7 +278,7 @@ class IntersectionChecker:
         once; pairs where the solver returns UNKNOWN are excluded.
         """
         rx_rules = [r for r in rules if r.operator in ("@rx", "!@rx")]
-        if self._verbose:
+        if self._verbosity >= 1:
             print(f"[intersection] {len(rx_rules)} @rx/@!rx rules, {len(rx_rules) * (len(rx_rules) - 1) // 2} unordered pairs to check")
         results: list[IntersectionResult] = []
 
@@ -291,9 +294,9 @@ class IntersectionChecker:
 class SubsumptionChecker:
     """Check subsumption between pairs of @rx SecRules using an SMT solver."""
 
-    def __init__(self, solver: SolverBackend, verbose: bool = False) -> None:
+    def __init__(self, solver: SolverBackend, verbosity: int = 0) -> None:
         self._solver = solver
-        self._verbose = verbose
+        self._verbosity = verbosity
 
     def check_pair(self, rule1: SecRule, rule2: SecRule) -> SubsumptionResult:
         """Check if rule1 is subsumed by rule2.
@@ -301,23 +304,26 @@ class SubsumptionChecker:
         Returns UNKNOWN if either rule uses an unsupported transform or if the
         rules target disjoint sets of variables.
         """
-        if self._verbose:
+        if self._verbosity >= 1:
             print(f"  checking subsumption: rule {rule1.rule_id} ⊆ rule {rule2.rule_id} ...", end=" ", flush=True)
 
         if not rules_share_variable(rule1, rule2):
-            if self._verbose:
+            if self._verbosity >= 1:
                 print("skipped (no shared variable)")
             return SubsumptionResult(rule1, rule2, SolverResult.UNKNOWN)
 
         try:
             smt2 = subsumption_smt2(rule1, rule2)
         except UnsupportedTransformError as exc:
-            if self._verbose:
+            if self._verbosity >= 1:
                 print(f"skipped (unsupported transform: {exc})")
             return SubsumptionResult(rule1, rule2, SolverResult.UNKNOWN)
 
+        if self._verbosity >= 2:
+            print(f"\n[smt2]\n{smt2}\n[/smt2]", flush=True)
+
         result = self._solver.solve(smt2)
-        if self._verbose:
+        if self._verbosity >= 1:
             label = {
                 SolverResult.UNSAT: "SUBSUMED",
                 SolverResult.SAT: "not subsumed",
@@ -334,7 +340,7 @@ class SubsumptionChecker:
         excluded from the result.
         """
         rx_rules = [r for r in rules if r.operator in ("@rx", "!@rx")]
-        if self._verbose:
+        if self._verbosity >= 1:
             print(f"[subsumption] {len(rx_rules)} @rx/@!rx rules, {len(rx_rules) * (len(rx_rules) - 1)} ordered pairs to check")
         results: list[SubsumptionResult] = []
 

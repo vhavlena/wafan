@@ -17,5 +17,8 @@ dev = ["pytest>=7"]
 [project.scripts]
 wafan = "wafan.__main__:main"
 
+[tool.setuptools.packages.find]
+include = ["wafan*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

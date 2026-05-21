@@ -48,6 +48,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print each rule pair being checked along with its result.",
     )
+    p.add_argument(
+        "-v2",
+        action="store_true",
+        dest="verbose2",
+        help="Like -v, but also print the SMT-LIB2 formula for each query.",
+    )
     return p
 
 
@@ -59,11 +65,11 @@ def _make_solver(args: argparse.Namespace) -> SubprocessSolver:
     return SubprocessSolver(argv=argv, timeout=args.timeout)
 
 
-def _run_subsumption(conf: Path, solver: SubprocessSolver, verbose: bool = False) -> int:
+def _run_subsumption(conf: Path, solver: SubprocessSolver, verbosity: int = 0) -> int:
     rules = parse_file(conf)
-    if verbose:
+    if verbosity >= 1:
         print(f"[parse] {len(rules)} rules loaded from {conf}")
-    checker = SubsumptionChecker(solver, verbose=verbose)
+    checker = SubsumptionChecker(solver, verbosity=verbosity)
     results = checker.find_subsumed(rules)
 
     subsumed = [r for r in results if r.is_subsumed]
@@ -85,11 +91,11 @@ def _run_subsumption(conf: Path, solver: SubprocessSolver, verbose: bool = False
     return 0
 
 
-def _run_intersection(conf: Path, solver: SubprocessSolver, verbose: bool = False) -> int:
+def _run_intersection(conf: Path, solver: SubprocessSolver, verbosity: int = 0) -> int:
     rules = parse_file(conf)
-    if verbose:
+    if verbosity >= 1:
         print(f"[parse] {len(rules)} rules loaded from {conf}")
-    checker = IntersectionChecker(solver, verbose=verbose)
+    checker = IntersectionChecker(solver, verbosity=verbosity)
     results = checker.find_intersecting(rules)
 
     intersecting = [r for r in results if r.has_intersection]
@@ -120,11 +126,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     solver = _make_solver(args)
+    verbosity = 2 if args.verbose2 else (1 if args.verbose else 0)
 
     if args.analysis == "subsumption":
-        return _run_subsumption(args.conf, solver, verbose=args.verbose)
+        return _run_subsumption(args.conf, solver, verbosity=verbosity)
     if args.analysis == "intersection":
-        return _run_intersection(args.conf, solver, verbose=args.verbose)
+        return _run_intersection(args.conf, solver, verbosity=verbosity)
 
     print(f"error: unknown analysis '{args.analysis}'", file=sys.stderr)
     return 1
