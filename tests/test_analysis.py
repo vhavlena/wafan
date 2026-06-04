@@ -222,7 +222,7 @@ class TestSubsumptionSmt2:
         r1 = make_rule(pattern="foo", transforms=["lowercase"])
         r2 = make_rule(pattern="foo|bar")
         smt2 = subsumption_smt2(r1, r2)
-        assert "str.lower" in smt2
+        assert "str.to_lower" in smt2
 
     def test_unsupported_transform_raises(self):
         r1 = make_rule(pattern="x", transforms=["__unknown_transform__"])
@@ -543,7 +543,7 @@ class TestIntersectionSmt2:
     def test_transform_reflected(self):
         r1 = make_rule(pattern="foo", transforms=["lowercase"])
         r2 = make_rule(pattern="bar")
-        assert "str.lower" in intersection_smt2(r1, r2)
+        assert "str.to_lower" in intersection_smt2(r1, r2)
 
     def test_unsupported_transform_raises(self):
         r1 = make_rule(pattern="x", transforms=["__unknown_transform__"])

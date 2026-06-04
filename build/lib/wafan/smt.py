@@ -7,8 +7,8 @@ SecRule ``t:`` transformations are handled in two ways:
 
 Direct SMT-LIB counterparts (applied inline):
   none            – resets the transform chain (identity)
-  lowercase       – str.lower
-  uppercase       – str.upper
+  lowercase       – str.to_lower
+  uppercase       – str.to_upper
 
 Uninterpreted functions (declared per-formula with constraining axioms):
   urlDecode       – t_urlDecode       : length-non-increasing, idempotent
@@ -46,7 +46,7 @@ SMT_LOGIC = "QF_SLIA"
 @dataclass(frozen=True)
 class _TransformDef:
     """Definition of one SecRule transform in SMT-LIB2 terms."""
-    smt_fn: str           # SMT function name, e.g. "str.lower"; empty = direct inline
+    smt_fn: str           # SMT function name, e.g. "str.to_lower"; empty = direct inline
     fun_decl: str = ""    # (declare-fun …) line; empty for built-in SMT functions
     axioms: tuple[str, ...] = ()
 
@@ -156,8 +156,8 @@ _NORM_PATH_WIN_AXIOMS = (
 # "none" is excluded — it is handled specially by extract_transforms.
 _TRANSFORMS: dict[str, _TransformDef] = {
     # --- direct SMT-LIB built-ins ---
-    "lowercase":  _TransformDef(smt_fn="str.lower"),
-    "uppercase":  _TransformDef(smt_fn="str.upper"),
+    "lowercase":  _TransformDef(smt_fn="str.to_lower"),
+    "uppercase":  _TransformDef(smt_fn="str.to_upper"),
     # --- uninterpreted functions ---
     "urldecode":         _uninterpreted("t_urlDecode",          *_URL_DECODE_AXIOMS),
     "urldecodeuni":      _uninterpreted("t_urlDecodeUni",
@@ -233,7 +233,7 @@ def apply_transforms_smt(var_expr: str, transforms: Sequence[str]) -> str:
     """Wrap *var_expr* with SMT-LIB transformation functions.
 
     Transforms are applied left-to-right (innermost = first applied), e.g.
-    ``[lowercase, uppercase]`` produces ``(str.upper (str.lower var))``.
+    ``[lowercase, uppercase]`` produces ``(str.to_upper (str.to_lower var))``.
 
     Raises UnsupportedTransformError for any transform not in _TRANSFORMS.
     """
@@ -252,7 +252,7 @@ def transform_preamble(transforms: Sequence[str]) -> tuple[list[str], list[str]]
     """Return ``(fun_declarations, axioms)`` required by *transforms*.
 
     Only uninterpreted transforms contribute entries; direct SMT-LIB functions
-    (e.g. ``str.lower``) need no declaration.  Duplicates are eliminated while
+    (e.g. ``str.to_lower``) need no declaration.  Duplicates are eliminated while
     preserving first-seen order.
     """
     seen: set[str] = set()

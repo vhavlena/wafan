@@ -120,21 +120,21 @@ class TestApplyTransformsSmt:
         assert apply_transforms_smt("BODY", []) == "BODY"
 
     def test_lowercase_wraps_with_str_lower(self):
-        assert apply_transforms_smt("BODY", ["lowercase"]) == "(str.lower BODY)"
+        assert apply_transforms_smt("BODY", ["lowercase"]) == "(str.to_lower BODY)"
 
     def test_uppercase_wraps_with_str_upper(self):
-        assert apply_transforms_smt("BODY", ["uppercase"]) == "(str.upper BODY)"
+        assert apply_transforms_smt("BODY", ["uppercase"]) == "(str.to_upper BODY)"
 
     def test_lowerCase_alias(self):
-        assert apply_transforms_smt("BODY", ["lowerCase"]) == "(str.lower BODY)"
+        assert apply_transforms_smt("BODY", ["lowerCase"]) == "(str.to_lower BODY)"
 
     def test_upperCase_alias(self):
-        assert apply_transforms_smt("BODY", ["upperCase"]) == "(str.upper BODY)"
+        assert apply_transforms_smt("BODY", ["upperCase"]) == "(str.to_upper BODY)"
 
     def test_stacking_order_innermost_first(self):
         # lowercase applied first (innermost), then uppercase wraps it
         result = apply_transforms_smt("BODY", ["lowercase", "uppercase"])
-        assert result == "(str.upper (str.lower BODY))"
+        assert result == "(str.to_upper (str.to_lower BODY))"
 
     def test_unsupported_transform_raises(self):
         with pytest.raises(UnsupportedTransformError):
@@ -256,24 +256,24 @@ class TestRxRuleToSmt:
 
     def test_lowercase_transform_applied(self):
         f = rx_rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["lowercase"]))
-        assert "(str.lower BODY)" in f.assertion
+        assert "(str.to_lower BODY)" in f.assertion
 
     def test_uppercase_transform_applied(self):
         f = rx_rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["uppercase"]))
-        assert "(str.upper BODY)" in f.assertion
+        assert "(str.to_upper BODY)" in f.assertion
 
     def test_none_then_lowercase(self):
         f = rx_rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["none", "lowercase"]))
-        assert "(str.lower BODY)" in f.assertion
+        assert "(str.to_lower BODY)" in f.assertion
 
     def test_lowercase_then_none_resets(self):
         f = rx_rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["lowercase", "none"]))
         assert "str.in_re BODY" in f.assertion
-        assert "str.lower" not in f.assertion
+        assert "str.to_lower" not in f.assertion
 
     def test_stacked_transforms_nested(self):
         f = rx_rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["lowercase", "uppercase"]))
-        assert "(str.upper (str.lower BODY))" in f.assertion
+        assert "(str.to_upper (str.to_lower BODY))" in f.assertion
 
     def test_truly_unknown_transform_raises(self):
         with pytest.raises(UnsupportedTransformError):
@@ -291,18 +291,18 @@ class TestRxRuleToSmt:
             lineno=1,
         )
         f = rx_rule_to_smt(rule)
-        assert "(str.lower A)" in f.assertion
-        assert "(str.lower B)" in f.assertion
+        assert "(str.to_lower A)" in f.assertion
+        assert "(str.to_lower B)" in f.assertion
 
     def test_conf_file_rules_translate_with_expected_transforms(self):
         rules = parse_rx_rules(CONF)
         for rule in rules:
             f = rx_rule_to_smt(rule)
             if rule.rule_id == "500":
-                assert "str.lower" in f.assertion
+                assert "str.to_lower" in f.assertion
             else:
-                assert "str.lower" not in f.assertion
-            assert "str.upper" not in f.assertion
+                assert "str.to_lower" not in f.assertion
+            assert "str.to_upper" not in f.assertion
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +348,7 @@ class TestUninterpretedTransformExpression:
 
     def test_stacked_with_direct(self):
         result = apply_transforms_smt("VAR", ["urlDecode", "lowercase"])
-        assert result == "(str.lower (t_urlDecode VAR))"
+        assert result == "(str.to_lower (t_urlDecode VAR))"
 
     def test_unknown_still_raises(self):
         with pytest.raises(UnsupportedTransformError):
@@ -466,7 +466,7 @@ class TestSmtFormulaWithPreamble:
     def test_stacked_uninterpreted_and_direct(self):
         rule = make_rule(var_name="V", pattern="p", transforms=["urlDecode", "lowercase"])
         f = rx_rule_to_smt(rule)
-        assert "str.lower (t_urlDecode V)" in f.assertion
+        assert "str.to_lower (t_urlDecode V)" in f.assertion
         assert len(f.fun_declarations) == 1
 
     def test_htmlentitydecode_produces_preamble(self):
