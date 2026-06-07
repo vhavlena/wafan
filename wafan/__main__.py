@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .analysis import SubprocessSolver, SubsumptionChecker, IntersectionChecker
+from .analysis import SubprocessSolver, SubsumptionChecker, IntersectionChecker, WitnessChecker
 from .parser import parse_file
 
 
@@ -32,9 +32,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--analysis",
-        choices=["subsumption", "intersection"],
+        choices=["subsumption", "intersection", "witness"],
         default="subsumption",
-        help="Analysis to run (default: subsumption).",
+        help="Analysis to run (default: subsumption). "
+             "'witness' finds a concrete input satisfying each rule.",
     )
     p.add_argument(
         "--timeout",
@@ -117,6 +118,39 @@ def _run_intersection(conf: Path, solver: SubprocessSolver, verbosity: int = 0) 
     return 0
 
 
+def _run_witness(conf: Path, solver: SubprocessSolver, verbosity: int = 0) -> int:
+    rules = parse_file(conf)
+    if verbosity >= 1:
+        print(f"[parse] {len(rules)} rules loaded from {conf}")
+    checker = WitnessChecker(solver, verbosity=verbosity)
+    results = checker.find_witnesses(rules)
+
+    sat_results = [r for r in results if r.has_witness]
+    unsat_results = [r for r in results if r.result.value == "unsat"]
+    unknown_results = [r for r in results if r.result.value == "unknown"]
+
+    if not sat_results:
+        print("No satisfiable rules found (all rules are either unsatisfiable or unknown).")
+        return 0
+
+    print(f"Found {len(sat_results)} rule(s) with concrete triggering inputs:\n")
+    for res in sat_results:
+        print(f"  rule {res.rule.rule_id}  ({res.rule.operator_argument[:60]})")
+        print(res.format_model())
+        print()
+
+    if unsat_results:
+        print(f"{len(unsat_results)} rule(s) found UNSAT (pattern can never match):")
+        for res in unsat_results:
+            print(f"  rule {res.rule.rule_id}")
+        print()
+
+    if unknown_results:
+        print(f"{len(unknown_results)} rule(s) returned unknown (unsupported features or timeout).")
+
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -132,6 +166,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_subsumption(args.conf, solver, verbosity=verbosity)
     if args.analysis == "intersection":
         return _run_intersection(args.conf, solver, verbosity=verbosity)
+    if args.analysis == "witness":
+        return _run_witness(args.conf, solver, verbosity=verbosity)
 
     print(f"error: unknown analysis '{args.analysis}'", file=sys.stderr)
     return 1
