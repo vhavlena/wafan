@@ -937,7 +937,10 @@ class TestWitnessCheckerUnit:
 
 import os as _os
 
-Z3_PATH = _os.environ.get("WAFAN_Z3_PATH", "z3")
+# Requires a z3 build with re.from_ecma2020 support (not in mainstream z3).
+# Set WAFAN_Z3_PATH to the path of such a binary to enable E2E tests.
+Z3_PATH = _os.environ.get("WAFAN_Z3_PATH")
+_Z3_AVAILABLE = Z3_PATH is not None and _os.path.exists(Z3_PATH)
 
 
 @pytest.fixture(scope="module")
@@ -945,10 +948,7 @@ def z3_solver() -> SubprocessSolver:
     return SubprocessSolver(argv=[Z3_PATH, "-in"], timeout=30)
 
 
-@pytest.mark.skipif(
-    not __import__("shutil").which(Z3_PATH) and not __import__("os.path").exists(Z3_PATH),
-    reason="z3 solver not available (set WAFAN_Z3_PATH to enable)",
-)
+@pytest.mark.skipif(not _Z3_AVAILABLE, reason="WAFAN_Z3_PATH not set or binary not found")
 class TestWitnessE2E:
     def test_simple_pattern_has_witness(self, z3_solver):
         r = make_rule(rule_id="1", var_name="ARGS", pattern="foo|bar")

@@ -58,7 +58,8 @@ class TestArgumentParser:
 
 
 class TestMakeSolver:
-    def test_default_solver_uses_z3(self):
+    def test_default_solver_uses_z3(self, monkeypatch):
+        monkeypatch.delenv("WAFAN_Z3_PATH", raising=False)
         args = _build_parser().parse_args([str(REAL_CONF)])
         solver = _make_solver(args)
         assert isinstance(solver, SubprocessSolver)
