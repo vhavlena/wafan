@@ -149,6 +149,13 @@ def _merge_unique(a: list[str], b: list[str]) -> list[str]:
     return a + [x for x in b if x not in seen]
 
 
+_SMT_SEP = "  " + "-" * 62
+
+
+def _print_smt_block(smt2: str) -> None:
+    print(f"  SMT-LIB2:\n{_SMT_SEP}\n{smt2}\n{_SMT_SEP}", flush=True)
+
+
 def _rule_label(rule: SecRule, pat_width: int = 35) -> str:
     """Return a compact human-readable identifier for *rule*.
 
@@ -333,14 +340,14 @@ class IntersectionChecker:
 
         if not rules_share_variable(rule1, rule2):
             if self._verbosity >= 1:
-                print(f"{prefix}  →  skipped (no shared variable)")
+                print(f"{prefix}  [{'skipped':<12}]  (no shared variable)")
             return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN)
 
         try:
             smt2 = intersection_smt2(rule1, rule2)
         except UnsupportedTransformError as exc:
             if self._verbosity >= 1:
-                print(f"{prefix}  →  skipped (unsupported transform: {exc})")
+                print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
             return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN)
 
         result = self._solver.solve(smt2)
@@ -350,9 +357,9 @@ class IntersectionChecker:
                 SolverResult.UNSAT: "disjoint",
                 SolverResult.UNKNOWN: "unknown",
             }[result]
-            print(f"{prefix}  →  {outcome}")
+            print(f"{prefix}  [{outcome:<12}]")
         if self._verbosity >= 2:
-            print(f"[smt2]\n{smt2}\n[/smt2]", flush=True)
+            _print_smt_block(smt2)
         return IntersectionResult(rule1, rule2, result)
 
     def find_intersecting(self, rules: Sequence[SecRule]) -> list[IntersectionResult]:
@@ -364,7 +371,7 @@ class IntersectionChecker:
         rx_rules = [r for r in rules if r.operator in ("@rx", "!@rx")]
         n = len(rx_rules)
         if self._verbosity >= 1:
-            print(f"[intersection] {n} rules, {n * (n - 1) // 2} unordered pairs to check")
+            print(f"Intersection analysis: {n} rules, {n * (n - 1) // 2} unordered pairs\n")
         results: list[IntersectionResult] = []
 
         for i, r1 in enumerate(rx_rules):
@@ -395,14 +402,14 @@ class SubsumptionChecker:
 
         if not rules_share_variable(rule1, rule2):
             if self._verbosity >= 1:
-                print(f"{prefix}  →  skipped (no shared variable)")
+                print(f"{prefix}  [{'skipped':<12}]  (no shared variable)")
             return SubsumptionResult(rule1, rule2, SolverResult.UNKNOWN)
 
         try:
             smt2 = subsumption_smt2(rule1, rule2)
         except UnsupportedTransformError as exc:
             if self._verbosity >= 1:
-                print(f"{prefix}  →  skipped (unsupported transform: {exc})")
+                print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
             return SubsumptionResult(rule1, rule2, SolverResult.UNKNOWN)
 
         result = self._solver.solve(smt2)
@@ -412,9 +419,9 @@ class SubsumptionChecker:
                 SolverResult.SAT: "not subsumed",
                 SolverResult.UNKNOWN: "unknown",
             }[result]
-            print(f"{prefix}  →  {outcome}")
+            print(f"{prefix}  [{outcome:<12}]")
         if self._verbosity >= 2:
-            print(f"[smt2]\n{smt2}\n[/smt2]", flush=True)
+            _print_smt_block(smt2)
         return SubsumptionResult(rule1, rule2, result)
 
     def find_subsumed(self, rules: Sequence[SecRule]) -> list[SubsumptionResult]:
@@ -427,7 +434,7 @@ class SubsumptionChecker:
         rx_rules = [r for r in rules if r.operator in ("@rx", "!@rx")]
         n = len(rx_rules)
         if self._verbosity >= 1:
-            print(f"[subsumption] {n} rules, {n * (n - 1)} ordered pairs to check")
+            print(f"Subsumption analysis: {n} rules, {n * (n - 1)} ordered pairs\n")
         results: list[SubsumptionResult] = []
 
         for i, r1 in enumerate(rx_rules):
@@ -486,8 +493,8 @@ class WitnessResult:
     def format_model(self) -> str:
         """Return a human-readable representation of the model."""
         if not self.model:
-            return "(no model)"
-        return "  " + "\n  ".join(f"{k} = {v!r}" for k, v in self.model.items())
+            return "    (no model)"
+        return "\n".join(f"    {k} = {v!r}" for k, v in self.model.items())
 
 
 class WitnessChecker:
@@ -511,14 +518,14 @@ class WitnessChecker:
 
         if rule.operator not in ("@rx", "!@rx"):
             if self._verbosity >= 1:
-                print(f"  {label}  →  skipped (not @rx)")
+                print(f"  {label}  [{'skipped':<13}]  (not @rx)")
             return WitnessResult(rule, SolverResult.UNKNOWN)
 
         try:
             smt2 = witness_smt2(rule)
         except UnsupportedTransformError as exc:
             if self._verbosity >= 1:
-                print(f"  {label}  →  skipped (unsupported transform: {exc})")
+                print(f"  {label}  [{'skipped':<13}]  (unsupported transform: {exc})")
             return WitnessResult(rule, SolverResult.UNKNOWN)
 
         result, model = self._solver.solve_with_model(smt2)
@@ -526,12 +533,12 @@ class WitnessChecker:
         if self._verbosity >= 1:
             outcome = {
                 SolverResult.SAT: "SAT",
-                SolverResult.UNSAT: "UNSAT (rule never matches)",
+                SolverResult.UNSAT: "never matches",
                 SolverResult.UNKNOWN: "unknown",
             }[result]
-            print(f"  {label}  →  {outcome}")
+            print(f"  {label}  [{outcome:<13}]")
         if self._verbosity >= 2:
-            print(f"[smt2]\n{smt2}\n[/smt2]", flush=True)
+            _print_smt_block(smt2)
 
         return WitnessResult(rule, result, model)
 
@@ -543,5 +550,5 @@ class WitnessChecker:
         """
         rx_rules = [r for r in rules if r.operator in ("@rx", "!@rx")]
         if self._verbosity >= 1:
-            print(f"[witness] {len(rx_rules)} rules to check")
+            print(f"Witness analysis: {len(rx_rules)} rules\n")
         return [self.check_rule(r) for r in rx_rules]

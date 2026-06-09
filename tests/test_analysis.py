@@ -922,7 +922,7 @@ class TestWitnessCheckerUnit:
 
     def test_format_model_no_model(self):
         res = WitnessResult(make_rule(), SolverResult.UNKNOWN, None)
-        assert res.format_model() == "(no model)"
+        assert res.format_model() == "    (no model)"
 
     def test_format_model_with_model(self):
         res = WitnessResult(make_rule(), SolverResult.SAT, {"ARGS": "hello"})

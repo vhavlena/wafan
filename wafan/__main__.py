@@ -67,10 +67,13 @@ def _make_solver(args: argparse.Namespace) -> SubprocessSolver:
     return SubprocessSolver(argv=argv, timeout=args.timeout)
 
 
+_SEP = "-" * 66
+
+
 def _run_subsumption(conf: Path, solver: SubprocessSolver, verbosity: int = 0) -> int:
     rules = parse_file(conf)
     if verbosity >= 1:
-        print(f"[parse] {len(rules)} rules loaded from {conf}")
+        print(f"Loaded {len(rules)} rules from {conf}")
     checker = SubsumptionChecker(solver, verbosity=verbosity)
     results = checker.find_subsumed(rules)
 
@@ -78,12 +81,12 @@ def _run_subsumption(conf: Path, solver: SubprocessSolver, verbosity: int = 0) -
     not_subsumed = [r for r in results if not r.is_subsumed]
 
     if verbosity >= 1:
-        print()
+        print(f"\n{_SEP}")
     if not subsumed:
         print("No subsumed rule pairs found.")
         return 0
 
-    print(f"Subsumed pairs ({len(subsumed)} found):\n")
+    print(f"Subsumed pairs  ({len(subsumed)} found)\n")
     for res in subsumed:
         print(f"  {_rule_label(res.rule1, pat_width=50)}")
         print(f"    ⊆  {_rule_label(res.rule2, pat_width=50)}")
@@ -94,7 +97,7 @@ def _run_subsumption(conf: Path, solver: SubprocessSolver, verbosity: int = 0) -
 def _run_intersection(conf: Path, solver: SubprocessSolver, verbosity: int = 0) -> int:
     rules = parse_file(conf)
     if verbosity >= 1:
-        print(f"[parse] {len(rules)} rules loaded from {conf}")
+        print(f"Loaded {len(rules)} rules from {conf}")
     checker = IntersectionChecker(solver, verbosity=verbosity)
     results = checker.find_intersecting(rules)
 
@@ -102,12 +105,12 @@ def _run_intersection(conf: Path, solver: SubprocessSolver, verbosity: int = 0) 
     disjoint = [r for r in results if not r.has_intersection]
 
     if verbosity >= 1:
-        print()
+        print(f"\n{_SEP}")
     if not intersecting:
         print("No intersecting rule pairs found.")
         return 0
 
-    print(f"Intersecting pairs ({len(intersecting)} found):\n")
+    print(f"Intersecting pairs  ({len(intersecting)} found)\n")
     for res in intersecting:
         print(f"  {_rule_label(res.rule1, pat_width=50)}")
         print(f"    ∩  {_rule_label(res.rule2, pat_width=50)}")
@@ -118,7 +121,7 @@ def _run_intersection(conf: Path, solver: SubprocessSolver, verbosity: int = 0) 
 def _run_witness(conf: Path, solver: SubprocessSolver, verbosity: int = 0) -> int:
     rules = parse_file(conf)
     if verbosity >= 1:
-        print(f"[parse] {len(rules)} rules loaded from {conf}")
+        print(f"Loaded {len(rules)} rules from {conf}")
     checker = WitnessChecker(solver, verbosity=verbosity)
     results = checker.find_witnesses(rules)
 
@@ -127,25 +130,25 @@ def _run_witness(conf: Path, solver: SubprocessSolver, verbosity: int = 0) -> in
     unknown_results = [r for r in results if r.result.value == "unknown"]
 
     if verbosity >= 1:
-        print()
+        print(f"\n{_SEP}")
     if not sat_results:
         print("No satisfiable rules found (all rules are either unsatisfiable or unknown).")
         return 0
 
-    print(f"Concrete triggering inputs ({len(sat_results)} rule(s)):\n")
+    print(f"Concrete triggering inputs  ({len(sat_results)} rule(s))\n")
     for res in sat_results:
         print(f"  {_rule_label(res.rule, pat_width=50)}")
         print(res.format_model())
         print()
 
     if unsat_results:
-        print(f"Rules that never match ({len(unsat_results)}):")
+        print(f"Rules that never match  ({len(unsat_results)})")
         for res in unsat_results:
             print(f"  {_rule_label(res.rule, pat_width=50)}")
         print()
 
     if unknown_results:
-        print(f"Rules with unknown result ({len(unknown_results)}, unsupported features or timeout):")
+        print(f"Rules with unknown result  ({len(unknown_results)}, unsupported features or timeout)")
         for res in unknown_results:
             print(f"  {_rule_label(res.rule, pat_width=50)}")
 
