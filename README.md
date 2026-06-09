@@ -1,5 +1,7 @@
 # wafan
 
+[![Test](https://github.com/vhavlena/wafan/actions/workflows/python-tests.yml/badge.svg)](https://github.com/vhavlena/wafan/actions/workflows/python-tests.yml)
+
 SMT-based analysis of WAF ModSecurity SecRule rulesets.
 
 `wafan` parses ModSecurity configuration files, converts `@rx` rules to
