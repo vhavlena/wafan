@@ -16,6 +16,7 @@ via stdin/stdout using the SMT-LIB2 format produced by wafan.smt.
 
 from __future__ import annotations
 
+import re as _re
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
@@ -25,10 +26,12 @@ from .parser import SecRule
 from .regex_conv import pcre_to_ecma2020
 from .smt import (
     SMT_LOGIC,
+    SmtFormula,
     UnsupportedTransformError,
     _escape_smt_string,
     apply_transforms_smt,
     extract_transforms,
+    rx_rule_to_smt,
     transform_preamble,
 )
 
@@ -74,6 +77,67 @@ class SubprocessSolver:
         except ValueError:
             return SolverResult.UNKNOWN
 
+    def solve_with_model(self, smt2: str) -> tuple[SolverResult, dict[str, str] | None]:
+        """Run solver and return (result, model).
+
+        The model is a dict mapping variable names to their string values, or
+        None if the result is not SAT or the model could not be parsed.
+
+        The formula must include a (get-value ...) command after (check-sat),
+        and the solver must be invoked with model generation enabled.  This is
+        handled automatically by the witness analysis: the solver argv is
+        extended with 'model=true' when needed.
+        """
+        model_argv = _argv_with_model(self.argv)
+        try:
+            proc = subprocess.run(
+                model_argv,
+                input=smt2,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return SolverResult.UNKNOWN, None
+
+        output = proc.stdout.strip()
+        lines = output.splitlines()
+        first = lines[0] if lines else ""
+        try:
+            result = SolverResult(first)
+        except ValueError:
+            return SolverResult.UNKNOWN, None
+
+        if result != SolverResult.SAT:
+            return result, None
+
+        model = _parse_get_value_output("\n".join(lines[1:]))
+        return result, model
+
+
+def _argv_with_model(argv: list[str]) -> list[str]:
+    """Return argv extended with model=true unless already present."""
+    if any(a.startswith("model") for a in argv):
+        return argv
+    return argv + ["model=true"]
+
+
+def _parse_get_value_output(text: str) -> dict[str, str] | None:
+    """Parse z3's (get-value ...) response into {name: value} dict.
+
+    Expected format (one or more bindings):
+        ((VAR1 "value1")
+         (VAR2 "value2"))
+
+    Returns None if parsing fails.
+    """
+    result: dict[str, str] = {}
+    for m in _re.finditer(r'\((\w+)\s+"((?:[^"\\]|\\.)*)"\)', text):
+        name = m.group(1)
+        value = m.group(2).replace('\\"', '"').replace("\\\\", "\\")
+        result[name] = value
+    return result if result else None
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -83,6 +147,33 @@ def _merge_unique(a: list[str], b: list[str]) -> list[str]:
     """Concatenate two lists, dropping duplicates from b that already appear in a."""
     seen = set(a)
     return a + [x for x in b if x not in seen]
+
+
+_SMT_SEP = "  " + "-" * 62
+
+
+def _print_smt_block(smt2: str) -> None:
+    print(f"  SMT-LIB2:\n{_SMT_SEP}\n{smt2}\n{_SMT_SEP}", flush=True)
+
+
+def _rule_label(rule: SecRule, pat_width: int = 35) -> str:
+    """Return a compact human-readable identifier for *rule*.
+
+    Format: ``#ID [VAR1,VAR2 OP "PATTERN"]``
+
+    Variable list is capped at three names; pattern is truncated to
+    *pat_width* characters so the label fits on one terminal line.
+    """
+    var_names = [v.name for v in rule.variables]
+    if len(var_names) > 3:
+        vars_str = ",".join(var_names[:3]) + ",..."
+    else:
+        vars_str = ",".join(var_names)
+    pat = rule.operator_argument
+    if len(pat) > pat_width:
+        pat = pat[:pat_width - 3] + "..."
+    op = rule.operator
+    return f"#{rule.rule_id} [{vars_str} {op} \"{pat}\"]"
 
 
 # ---------------------------------------------------------------------------
@@ -243,32 +334,32 @@ class IntersectionChecker:
         Returns UNKNOWN if either rule uses an unsupported transform or if the
         rules target disjoint sets of variables.
         """
-        if self._verbosity >= 1:
-            print(f"  checking intersection: rule {rule1.rule_id} ∩ rule {rule2.rule_id} ...", end=" ", flush=True)
+        lhs = _rule_label(rule1)
+        rhs = _rule_label(rule2)
+        prefix = f"  {lhs}  ∩  {rhs}"
 
         if not rules_share_variable(rule1, rule2):
             if self._verbosity >= 1:
-                print("skipped (no shared variable)")
+                print(f"{prefix}  [{'skipped':<12}]  (no shared variable)")
             return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN)
 
         try:
             smt2 = intersection_smt2(rule1, rule2)
         except UnsupportedTransformError as exc:
             if self._verbosity >= 1:
-                print(f"skipped (unsupported transform: {exc})")
+                print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
             return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN)
-
-        if self._verbosity >= 2:
-            print(f"\n[smt2]\n{smt2}\n[/smt2]", flush=True)
 
         result = self._solver.solve(smt2)
         if self._verbosity >= 1:
-            label = {
+            outcome = {
                 SolverResult.SAT: "INTERSECTING",
                 SolverResult.UNSAT: "disjoint",
                 SolverResult.UNKNOWN: "unknown",
             }[result]
-            print(label)
+            print(f"{prefix}  [{outcome:<12}]")
+        if self._verbosity >= 2:
+            _print_smt_block(smt2)
         return IntersectionResult(rule1, rule2, result)
 
     def find_intersecting(self, rules: Sequence[SecRule]) -> list[IntersectionResult]:
@@ -278,8 +369,9 @@ class IntersectionChecker:
         once; pairs where the solver returns UNKNOWN are excluded.
         """
         rx_rules = [r for r in rules if r.operator in ("@rx", "!@rx")]
+        n = len(rx_rules)
         if self._verbosity >= 1:
-            print(f"[intersection] {len(rx_rules)} @rx/@!rx rules, {len(rx_rules) * (len(rx_rules) - 1) // 2} unordered pairs to check")
+            print(f"Intersection analysis: {n} rules, {n * (n - 1) // 2} unordered pairs\n")
         results: list[IntersectionResult] = []
 
         for i, r1 in enumerate(rx_rules):
@@ -304,32 +396,32 @@ class SubsumptionChecker:
         Returns UNKNOWN if either rule uses an unsupported transform or if the
         rules target disjoint sets of variables.
         """
-        if self._verbosity >= 1:
-            print(f"  checking subsumption: rule {rule1.rule_id} ⊆ rule {rule2.rule_id} ...", end=" ", flush=True)
+        lhs = _rule_label(rule1)
+        rhs = _rule_label(rule2)
+        prefix = f"  {lhs}  ⊆  {rhs}"
 
         if not rules_share_variable(rule1, rule2):
             if self._verbosity >= 1:
-                print("skipped (no shared variable)")
+                print(f"{prefix}  [{'skipped':<12}]  (no shared variable)")
             return SubsumptionResult(rule1, rule2, SolverResult.UNKNOWN)
 
         try:
             smt2 = subsumption_smt2(rule1, rule2)
         except UnsupportedTransformError as exc:
             if self._verbosity >= 1:
-                print(f"skipped (unsupported transform: {exc})")
+                print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
             return SubsumptionResult(rule1, rule2, SolverResult.UNKNOWN)
-
-        if self._verbosity >= 2:
-            print(f"\n[smt2]\n{smt2}\n[/smt2]", flush=True)
 
         result = self._solver.solve(smt2)
         if self._verbosity >= 1:
-            label = {
+            outcome = {
                 SolverResult.UNSAT: "SUBSUMED",
                 SolverResult.SAT: "not subsumed",
                 SolverResult.UNKNOWN: "unknown",
             }[result]
-            print(label)
+            print(f"{prefix}  [{outcome:<12}]")
+        if self._verbosity >= 2:
+            _print_smt_block(smt2)
         return SubsumptionResult(rule1, rule2, result)
 
     def find_subsumed(self, rules: Sequence[SecRule]) -> list[SubsumptionResult]:
@@ -340,8 +432,9 @@ class SubsumptionChecker:
         excluded from the result.
         """
         rx_rules = [r for r in rules if r.operator in ("@rx", "!@rx")]
+        n = len(rx_rules)
         if self._verbosity >= 1:
-            print(f"[subsumption] {len(rx_rules)} @rx/@!rx rules, {len(rx_rules) * (len(rx_rules) - 1)} ordered pairs to check")
+            print(f"Subsumption analysis: {n} rules, {n * (n - 1)} ordered pairs\n")
         results: list[SubsumptionResult] = []
 
         for i, r1 in enumerate(rx_rules):
@@ -353,3 +446,109 @@ class SubsumptionChecker:
                     results.append(res)
 
         return results
+
+
+# ---------------------------------------------------------------------------
+# Witness (concrete model) query generation
+# ---------------------------------------------------------------------------
+
+def witness_smt2(rule: SecRule) -> str:
+    """Return an SMT-LIB2 string that, when SAT, yields a concrete input
+    triggering *rule*.
+
+    The formula asserts the rule's match condition for each of its variables.
+    A (get-value ...) command is appended so the solver can return concrete
+    string values.  The solver must be invoked with model generation enabled
+    (e.g. z3 model=true -in).
+
+    Raises:
+        ValueError: if the operator is not @rx / !@rx.
+        UnsupportedTransformError: if a t: action is unknown.
+    """
+    formula: SmtFormula = rx_rule_to_smt(rule)
+    return formula.to_smt2_with_model()
+
+
+# ---------------------------------------------------------------------------
+# Witness checker
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WitnessResult:
+    """Outcome of finding a concrete input that triggers *rule*.
+
+    If *result* is SAT, *model* maps each ModSecurity variable name (as used
+    in the SMT formula) to a concrete string value that satisfies the rule.
+    For unsupported rules the result is UNKNOWN and model is None.
+    """
+
+    rule: SecRule
+    result: SolverResult
+    model: dict[str, str] | None = None
+
+    @property
+    def has_witness(self) -> bool:
+        return self.result == SolverResult.SAT
+
+    def format_model(self) -> str:
+        """Return a human-readable representation of the model."""
+        if not self.model:
+            return "    (no model)"
+        return "\n".join(f"    {k} = {v!r}" for k, v in self.model.items())
+
+
+class WitnessChecker:
+    """Find concrete inputs (witnesses/models) that trigger @rx SecRules.
+
+    Requires a SubprocessSolver (or any object with a solve_with_model
+    method) so that the SMT model can be extracted from the solver output.
+    """
+
+    def __init__(self, solver: SubprocessSolver, verbosity: int = 0) -> None:
+        self._solver = solver
+        self._verbosity = verbosity
+
+    def check_rule(self, rule: SecRule) -> WitnessResult:
+        """Find a concrete input that triggers *rule*, if one exists.
+
+        Returns UNKNOWN if the rule uses an unsupported transform or a
+        non-@rx operator.
+        """
+        label = _rule_label(rule)
+
+        if rule.operator not in ("@rx", "!@rx"):
+            if self._verbosity >= 1:
+                print(f"  {label}  [{'skipped':<13}]  (not @rx)")
+            return WitnessResult(rule, SolverResult.UNKNOWN)
+
+        try:
+            smt2 = witness_smt2(rule)
+        except UnsupportedTransformError as exc:
+            if self._verbosity >= 1:
+                print(f"  {label}  [{'skipped':<13}]  (unsupported transform: {exc})")
+            return WitnessResult(rule, SolverResult.UNKNOWN)
+
+        result, model = self._solver.solve_with_model(smt2)
+
+        if self._verbosity >= 1:
+            outcome = {
+                SolverResult.SAT: "SAT",
+                SolverResult.UNSAT: "never matches",
+                SolverResult.UNKNOWN: "unknown",
+            }[result]
+            print(f"  {label}  [{outcome:<13}]")
+        if self._verbosity >= 2:
+            _print_smt_block(smt2)
+
+        return WitnessResult(rule, result, model)
+
+    def find_witnesses(self, rules: Sequence[SecRule]) -> list[WitnessResult]:
+        """Return WitnessResults for all @rx / !@rx rules.
+
+        Rules where the solver returns UNKNOWN are included so callers can
+        distinguish unsatisfiable rules from solver failures.
+        """
+        rx_rules = [r for r in rules if r.operator in ("@rx", "!@rx")]
+        if self._verbosity >= 1:
+            print(f"Witness analysis: {len(rx_rules)} rules\n")
+        return [self.check_rule(r) for r in rx_rules]

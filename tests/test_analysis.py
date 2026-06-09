@@ -26,6 +26,10 @@ from wafan.analysis import (
     IntersectionChecker,
     intersection_smt2,
     rules_share_variable,
+    WitnessResult,
+    WitnessChecker,
+    witness_smt2,
+    _parse_get_value_output,
 )
 
 CONF = Path(__file__).parent / "data" / "subsumption.conf"
@@ -730,3 +734,248 @@ class TestIntersectionE2E:
                 assert "(set-logic" in smt2
                 assert "(declare-const x String)" in smt2
                 assert smt2.strip().endswith("(check-sat)")
+
+
+# ---------------------------------------------------------------------------
+# _parse_get_value_output – unit tests
+# ---------------------------------------------------------------------------
+
+class TestParseGetValueOutput:
+    def test_single_variable(self):
+        text = '((x "foo"))'
+        result = _parse_get_value_output(text)
+        assert result == {"x": "foo"}
+
+    def test_multiple_variables(self):
+        text = '((ARGS "hello")\n (REQUEST_URI "world"))'
+        result = _parse_get_value_output(text)
+        assert result == {"ARGS": "hello", "REQUEST_URI": "world"}
+
+    def test_empty_string_value(self):
+        text = '((x ""))'
+        result = _parse_get_value_output(text)
+        assert result == {"x": ""}
+
+    def test_escaped_quotes_in_value(self):
+        text = r'((x "say \"hello\""))'
+        result = _parse_get_value_output(text)
+        assert result is not None
+        assert result["x"] == 'say "hello"'
+
+    def test_empty_text_returns_none(self):
+        assert _parse_get_value_output("") is None
+
+    def test_no_bindings_returns_none(self):
+        assert _parse_get_value_output("unsat") is None
+
+
+# ---------------------------------------------------------------------------
+# witness_smt2 – structure tests
+# ---------------------------------------------------------------------------
+
+class TestWitnessSmt2:
+    def test_returns_string(self):
+        r = make_rule(rule_id="1", pattern="foo")
+        assert isinstance(witness_smt2(r), str)
+
+    def test_contains_set_logic(self):
+        r = make_rule(pattern="foo")
+        assert "(set-logic" in witness_smt2(r)
+
+    def test_declares_variable(self):
+        r = make_rule(var_name="ARGS", pattern="foo")
+        smt2 = witness_smt2(r)
+        assert "(declare-const ARGS String)" in smt2
+
+    def test_contains_check_sat(self):
+        r = make_rule(pattern="foo")
+        assert "(check-sat)" in witness_smt2(r)
+
+    def test_ends_with_get_value(self):
+        r = make_rule(var_name="ARGS", pattern="foo")
+        smt2 = witness_smt2(r)
+        assert smt2.strip().endswith(")")
+        assert "(get-value" in smt2
+
+    def test_pattern_present(self):
+        r = make_rule(pattern="secretpattern")
+        assert "secretpattern" in witness_smt2(r)
+
+    def test_multiple_variables_in_get_value(self):
+        rule = SecRule(
+            rule_id="1",
+            variables=[SecRuleVariable("ARGS"), SecRuleVariable("REQUEST_URI")],
+            operator="@rx",
+            operator_argument="test",
+            negated=False,
+            actions=[],
+            chained=False,
+            lineno=1,
+        )
+        smt2 = witness_smt2(rule)
+        assert "ARGS" in smt2
+        assert "REQUEST_URI" in smt2
+        assert "(get-value" in smt2
+
+    def test_transform_reflected(self):
+        r = make_rule(pattern="foo", transforms=["lowercase"])
+        assert "str.to_lower" in witness_smt2(r)
+
+    def test_unsupported_transform_raises(self):
+        r = make_rule(pattern="x", transforms=["__unknown_transform__"])
+        with pytest.raises(UnsupportedTransformError):
+            witness_smt2(r)
+
+    def test_non_rx_operator_raises(self):
+        r = make_rule(pattern="foo")
+        r.operator = "@pm"
+        with pytest.raises(ValueError):
+            witness_smt2(r)
+
+
+# ---------------------------------------------------------------------------
+# WitnessChecker – unit tests with mock solvers
+# ---------------------------------------------------------------------------
+
+class ModelSolver:
+    """Solver stub that returns a fixed result and model."""
+
+    def __init__(self, result: SolverResult, model: dict[str, str] | None = None) -> None:
+        self._result = result
+        self._model = model
+
+    def solve(self, smt2: str) -> SolverResult:
+        return self._result
+
+    def solve_with_model(self, smt2: str) -> tuple[SolverResult, dict[str, str] | None]:
+        return self._result, self._model
+
+
+class TestWitnessCheckerUnit:
+    def test_sat_result_has_witness(self):
+        solver = ModelSolver(SolverResult.SAT, {"ARGS": "foo"})
+        checker = WitnessChecker(solver)
+        res = checker.check_rule(make_rule(rule_id="1"))
+        assert res.has_witness
+
+    def test_unsat_result_no_witness(self):
+        solver = ModelSolver(SolverResult.UNSAT)
+        checker = WitnessChecker(solver)
+        res = checker.check_rule(make_rule(rule_id="1"))
+        assert not res.has_witness
+
+    def test_unknown_propagates(self):
+        solver = ModelSolver(SolverResult.UNKNOWN)
+        checker = WitnessChecker(solver)
+        res = checker.check_rule(make_rule(rule_id="1"))
+        assert res.result == SolverResult.UNKNOWN
+
+    def test_model_attached_on_sat(self):
+        model = {"ARGS": "hello"}
+        solver = ModelSolver(SolverResult.SAT, model)
+        checker = WitnessChecker(solver)
+        res = checker.check_rule(make_rule(rule_id="1"))
+        assert res.model == model
+
+    def test_model_none_on_unsat(self):
+        solver = ModelSolver(SolverResult.UNSAT)
+        checker = WitnessChecker(solver)
+        res = checker.check_rule(make_rule())
+        assert res.model is None
+
+    def test_non_rx_operator_returns_unknown(self):
+        solver = ModelSolver(SolverResult.SAT, {"ARGS": "x"})
+        checker = WitnessChecker(solver)
+        r = make_rule()
+        r.operator = "@pm"
+        res = checker.check_rule(r)
+        assert res.result == SolverResult.UNKNOWN
+
+    def test_unsupported_transform_returns_unknown(self):
+        solver = ModelSolver(SolverResult.SAT, {"ARGS": "x"})
+        checker = WitnessChecker(solver)
+        r = make_rule(transforms=["__unknown_transform__"])
+        res = checker.check_rule(r)
+        assert res.result == SolverResult.UNKNOWN
+
+    def test_result_carries_rule(self):
+        solver = ModelSolver(SolverResult.SAT, {"ARGS": "v"})
+        checker = WitnessChecker(solver)
+        r = make_rule(rule_id="42")
+        res = checker.check_rule(r)
+        assert res.rule.rule_id == "42"
+
+    def test_find_witnesses_returns_all_rx_rules(self):
+        solver = ModelSolver(SolverResult.SAT, {"ARGS": "v"})
+        checker = WitnessChecker(solver)
+        rules = [make_rule(rule_id=str(i)) for i in range(3)]
+        results = checker.find_witnesses(rules)
+        assert len(results) == 3
+
+    def test_find_witnesses_skips_non_rx(self):
+        solver = ModelSolver(SolverResult.SAT, {"ARGS": "v"})
+        checker = WitnessChecker(solver)
+        r_pm = make_rule()
+        r_pm.operator = "@pm"
+        results = checker.find_witnesses([r_pm, make_rule(rule_id="2")])
+        assert len(results) == 1
+
+    def test_format_model_no_model(self):
+        res = WitnessResult(make_rule(), SolverResult.UNKNOWN, None)
+        assert res.format_model() == "    (no model)"
+
+    def test_format_model_with_model(self):
+        res = WitnessResult(make_rule(), SolverResult.SAT, {"ARGS": "hello"})
+        out = res.format_model()
+        assert "ARGS" in out
+        assert "hello" in out
+
+
+# ---------------------------------------------------------------------------
+# WitnessChecker – E2E tests with real z3 solver
+# ---------------------------------------------------------------------------
+
+import os as _os
+
+# Requires a z3 build with re.from_ecma2020 support (not in mainstream z3).
+# Set WAFAN_Z3_PATH to the path of such a binary to enable E2E tests.
+Z3_PATH = _os.environ.get("WAFAN_Z3_PATH")
+_Z3_AVAILABLE = Z3_PATH is not None and _os.path.exists(Z3_PATH)
+
+
+@pytest.fixture(scope="module")
+def z3_solver() -> SubprocessSolver:
+    return SubprocessSolver(argv=[Z3_PATH, "-in"], timeout=30)
+
+
+@pytest.mark.skipif(not _Z3_AVAILABLE, reason="WAFAN_Z3_PATH not set or binary not found")
+class TestWitnessE2E:
+    def test_simple_pattern_has_witness(self, z3_solver):
+        r = make_rule(rule_id="1", var_name="ARGS", pattern="foo|bar")
+        checker = WitnessChecker(z3_solver)
+        res = checker.check_rule(r)
+        assert res.has_witness
+        assert res.model is not None
+        assert "ARGS" in res.model
+
+    def test_witness_value_satisfies_pattern(self, z3_solver):
+        import re
+        r = make_rule(rule_id="1", var_name="ARGS", pattern="foo|bar")
+        checker = WitnessChecker(z3_solver)
+        res = checker.check_rule(r)
+        assert res.has_witness and res.model is not None
+        value = res.model.get("ARGS", "")
+        assert re.fullmatch("foo|bar", value) is not None
+
+    def test_fixture_rules_have_witnesses(self, z3_solver, sub_rules):
+        checker = WitnessChecker(z3_solver)
+        results = checker.find_witnesses(sub_rules)
+        sat = [r for r in results if r.has_witness]
+        assert len(sat) >= 4
+
+    def test_witness_model_keys_match_variables(self, z3_solver):
+        r = make_rule(rule_id="5", var_name="REQUEST_URI", pattern="select")
+        checker = WitnessChecker(z3_solver)
+        res = checker.check_rule(r)
+        assert res.has_witness
+        assert "REQUEST_URI" in res.model

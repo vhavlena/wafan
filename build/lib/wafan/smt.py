@@ -46,7 +46,7 @@ SMT_LOGIC = "QF_SLIA"
 @dataclass(frozen=True)
 class _TransformDef:
     """Definition of one SecRule transform in SMT-LIB2 terms."""
-    smt_fn: str           # SMT function name, e.g. "str.to_lower"; empty = direct inline
+    smt_fn: str           # SMT function name, e.g. "str.lower"; empty = direct inline
     fun_decl: str = ""    # (declare-fun …) line; empty for built-in SMT functions
     axioms: tuple[str, ...] = ()
 
@@ -205,6 +205,36 @@ class SmtFormula:
             *self.declarations,
             f"(assert {self.assertion})",
             "(check-sat)",
+        ]
+        return "\n".join(lines)
+
+    def declared_var_names(self) -> list[str]:
+        """Return variable names from declaration lines, preserving order."""
+        names: list[str] = []
+        for decl in self.declarations:
+            parts = decl.split()
+            # (declare-const NAME String)
+            if len(parts) >= 3 and parts[0] == "(declare-const":
+                names.append(parts[1])
+        return names
+
+    def to_smt2_with_model(self) -> str:
+        """Like to_smt2(), but adds (get-value ...) to extract a concrete model.
+
+        Requires the solver to be launched with model generation enabled
+        (e.g. z3 model=true -in).  Only meaningful when check-sat returns sat.
+        """
+        var_names = self.declared_var_names()
+        get_value = "(get-value (" + " ".join(var_names) + "))"
+        lines = [
+            f"(set-logic {SMT_LOGIC})",
+            f"; rule id:{self.rule_id}",
+            *self.fun_declarations,
+            *self.axioms,
+            *self.declarations,
+            f"(assert {self.assertion})",
+            "(check-sat)",
+            get_value,
         ]
         return "\n".join(lines)
 

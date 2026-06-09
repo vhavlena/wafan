@@ -1,10 +1,11 @@
 """Command-line entry point: python -m wafan  or  wafan (console script)."""
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
-from .analysis import SubprocessSolver, SubsumptionChecker, IntersectionChecker
+from .analysis import SubprocessSolver, SubsumptionChecker, IntersectionChecker, WitnessChecker, _rule_label
 from .parser import parse_file
 
 
@@ -19,9 +20,9 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         default=None,
         help=(
-            "Path (or name) of the SMT solver binary. "
-            "The solver must accept SMT-LIB2 on stdin and print sat/unsat on stdout. "
-            "Default: z3 (use z3-noodler for full re.from_ecma2020 support)."
+            "Path to the SMT solver binary. "
+            "Must support re.from_ecma2020 (mainstream z3 does not). "
+            "Falls back to WAFAN_Z3_PATH env var, then 'z3'."
         ),
     )
     p.add_argument(
@@ -32,9 +33,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--analysis",
-        choices=["subsumption", "intersection"],
+        choices=["subsumption", "intersection", "witness"],
         default="subsumption",
-        help="Analysis to run (default: subsumption).",
+        help="Analysis to run (default: subsumption). "
+             "'witness' finds a concrete input satisfying each rule.",
     )
     p.add_argument(
         "--timeout",
@@ -58,62 +60,98 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _make_solver(args: argparse.Namespace) -> SubprocessSolver:
-    binary = args.solver or "z3"
+    binary = args.solver or os.environ.get("WAFAN_Z3_PATH") or "z3"
     argv = [binary, "-in"]
     if args.solver_args:
         argv += args.solver_args.split()
     return SubprocessSolver(argv=argv, timeout=args.timeout)
 
 
+_SEP = "-" * 66
+
+
 def _run_subsumption(conf: Path, solver: SubprocessSolver, verbosity: int = 0) -> int:
     rules = parse_file(conf)
     if verbosity >= 1:
-        print(f"[parse] {len(rules)} rules loaded from {conf}")
+        print(f"Loaded {len(rules)} rules from {conf}")
     checker = SubsumptionChecker(solver, verbosity=verbosity)
     results = checker.find_subsumed(rules)
 
     subsumed = [r for r in results if r.is_subsumed]
     not_subsumed = [r for r in results if not r.is_subsumed]
 
+    if verbosity >= 1:
+        print(f"\n{_SEP}")
     if not subsumed:
         print("No subsumed rule pairs found.")
         return 0
 
-    print(f"Found {len(subsumed)} subsumed pair(s):\n")
+    print(f"Subsumed pairs  ({len(subsumed)} found)\n")
     for res in subsumed:
-        r1, r2 = res.rule1, res.rule2
-        print(
-            f"  rule {r1.rule_id:>8}  ⊆  rule {r2.rule_id:<8}"
-            f"  ({r1.operator_argument[:60]})"
-        )
-
-    print(f"\n{len(not_subsumed)} pair(s) checked and found NOT subsumed.")
+        print(f"  {_rule_label(res.rule1, pat_width=50)}")
+        print(f"    ⊆  {_rule_label(res.rule2, pat_width=50)}")
+    print(f"\n{len(not_subsumed)} pair(s) checked and found not subsumed.")
     return 0
 
 
 def _run_intersection(conf: Path, solver: SubprocessSolver, verbosity: int = 0) -> int:
     rules = parse_file(conf)
     if verbosity >= 1:
-        print(f"[parse] {len(rules)} rules loaded from {conf}")
+        print(f"Loaded {len(rules)} rules from {conf}")
     checker = IntersectionChecker(solver, verbosity=verbosity)
     results = checker.find_intersecting(rules)
 
     intersecting = [r for r in results if r.has_intersection]
     disjoint = [r for r in results if not r.has_intersection]
 
+    if verbosity >= 1:
+        print(f"\n{_SEP}")
     if not intersecting:
         print("No intersecting rule pairs found.")
         return 0
 
-    print(f"Found {len(intersecting)} intersecting pair(s):\n")
+    print(f"Intersecting pairs  ({len(intersecting)} found)\n")
     for res in intersecting:
-        r1, r2 = res.rule1, res.rule2
-        print(
-            f"  rule {r1.rule_id:>8}  ∩  rule {r2.rule_id:<8}"
-            f"  ({r1.operator_argument[:60]})"
-        )
-
+        print(f"  {_rule_label(res.rule1, pat_width=50)}")
+        print(f"    ∩  {_rule_label(res.rule2, pat_width=50)}")
     print(f"\n{len(disjoint)} pair(s) checked and found disjoint.")
+    return 0
+
+
+def _run_witness(conf: Path, solver: SubprocessSolver, verbosity: int = 0) -> int:
+    rules = parse_file(conf)
+    if verbosity >= 1:
+        print(f"Loaded {len(rules)} rules from {conf}")
+    checker = WitnessChecker(solver, verbosity=verbosity)
+    results = checker.find_witnesses(rules)
+
+    sat_results = [r for r in results if r.has_witness]
+    unsat_results = [r for r in results if r.result.value == "unsat"]
+    unknown_results = [r for r in results if r.result.value == "unknown"]
+
+    if verbosity >= 1:
+        print(f"\n{_SEP}")
+    if not sat_results:
+        print("No satisfiable rules found (all rules are either unsatisfiable or unknown).")
+        return 0
+
+    print(f"Concrete triggering inputs  ({len(sat_results)} rule(s))\n")
+    for res in sat_results:
+        print(f"  {_rule_label(res.rule, pat_width=50)}")
+        print(res.format_model())
+        print()
+
+    if unsat_results:
+        print(f"Rules that never match  ({len(unsat_results)})")
+        for res in unsat_results:
+            print(f"  {_rule_label(res.rule, pat_width=50)}")
+        print()
+
+    if unknown_results:
+        print(f"Rules with unknown result  ({len(unknown_results)}, unsupported features or timeout)")
+        for res in unknown_results:
+            print(f"  {_rule_label(res.rule, pat_width=50)}")
+
     return 0
 
 
@@ -132,6 +170,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_subsumption(args.conf, solver, verbosity=verbosity)
     if args.analysis == "intersection":
         return _run_intersection(args.conf, solver, verbosity=verbosity)
+    if args.analysis == "witness":
+        return _run_witness(args.conf, solver, verbosity=verbosity)
 
     print(f"error: unknown analysis '{args.analysis}'", file=sys.stderr)
     return 1
