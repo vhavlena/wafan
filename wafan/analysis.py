@@ -30,7 +30,7 @@ from .smt import (
     UnsupportedTransformError,
     _escape_smt_string,
     apply_transforms_smt,
-    extract_transforms,
+    effective_transforms,
     rx_rule_to_smt,
     transform_preamble,
 )
@@ -197,8 +197,8 @@ def subsumption_smt2(rule1: SecRule, rule2: SecRule) -> str:
 
     Raises UnsupportedTransformError if either rule uses an unknown transform.
     """
-    transforms1 = extract_transforms(rule1.actions)
-    transforms2 = extract_transforms(rule2.actions)
+    transforms1 = effective_transforms(rule1)
+    transforms2 = effective_transforms(rule2)
 
     fd1, ax1 = transform_preamble(transforms1)
     fd2, ax2 = transform_preamble(transforms2)
@@ -244,8 +244,8 @@ def intersection_smt2(rule1: SecRule, rule2: SecRule) -> str:
 
     Raises UnsupportedTransformError if either rule uses an unknown transform.
     """
-    transforms1 = extract_transforms(rule1.actions)
-    transforms2 = extract_transforms(rule2.actions)
+    transforms1 = effective_transforms(rule1)
+    transforms2 = effective_transforms(rule2)
 
     fd1, ax1 = transform_preamble(transforms1)
     fd2, ax2 = transform_preamble(transforms2)

@@ -260,6 +260,19 @@ def extract_transforms(actions: Sequence[SecRuleAction]) -> list[str]:
     return transforms
 
 
+def effective_transforms(rule: SecRule) -> list[str]:
+    """Return the effective ordered list of transformation names for *rule*.
+
+    ModSecurity inherits transformations from the closest preceding
+    ``SecDefaultAction`` in the same phase, but only when the rule itself
+    does not define any ``t:`` action (including ``t:none``); a rule that
+    defines its own transformations entirely replaces the inherited ones.
+    """
+    if any(action.name == "t" for action in rule.actions):
+        return extract_transforms(rule.actions)
+    return extract_transforms(rule.inherited_actions)
+
+
 def apply_transforms_smt(var_expr: str, transforms: Sequence[str]) -> str:
     """Wrap *var_expr* with SMT-LIB transformation functions.
 
@@ -352,7 +365,7 @@ def rx_rule_to_smt(rule: SecRule) -> SmtFormula:
     negated = rule.negated or rule.operator == "!@rx"
     conv = pcre_to_ecma2020(rule.operator_argument)
     pattern = conv.pattern
-    transforms = extract_transforms(rule.actions)
+    transforms = effective_transforms(rule)
     fun_decls, axioms = transform_preamble(transforms)
 
     declarations: list[str] = []
