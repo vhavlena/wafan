@@ -314,7 +314,7 @@ class TestRxRuleToSmt:
 # ---------------------------------------------------------------------------
 
 UNINTERPRETED = [
-    "urlDecode", "urlDecodeUni", "htmlEntityDecode",
+    "urlDecode", "urlDecodeUni",
     "removeWhitespace", "compressWhitespace", "removeNulls",
     "trim", "trimLeft", "trimRight",
     "normalizePath", "normalizePathWin",
@@ -323,7 +323,6 @@ UNINTERPRETED = [
 SMT_NAMES = {
     "urlDecode": "t_urlDecode",
     "urlDecodeUni": "t_urlDecodeUni",
-    "htmlEntityDecode": "t_htmlEntityDecode",
     "removeWhitespace": "t_removeWhitespace",
     "compressWhitespace": "t_compressWhitespace",
     "removeNulls": "t_removeNulls",
@@ -387,8 +386,15 @@ class TestTransformPreamble:
         assert ax1 == ax2
 
     def test_two_different_transforms_two_decls(self):
-        fun_decls, _ = transform_preamble(["urlDecode", "htmlEntityDecode"])
+        fun_decls, _ = transform_preamble(["urlDecode", "removeWhitespace"])
         assert len(fun_decls) == 2
+
+    def test_htmlentitydecode_define_fun_no_axioms(self):
+        fun_decls, axioms = transform_preamble(["htmlEntityDecode"])
+        assert len(fun_decls) == 1
+        assert fun_decls[0].startswith("(define-fun t_htmlEntityDecode ((s String)) String")
+        assert fun_decls[0].count("str.replace_all") > 100
+        assert axioms == []
 
     def test_unknown_raises(self):
         with pytest.raises(UnsupportedTransformError):
@@ -469,10 +475,13 @@ class TestSmtFormulaWithPreamble:
         assert "str.to_lower (t_urlDecode V)" in f.assertion
         assert len(f.fun_declarations) == 1
 
-    def test_htmlentitydecode_produces_preamble(self):
-        rule = make_rule(transforms=["htmlEntityDecode"])
+    def test_htmlentitydecode_define_fun_call_in_assertion(self):
+        rule = make_rule(var_name="BODY", pattern="x", transforms=["htmlEntityDecode"])
         f = rx_rule_to_smt(rule)
-        assert any("htmlEntityDecode" in d for d in f.fun_declarations)
+        assert len(f.fun_declarations) == 1
+        assert f.fun_declarations[0].startswith("(define-fun t_htmlEntityDecode")
+        assert f.axioms == []
+        assert "(t_htmlEntityDecode BODY)" in f.assertion
 
     @pytest.mark.parametrize("t", UNINTERPRETED)
     def test_all_uninterpreted_produce_well_formed_smt2(self, t):
