@@ -1,4 +1,4 @@
-"""Tests for wafan.analysis – subsumption and intersection checking.
+"""Tests for wafan.analyses – subsumption, intersection and witness checking.
 
 The e2e tests use a PythonReSolver that resolves queries by extracting
 patterns from the SMT2 text and checking them with Python's re module.
@@ -16,7 +16,7 @@ import pytest
 
 from wafan.parser import parse_rx_rules, group_chains, SecRule, SecRuleVariable, SecRuleAction
 from wafan.smt import UnsupportedTransformError, chain_to_smt
-from wafan.analysis import (
+from wafan.analyses import (
     SolverResult,
     SubprocessSolver,
     SubsumptionResult,

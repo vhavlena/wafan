@@ -7,7 +7,6 @@ tests/test_parser.py
 tests/test_smt.py
 wafan/__init__.py
 wafan/__main__.py
-wafan/analysis.py
 wafan/parser.py
 wafan/regex_conv.py
 wafan/smt.py
@@ -17,5 +16,11 @@ wafan.egg-info/dependency_links.txt
 wafan.egg-info/entry_points.txt
 wafan.egg-info/requires.txt
 wafan.egg-info/top_level.txt
+wafan/analyses/__init__.py
+wafan/analyses/common.py
+wafan/analyses/intersection.py
+wafan/analyses/solver.py
+wafan/analyses/subsumption.py
+wafan/analyses/witness.py
 wafan/transforms/__init__.py
 wafan/transforms/html_entity_decode.py

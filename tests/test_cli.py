@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from wafan.__main__ import main, _build_parser, _make_solver
-from wafan.analysis import SubprocessSolver
+from wafan.analyses import SubprocessSolver
 
 SUBSUMPTION_CONF = Path(__file__).parent / "data" / "subsumption.conf"
 REAL_CONF = SUBSUMPTION_CONF

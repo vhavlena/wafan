@@ -5,7 +5,7 @@ import os
 import sys
 from pathlib import Path
 
-from .analysis import SubprocessSolver, SubsumptionChecker, IntersectionChecker, WitnessChecker, _chain_label
+from .analyses import SubprocessSolver, SubsumptionChecker, IntersectionChecker, WitnessChecker, _chain_label
 from .parser import parse_file
 
 
