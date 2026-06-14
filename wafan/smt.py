@@ -10,10 +10,14 @@ Direct SMT-LIB counterparts (applied inline):
   lowercase       – str.to_lower
   uppercase       – str.to_upper
 
+Modelled precisely as a define-fun chaining literal str.replace_all passes:
+  htmlEntityDecode– t_htmlEntityDecode, see
+                    wafan.transforms.html_entity_decode for the full table
+                    and pass-ordering rules.
+
 Uninterpreted functions (declared per-formula with constraining axioms):
   urlDecode       – t_urlDecode       : length-non-increasing, idempotent
   urlDecodeUni    – t_urlDecodeUni    : same axioms as urlDecode
-  htmlEntityDecode– t_htmlEntityDecode: idempotent, empty-preserving
   removeWhitespace– t_removeWhitespace: idempotent, result contains no
                                         space / tab / CR / LF
   compressWhitespace–t_compressWhitespace: idempotent, no consecutive spaces
@@ -34,6 +38,7 @@ from typing import Sequence
 
 from .parser import SecRule, SecRuleAction, SecRuleVariable
 from .regex_conv import UnsupportedPatternError, pcre_to_ecma2020
+from .transforms.html_entity_decode import HTML_ENTITY_DECODE_FUN_DECL
 
 
 SMT_LOGIC = "QF_SLIA"
@@ -90,11 +95,6 @@ _URL_DECODE_AXIOMS = (
     _len_le("t_urlDecode"),
     _idempotent("t_urlDecode"),
     _empty_fixed("t_urlDecode"),
-)
-
-_HTML_ENTITY_AXIOMS = (
-    _idempotent("t_htmlEntityDecode"),
-    _empty_fixed("t_htmlEntityDecode"),
 )
 
 _REMOVE_WS_AXIOMS = (
@@ -165,7 +165,8 @@ _TRANSFORMS: dict[str, _TransformDef] = {
                              _idempotent("t_urlDecodeUni"),
                              _empty_fixed("t_urlDecodeUni"),
                          ),
-    "htmlentitydecode":  _uninterpreted("t_htmlEntityDecode",   *_HTML_ENTITY_AXIOMS),
+    "htmlentitydecode":  _TransformDef(smt_fn="t_htmlEntityDecode",
+                                        fun_decl=HTML_ENTITY_DECODE_FUN_DECL),
     "removewhitespace":  _uninterpreted("t_removeWhitespace",   *_REMOVE_WS_AXIOMS),
     "compresswhitespace":_uninterpreted("t_compressWhitespace", *_COMPRESS_WS_AXIOMS),
     "removenulls":       _uninterpreted("t_removeNulls",        *_REMOVE_NULLS_AXIOMS),
@@ -257,6 +258,19 @@ def extract_transforms(actions: Sequence[SecRuleAction]) -> list[str]:
             else:
                 transforms.append(action.arg)
     return transforms
+
+
+def effective_transforms(rule: SecRule) -> list[str]:
+    """Return the effective ordered list of transformation names for *rule*.
+
+    ModSecurity inherits transformations from the closest preceding
+    ``SecDefaultAction`` in the same phase, but only when the rule itself
+    does not define any ``t:`` action (including ``t:none``); a rule that
+    defines its own transformations entirely replaces the inherited ones.
+    """
+    if any(action.name == "t" for action in rule.actions):
+        return extract_transforms(rule.actions)
+    return extract_transforms(rule.inherited_actions)
 
 
 def apply_transforms_smt(var_expr: str, transforms: Sequence[str]) -> str:
@@ -351,7 +365,7 @@ def rx_rule_to_smt(rule: SecRule) -> SmtFormula:
     negated = rule.negated or rule.operator == "!@rx"
     conv = pcre_to_ecma2020(rule.operator_argument)
     pattern = conv.pattern
-    transforms = extract_transforms(rule.actions)
+    transforms = effective_transforms(rule)
     fun_decls, axioms = transform_preamble(transforms)
 
     declarations: list[str] = []
