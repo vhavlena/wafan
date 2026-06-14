@@ -19,10 +19,10 @@ via stdin/stdout using the SMT-LIB2 format produced by wafan.smt.
 """
 
 from .common import (
-    _all_rx,
+    _all_supported,
     _chain_label,
     _chain_variable_names,
-    _match_assertion,
+    _operator_assertion,
     _print_smt_block,
     _rule_label,
     _SMT_SEP,

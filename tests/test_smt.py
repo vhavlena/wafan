@@ -12,6 +12,7 @@ from wafan.smt import (
     transform_preamble,
     SmtFormula,
     SMT_LOGIC,
+    UnsupportedOperatorError,
     UnsupportedTransformError,
 )
 
@@ -193,8 +194,8 @@ class TestRxRuleToSmt:
 
     def test_non_rx_operator_raises(self):
         rule = make_rule()
-        rule.operator = "@pm"
-        with pytest.raises(ValueError, match="not @rx"):
+        rule.operator = "@geoLookup"
+        with pytest.raises(UnsupportedOperatorError, match="not supported"):
             rx_rule_to_smt(rule)
 
     def test_backslash_in_pattern_escaped(self):
@@ -303,6 +304,85 @@ class TestRxRuleToSmt:
             else:
                 assert "str.to_lower" not in f.assertion
             assert "str.to_upper" not in f.assertion
+
+
+# ---------------------------------------------------------------------------
+# Additional operators (@streq, @contains, @beginsWith, @endsWith, @within,
+# @pm, @eq/@ge/@gt/@le/@lt)
+# ---------------------------------------------------------------------------
+
+class TestStreqOperator:
+    def test_assertion_uses_equality(self):
+        f = rx_rule_to_smt(make_rule(var_name="BODY", pattern="foo", operator="@streq"))
+        assert f.assertion == '(= BODY "foo")'
+
+    def test_negated(self):
+        f = rx_rule_to_smt(make_rule(var_name="BODY", pattern="foo", operator="@streq", negated=True))
+        assert f.assertion == '(not (= BODY "foo"))'
+
+    def test_bang_operator_negates(self):
+        f = rx_rule_to_smt(make_rule(var_name="BODY", pattern="foo", operator="!@streq"))
+        assert f.assertion == '(not (= BODY "foo"))'
+
+
+class TestContainsOperator:
+    def test_assertion_uses_str_contains(self):
+        f = rx_rule_to_smt(make_rule(var_name="ARGS", pattern="evil", operator="@contains"))
+        assert f.assertion == '(str.contains ARGS "evil")'
+
+    def test_negated(self):
+        f = rx_rule_to_smt(make_rule(var_name="ARGS", pattern="evil", operator="!@contains"))
+        assert f.assertion == '(not (str.contains ARGS "evil"))'
+
+
+class TestBeginsWithOperator:
+    def test_assertion_uses_str_prefixof(self):
+        f = rx_rule_to_smt(make_rule(var_name="ARGS", pattern="/admin", operator="@beginsWith"))
+        assert f.assertion == '(str.prefixof "/admin" ARGS)'
+
+
+class TestEndsWithOperator:
+    def test_assertion_uses_str_suffixof(self):
+        f = rx_rule_to_smt(make_rule(var_name="ARGS", pattern=".php", operator="@endsWith"))
+        assert f.assertion == '(str.suffixof ".php" ARGS)'
+
+
+class TestWithinOperator:
+    def test_single_value(self):
+        f = rx_rule_to_smt(make_rule(var_name="ARGS", pattern="GET", operator="@within"))
+        assert f.assertion == '(str.contains "GET" ARGS)'
+
+    def test_multiple_values_uses_or(self):
+        f = rx_rule_to_smt(make_rule(var_name="ARGS", pattern="GET POST", operator="@within"))
+        assert f.assertion == '(or (str.contains "GET" ARGS) (str.contains "POST" ARGS))'
+
+
+class TestPmOperator:
+    def test_single_value(self):
+        f = rx_rule_to_smt(make_rule(var_name="ARGS", pattern="evil", operator="@pm"))
+        assert f.assertion == '(str.contains ARGS "evil")'
+
+    def test_multiple_values_uses_or(self):
+        f = rx_rule_to_smt(make_rule(var_name="ARGS", pattern="foo bar", operator="@pm"))
+        assert f.assertion == '(or (str.contains ARGS "foo") (str.contains ARGS "bar"))'
+
+
+class TestNumericOperators:
+    @pytest.mark.parametrize(
+        "operator,smt_op",
+        [("@eq", "="), ("@ge", ">="), ("@gt", ">"), ("@le", "<="), ("@lt", "<")],
+    )
+    def test_assertion_uses_str_to_int(self, operator, smt_op):
+        f = rx_rule_to_smt(make_rule(var_name="ARGS", pattern="5", operator=operator))
+        assert f.assertion == f"({smt_op} (str.to_int ARGS) 5)"
+
+    def test_negated(self):
+        f = rx_rule_to_smt(make_rule(var_name="ARGS", pattern="0", operator="@eq", negated=True))
+        assert f.assertion == "(not (= (str.to_int ARGS) 0))"
+
+    def test_non_integer_argument_raises(self):
+        with pytest.raises(UnsupportedOperatorError):
+            rx_rule_to_smt(make_rule(var_name="ARGS", pattern="not-a-number", operator="@eq"))
 
 
 # ---------------------------------------------------------------------------

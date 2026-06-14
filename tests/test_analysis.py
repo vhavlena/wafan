@@ -15,7 +15,7 @@ from typing import Callable
 import pytest
 
 from wafan.parser import parse_rx_rules, group_chains, SecRule, SecRuleVariable, SecRuleAction
-from wafan.smt import UnsupportedTransformError, chain_to_smt
+from wafan.smt import UnsupportedOperatorError, UnsupportedTransformError, chain_to_smt
 from wafan.analyses import (
     SolverResult,
     SubprocessSolver,
@@ -338,7 +338,7 @@ class TestFindSubsumed:
 
     def test_non_rx_rules_skipped(self):
         r_pm = make_rule()
-        r_pm.operator = "@pm"
+        r_pm.operator = "@geoLookup"
         checker = SubsumptionChecker(ConstantSolver(SolverResult.UNSAT))
         assert checker.find_subsumed([r_pm, r_pm]) == []
 
@@ -642,7 +642,7 @@ class TestFindIntersecting:
 
     def test_non_rx_rules_skipped(self):
         r_pm = make_rule()
-        r_pm.operator = "@pm"
+        r_pm.operator = "@geoLookup"
         checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
         assert checker.find_intersecting([r_pm, r_pm]) == []
 
@@ -835,8 +835,8 @@ class TestWitnessSmt2:
 
     def test_non_rx_operator_raises(self):
         r = make_rule(pattern="foo")
-        r.operator = "@pm"
-        with pytest.raises(ValueError):
+        r.operator = "@geoLookup"
+        with pytest.raises(UnsupportedOperatorError):
             witness_smt2(r)
 
 
@@ -894,7 +894,7 @@ class TestWitnessCheckerUnit:
         solver = ModelSolver(SolverResult.SAT, {"ARGS": "x"})
         checker = WitnessChecker(solver)
         r = make_rule()
-        r.operator = "@pm"
+        r.operator = "@geoLookup"
         res = checker.check_rule(r)
         assert res.result == SolverResult.UNKNOWN
 
@@ -923,7 +923,7 @@ class TestWitnessCheckerUnit:
         solver = ModelSolver(SolverResult.SAT, {"ARGS": "v"})
         checker = WitnessChecker(solver)
         r_pm = make_rule()
-        r_pm.operator = "@pm"
+        r_pm.operator = "@geoLookup"
         results = checker.find_witnesses([r_pm, make_rule(rule_id="2")])
         assert len(results) == 1
 
@@ -1064,8 +1064,8 @@ class TestChainToSmt:
             dict(rule_id="1", pattern="foo"),
             dict(rule_id="", pattern="bar"),
         ])
-        chain[1].operator = "@pm"
-        with pytest.raises(ValueError):
+        chain[1].operator = "@geoLookup"
+        with pytest.raises(UnsupportedOperatorError):
             chain_to_smt(chain)
 
     def test_unsupported_transform_raises(self):
@@ -1116,7 +1116,7 @@ class TestSubsumptionCheckerChainPair:
     def test_skips_when_chain_has_non_rx_link(self):
         checker = SubsumptionChecker(ConstantSolver(SolverResult.UNSAT))
         chain1 = make_chain([dict(rule_id="1"), dict(rule_id="")])
-        chain1[1].operator = "@pm"
+        chain1[1].operator = "@geoLookup"
         chain2 = [make_rule(rule_id="2")]
         res = checker.check_chain_pair(chain1, chain2)
         assert res.result == SolverResult.UNKNOWN
@@ -1187,7 +1187,7 @@ class TestWitnessCheckerChain:
         solver = ModelSolver(SolverResult.SAT, {"ARGS": "foo"})
         checker = WitnessChecker(solver)
         chain = make_chain([dict(rule_id="1"), dict(rule_id="")])
-        chain[1].operator = "@pm"
+        chain[1].operator = "@geoLookup"
         res = checker.check_chain(chain)
         assert res.result == SolverResult.UNKNOWN
 

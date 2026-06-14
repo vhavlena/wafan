@@ -1,7 +1,19 @@
 """Convert SecRule conditions to SMT-LIB2 format.
 
-Only @rx (ECMA regex matching) is supported, via the `re.from_ecma2020`
-SMT-LIB function, targeting the z3-noodler backend.
+Supported operators (see _OPERATORS / is_supported_operator):
+  @rx          – ECMA regex matching, via the `re.from_ecma2020` SMT-LIB
+                 function, targeting the z3-noodler backend.
+  @streq       – string equality (str.=)
+  @contains    – substring match (str.contains)
+  @beginsWith  – prefix match (str.prefixof)
+  @endsWith    – suffix match (str.suffixof)
+  @within      – input is a substring of one of a space-separated list of values
+  @pm          – any of a space-separated list of phrases is a substring of the input
+  @eq/@ge/@gt/@le/@lt – numeric comparison of (str.to_int input) against an
+                 integer argument
+
+All operators support ``!`` negation (e.g. ``!@rx``) and the rule-level
+``negated`` flag.
 
 SecRule ``t:`` transformations are handled in two ways:
 
@@ -34,7 +46,7 @@ Transforms not listed above raise UnsupportedTransformError.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Callable, Sequence
 
 from .parser import SecRule, SecRuleAction, SecRuleVariable
 from .regex_conv import UnsupportedPatternError, pcre_to_ecma2020
@@ -339,12 +351,126 @@ def _rx_assertion(var_expr: str, pattern: str, negated: bool) -> str:
     return f"(not {inner})" if negated else inner
 
 
+def _wrap_negated(atom: str, negated: bool) -> str:
+    return f"(not {atom})" if negated else atom
+
+
+# ---------------------------------------------------------------------------
+# Operator table
+# ---------------------------------------------------------------------------
+
+class UnsupportedOperatorError(Exception):
+    """Raised when a SecRule operator cannot be converted to SMT."""
+
+
+def _op_rx(var_expr: str, argument: str, negated: bool) -> str:
+    conv = pcre_to_ecma2020(argument)
+    return _rx_assertion(var_expr, conv.pattern, negated)
+
+
+def _op_streq(var_expr: str, argument: str, negated: bool) -> str:
+    atom = f'(= {var_expr} "{_escape_smt_string(argument)}")'
+    return _wrap_negated(atom, negated)
+
+
+def _op_contains(var_expr: str, argument: str, negated: bool) -> str:
+    atom = f'(str.contains {var_expr} "{_escape_smt_string(argument)}")'
+    return _wrap_negated(atom, negated)
+
+
+def _op_beginswith(var_expr: str, argument: str, negated: bool) -> str:
+    atom = f'(str.prefixof "{_escape_smt_string(argument)}" {var_expr})'
+    return _wrap_negated(atom, negated)
+
+
+def _op_endswith(var_expr: str, argument: str, negated: bool) -> str:
+    atom = f'(str.suffixof "{_escape_smt_string(argument)}" {var_expr})'
+    return _wrap_negated(atom, negated)
+
+
+def _disjunction(atoms: list[str]) -> str:
+    if not atoms:
+        return "false"
+    if len(atoms) == 1:
+        return atoms[0]
+    return "(or " + " ".join(atoms) + ")"
+
+
+def _op_within(var_expr: str, argument: str, negated: bool) -> str:
+    # @within: matches if var_expr is a substring of one of the
+    # space-separated values in argument.
+    atoms = [
+        f'(str.contains "{_escape_smt_string(v)}" {var_expr})'
+        for v in argument.split()
+    ]
+    return _wrap_negated(_disjunction(atoms), negated)
+
+
+def _op_pm(var_expr: str, argument: str, negated: bool) -> str:
+    # @pm: matches if any of the space-separated phrases is a substring of
+    # var_expr.
+    atoms = [
+        f'(str.contains {var_expr} "{_escape_smt_string(v)}")'
+        for v in argument.split()
+    ]
+    return _wrap_negated(_disjunction(atoms), negated)
+
+
+_NUMERIC_OPS = {"eq": "=", "ge": ">=", "gt": ">", "le": "<=", "lt": "<"}
+
+
+def _make_numeric_op(smt_op: str):
+    def _op(var_expr: str, argument: str, negated: bool) -> str:
+        try:
+            value = int(argument.strip())
+        except ValueError as exc:
+            raise UnsupportedOperatorError(
+                f"Operator argument '{argument}' is not an integer"
+            ) from exc
+        atom = f"({smt_op} (str.to_int {var_expr}) {value})"
+        return _wrap_negated(atom, negated)
+
+    return _op
+
+
+_OPERATORS: dict[str, Callable[[str, str, bool], str]] = {
+    "rx": _op_rx,
+    "streq": _op_streq,
+    "contains": _op_contains,
+    "beginswith": _op_beginswith,
+    "endswith": _op_endswith,
+    "within": _op_within,
+    "pm": _op_pm,
+    **{name: _make_numeric_op(smt_op) for name, smt_op in _NUMERIC_OPS.items()},
+}
+
+
+def _normalize_operator(operator: str) -> tuple[str, bool]:
+    """Split *operator* into (normalised name, bang-negated).
+
+    e.g. ``"!@rx"`` -> ``("rx", True)``, ``"@beginsWith"`` -> ``("beginswith", False)``.
+    """
+    op = operator
+    negated = op.startswith("!")
+    if negated:
+        op = op[1:]
+    if op.startswith("@"):
+        op = op[1:]
+    return op.lower(), negated
+
+
+def is_supported_operator(operator: str) -> bool:
+    """True if *operator* (with optional leading ``!``/``@``) can be converted to SMT."""
+    name, _ = _normalize_operator(operator)
+    return name in _OPERATORS
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def rx_rule_to_smt(rule: SecRule) -> SmtFormula:
-    """Convert a single @rx SecRule to an SmtFormula.
+def rule_to_smt(rule: SecRule) -> SmtFormula:
+    """Convert a single SecRule to an SmtFormula.
 
     Transformation actions (t:) are extracted and applied as SMT-LIB wrappers
     around each variable expression.  Uninterpreted transforms are declared and
@@ -353,18 +479,22 @@ def rx_rule_to_smt(rule: SecRule) -> SmtFormula:
     Each ModSecurity variable becomes a free String constant.  Multiple
     variables produce a disjunctive assertion.
 
+    Supported operators: @rx, @streq, @contains, @beginsWith, @endsWith,
+    @within, @pm, @eq, @ge, @gt, @le, @lt (each with optional ``!`` negation).
+
     Raises:
-        ValueError: if the operator is not @rx / !@rx.
+        UnsupportedOperatorError: if the operator is not supported, or (for
+            numeric operators) its argument is not an integer.
         UnsupportedTransformError: if a t: action is unknown.
     """
-    if rule.operator not in ("@rx", "!@rx"):
-        raise ValueError(
-            f"Rule {rule.rule_id}: operator '{rule.operator}' is not @rx"
+    op_name, op_negated = _normalize_operator(rule.operator)
+    builder = _OPERATORS.get(op_name)
+    if builder is None:
+        raise UnsupportedOperatorError(
+            f"Rule {rule.rule_id}: operator '{rule.operator}' is not supported"
         )
 
-    negated = rule.negated or rule.operator == "!@rx"
-    conv = pcre_to_ecma2020(rule.operator_argument)
-    pattern = conv.pattern
+    negated = rule.negated or op_negated
     transforms = effective_transforms(rule)
     fun_decls, axioms = transform_preamble(transforms)
 
@@ -378,7 +508,7 @@ def rx_rule_to_smt(rule: SecRule) -> SmtFormula:
             declarations.append(f"(declare-const {v} String)")
             seen.add(v)
         var_expr = apply_transforms_smt(v, transforms)
-        assertions.append(_rx_assertion(var_expr, pattern, negated))
+        assertions.append(builder(var_expr, rule.operator_argument, negated))
 
     assertion = assertions[0] if len(assertions) == 1 else "(or " + " ".join(assertions) + ")"
 
@@ -389,6 +519,10 @@ def rx_rule_to_smt(rule: SecRule) -> SmtFormula:
         declarations=declarations,
         assertion=assertion,
     )
+
+
+# Backwards-compatible alias: rule_to_smt now supports more than @rx.
+rx_rule_to_smt = rule_to_smt
 
 
 def chain_to_smt(chain: Sequence[SecRule]) -> SmtFormula:
@@ -403,10 +537,10 @@ def chain_to_smt(chain: Sequence[SecRule]) -> SmtFormula:
     reference the same ModSecurity variable or transform).
 
     Raises:
-        ValueError: if any link's operator is not @rx / !@rx.
+        UnsupportedOperatorError: if any link's operator is not supported.
         UnsupportedTransformError: if any link uses an unknown transform.
     """
-    formulas = [rx_rule_to_smt(rule) for rule in chain]
+    formulas = [rule_to_smt(rule) for rule in chain]
 
     declarations = _merge_unique([], [])
     fun_declarations: list[str] = []
@@ -437,9 +571,9 @@ def _merge_unique(a: list[str], b: list[str]) -> list[str]:
 
 
 def rules_to_smt(rules: Sequence[SecRule]) -> list[SmtFormula]:
-    """Convert a sequence of @rx SecRules to SmtFormulas, skipping others."""
+    """Convert a sequence of SecRules to SmtFormulas, skipping unsupported operators."""
     result = []
     for rule in rules:
-        if rule.operator in ("@rx", "!@rx"):
-            result.append(rx_rule_to_smt(rule))
+        if is_supported_operator(rule.operator):
+            result.append(rule_to_smt(rule))
     return result

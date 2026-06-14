@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Sequence
 
 from ..parser import SecRule
-from ..smt import _escape_smt_string
+from ..smt import _OPERATORS, _normalize_operator, is_supported_operator, UnsupportedOperatorError
 
 _SMT_SEP = "  " + "-" * 62
 
@@ -47,15 +47,25 @@ def _chain_label(chain: Sequence[SecRule], pat_width: int = 35) -> str:
     return label
 
 
-def _all_rx(chain: Sequence[SecRule]) -> bool:
-    """True if every link of *chain* uses the @rx / !@rx operator."""
-    return all(r.operator in ("@rx", "!@rx") for r in chain)
+def _all_supported(chain: Sequence[SecRule]) -> bool:
+    """True if every link of *chain* uses an SMT-convertible operator."""
+    return all(is_supported_operator(r.operator) for r in chain)
 
 
-def _match_assertion(var_expr: str, pattern: str, negated: bool) -> str:
-    escaped = _escape_smt_string(pattern)
-    atom = f'(str.in_re {var_expr} (re.from_ecma2020 "{escaped}"))'
-    return f"(not {atom})" if negated else atom
+def _operator_assertion(rule: SecRule, var_expr: str) -> str:
+    """Return the SMT-LIB2 assertion for *rule*'s operator applied to *var_expr*.
+
+    Raises UnsupportedOperatorError if the rule's operator is not supported
+    (or, for numeric operators, its argument is not an integer).
+    """
+    op_name, op_negated = _normalize_operator(rule.operator)
+    builder = _OPERATORS.get(op_name)
+    if builder is None:
+        raise UnsupportedOperatorError(
+            f"Rule {rule.rule_id}: operator '{rule.operator}' is not supported"
+        )
+    negated = rule.negated or op_negated
+    return builder(var_expr, rule.operator_argument, negated)
 
 
 def _variable_names(rule: SecRule) -> frozenset[str]:

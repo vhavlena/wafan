@@ -191,8 +191,10 @@ def parse_file(path: str | Path) -> list[SecRule]:
 
 
 def parse_rx_rules(path: str | Path) -> list[SecRule]:
-    """Return only @rx (regex-matching) rules from a conf file."""
-    return [r for r in parse_file(path) if r.operator in ("@rx", "!@rx")]
+    """Return only rules with an SMT-convertible operator from a conf file."""
+    from .smt import is_supported_operator
+
+    return [r for r in parse_file(path) if is_supported_operator(r.operator)]
 
 
 def group_chains(rules: list[SecRule]) -> list[list[SecRule]]:

@@ -10,8 +10,15 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from ..parser import SecRule, group_chains
-from ..smt import SmtFormula, UnsupportedTransformError, chain_to_smt, rx_rule_to_smt
-from .common import _all_rx, _chain_label, _print_smt_block, _rule_label
+from ..smt import (
+    SmtFormula,
+    UnsupportedOperatorError,
+    UnsupportedTransformError,
+    chain_to_smt,
+    is_supported_operator,
+    rule_to_smt,
+)
+from .common import _all_supported, _chain_label, _print_smt_block, _rule_label
 from .solver import SolverResult, SubprocessSolver
 
 
@@ -29,10 +36,10 @@ def witness_smt2(rule: SecRule) -> str:
     (e.g. z3 model=true -in).
 
     Raises:
-        ValueError: if the operator is not @rx / !@rx.
+        UnsupportedOperatorError: if the operator is not supported.
         UnsupportedTransformError: if a t: action is unknown.
     """
-    formula: SmtFormula = rx_rule_to_smt(rule)
+    formula: SmtFormula = rule_to_smt(rule)
     return formula.to_smt2_with_model()
 
 
@@ -46,7 +53,7 @@ def chain_witness_smt2(chain: Sequence[SecRule]) -> str:
     generation enabled (e.g. z3 model=true -in).
 
     Raises:
-        ValueError: if any link's operator is not @rx / !@rx.
+        UnsupportedOperatorError: if any link's operator is not supported.
         UnsupportedTransformError: if any link uses an unknown transform.
     """
     formula: SmtFormula = chain_to_smt(chain)
@@ -125,14 +132,14 @@ class WitnessChecker:
         """
         label = _rule_label(rule)
 
-        if rule.operator not in ("@rx", "!@rx"):
+        if not is_supported_operator(rule.operator):
             if self._verbosity >= 1:
-                print(f"  {label}  [{'skipped':<13}]  (not @rx)")
+                print(f"  {label}  [{'skipped':<13}]  (unsupported operator)")
             return WitnessResult(rule, SolverResult.UNKNOWN)
 
         try:
             smt2 = witness_smt2(rule)
-        except UnsupportedTransformError as exc:
+        except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"  {label}  [{'skipped':<13}]  (unsupported transform: {exc})")
             return WitnessResult(rule, SolverResult.UNKNOWN)
@@ -157,7 +164,7 @@ class WitnessChecker:
         Rules where the solver returns UNKNOWN are included so callers can
         distinguish unsatisfiable rules from solver failures.
         """
-        rx_rules = [r for r in rules if r.operator in ("@rx", "!@rx")]
+        rx_rules = [r for r in rules if is_supported_operator(r.operator)]
         if self._verbosity >= 1:
             print(f"Witness analysis: {len(rx_rules)} rules\n")
         return [self.check_rule(r) for r in rx_rules]
@@ -171,14 +178,14 @@ class WitnessChecker:
         chain = list(chain)
         label = _chain_label(chain)
 
-        if not _all_rx(chain):
+        if not _all_supported(chain):
             if self._verbosity >= 1:
-                print(f"  {label}  [{'skipped':<13}]  (not @rx)")
+                print(f"  {label}  [{'skipped':<13}]  (unsupported operator)")
             return ChainWitnessResult(chain, SolverResult.UNKNOWN)
 
         try:
             smt2 = chain_witness_smt2(chain)
-        except UnsupportedTransformError as exc:
+        except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"  {label}  [{'skipped':<13}]  (unsupported transform: {exc})")
             return ChainWitnessResult(chain, SolverResult.UNKNOWN)

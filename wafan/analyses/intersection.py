@@ -11,20 +11,21 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from ..parser import SecRule, group_chains
-from ..regex_conv import pcre_to_ecma2020
 from ..smt import (
     SMT_LOGIC,
+    UnsupportedOperatorError,
     UnsupportedTransformError,
     _merge_unique,
     apply_transforms_smt,
     chain_to_smt,
     effective_transforms,
+    is_supported_operator,
     transform_preamble,
 )
 from .common import (
-    _all_rx,
+    _all_supported,
     _chain_label,
-    _match_assertion,
+    _operator_assertion,
     _print_smt_block,
     _rule_label,
     chains_share_variable,
@@ -44,7 +45,9 @@ def intersection_smt2(rule1: SecRule, rule2: SecRule) -> str:
     Both rules' transformation chains are applied to the same free variable x.
     Uninterpreted transforms are declared and axiomatised in the preamble.
 
-    Raises UnsupportedTransformError if either rule uses an unknown transform.
+    Raises:
+        UnsupportedTransformError: if either rule uses an unknown transform.
+        UnsupportedOperatorError: if either rule's operator is not supported.
     """
     transforms1 = effective_transforms(rule1)
     transforms2 = effective_transforms(rule2)
@@ -54,17 +57,11 @@ def intersection_smt2(rule1: SecRule, rule2: SecRule) -> str:
     fun_decls = _merge_unique(fd1, fd2)
     axioms    = _merge_unique(ax1, ax2)
 
-    negated1 = rule1.negated or rule1.operator == "!@rx"
-    negated2 = rule2.negated or rule2.operator == "!@rx"
-
-    conv1 = pcre_to_ecma2020(rule1.operator_argument)
-    conv2 = pcre_to_ecma2020(rule2.operator_argument)
-
     var_expr1 = apply_transforms_smt("x", transforms1)
     var_expr2 = apply_transforms_smt("x", transforms2)
 
-    assert1 = _match_assertion(var_expr1, conv1.pattern, negated1)
-    assert2 = _match_assertion(var_expr2, conv2.pattern, negated2)
+    assert1 = _operator_assertion(rule1, var_expr1)
+    assert2 = _operator_assertion(rule2, var_expr2)
 
     lines = [
         f"(set-logic {SMT_LOGIC})",
@@ -166,7 +163,7 @@ class IntersectionChecker:
 
         try:
             smt2 = intersection_smt2(rule1, rule2)
-        except UnsupportedTransformError as exc:
+        except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
             return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN)
@@ -189,7 +186,7 @@ class IntersectionChecker:
         Only @rx / !@rx rules are considered.  Each unordered pair is checked
         once; pairs where the solver returns UNKNOWN are excluded.
         """
-        rx_rules = [r for r in rules if r.operator in ("@rx", "!@rx")]
+        rx_rules = [r for r in rules if is_supported_operator(r.operator)]
         n = len(rx_rules)
         if self._verbosity >= 1:
             print(f"Intersection analysis: {n} rules, {n * (n - 1) // 2} unordered pairs\n")
@@ -217,9 +214,9 @@ class IntersectionChecker:
         rhs = _chain_label(chain2)
         prefix = f"  {lhs}  ∩  {rhs}"
 
-        if not _all_rx(chain1) or not _all_rx(chain2):
+        if not _all_supported(chain1) or not _all_supported(chain2):
             if self._verbosity >= 1:
-                print(f"{prefix}  [{'skipped':<12}]  (not @rx)")
+                print(f"{prefix}  [{'skipped':<12}]  (unsupported operator)")
             return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN)
 
         if not chains_share_variable(chain1, chain2):
@@ -229,7 +226,7 @@ class IntersectionChecker:
 
         try:
             smt2 = chain_intersection_smt2(chain1, chain2)
-        except UnsupportedTransformError as exc:
+        except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
             return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN)
