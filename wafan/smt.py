@@ -391,6 +391,51 @@ def rx_rule_to_smt(rule: SecRule) -> SmtFormula:
     )
 
 
+def chain_to_smt(chain: Sequence[SecRule]) -> SmtFormula:
+    """Convert a chained sequence of @rx SecRules to a single SmtFormula.
+
+    Each link's match condition is computed independently via
+    rx_rule_to_smt(); the chain as a whole matches only if every link
+    matches (logical AND), mirroring ModSecurity's chained-rule semantics
+    where a chained rule "fires" only if all of its links match the same
+    request. Declarations, function declarations and axioms are merged
+    across links, deduplicating identical entries (e.g. when multiple links
+    reference the same ModSecurity variable or transform).
+
+    Raises:
+        ValueError: if any link's operator is not @rx / !@rx.
+        UnsupportedTransformError: if any link uses an unknown transform.
+    """
+    formulas = [rx_rule_to_smt(rule) for rule in chain]
+
+    declarations = _merge_unique([], [])
+    fun_declarations: list[str] = []
+    axioms: list[str] = []
+    for f in formulas:
+        declarations = _merge_unique(declarations, f.declarations)
+        fun_declarations = _merge_unique(fun_declarations, f.fun_declarations)
+        axioms = _merge_unique(axioms, f.axioms)
+
+    if len(formulas) == 1:
+        assertion = formulas[0].assertion
+    else:
+        assertion = "(and " + " ".join(f.assertion for f in formulas) + ")"
+
+    return SmtFormula(
+        rule_id=chain[0].rule_id,
+        declarations=declarations,
+        assertion=assertion,
+        fun_declarations=fun_declarations,
+        axioms=axioms,
+    )
+
+
+def _merge_unique(a: list[str], b: list[str]) -> list[str]:
+    """Concatenate two lists, dropping duplicates from b that already appear in a."""
+    seen = set(a)
+    return a + [x for x in b if x not in seen]
+
+
 def rules_to_smt(rules: Sequence[SecRule]) -> list[SmtFormula]:
     """Convert a sequence of @rx SecRules to SmtFormulas, skipping others."""
     result = []

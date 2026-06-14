@@ -5,7 +5,7 @@ import os
 import sys
 from pathlib import Path
 
-from .analysis import SubprocessSolver, SubsumptionChecker, IntersectionChecker, WitnessChecker, _rule_label
+from .analysis import SubprocessSolver, SubsumptionChecker, IntersectionChecker, WitnessChecker, _chain_label
 from .parser import parse_file
 
 
@@ -75,7 +75,7 @@ def _run_subsumption(conf: Path, solver: SubprocessSolver, verbosity: int = 0) -
     if verbosity >= 1:
         print(f"Loaded {len(rules)} rules from {conf}")
     checker = SubsumptionChecker(solver, verbosity=verbosity)
-    results = checker.find_subsumed(rules)
+    results = checker.find_subsumed_chains(rules)
 
     subsumed = [r for r in results if r.is_subsumed]
     not_subsumed = [r for r in results if not r.is_subsumed]
@@ -88,8 +88,8 @@ def _run_subsumption(conf: Path, solver: SubprocessSolver, verbosity: int = 0) -
 
     print(f"Subsumed pairs  ({len(subsumed)} found)\n")
     for res in subsumed:
-        print(f"  {_rule_label(res.rule1, pat_width=50)}")
-        print(f"    ⊆  {_rule_label(res.rule2, pat_width=50)}")
+        print(f"  {_chain_label(res.chain1, pat_width=50)}")
+        print(f"    ⊆  {_chain_label(res.chain2, pat_width=50)}")
     print(f"\n{len(not_subsumed)} pair(s) checked and found not subsumed.")
     return 0
 
@@ -99,7 +99,7 @@ def _run_intersection(conf: Path, solver: SubprocessSolver, verbosity: int = 0) 
     if verbosity >= 1:
         print(f"Loaded {len(rules)} rules from {conf}")
     checker = IntersectionChecker(solver, verbosity=verbosity)
-    results = checker.find_intersecting(rules)
+    results = checker.find_intersecting_chains(rules)
 
     intersecting = [r for r in results if r.has_intersection]
     disjoint = [r for r in results if not r.has_intersection]
@@ -112,8 +112,8 @@ def _run_intersection(conf: Path, solver: SubprocessSolver, verbosity: int = 0) 
 
     print(f"Intersecting pairs  ({len(intersecting)} found)\n")
     for res in intersecting:
-        print(f"  {_rule_label(res.rule1, pat_width=50)}")
-        print(f"    ∩  {_rule_label(res.rule2, pat_width=50)}")
+        print(f"  {_chain_label(res.chain1, pat_width=50)}")
+        print(f"    ∩  {_chain_label(res.chain2, pat_width=50)}")
     print(f"\n{len(disjoint)} pair(s) checked and found disjoint.")
     return 0
 
@@ -123,7 +123,7 @@ def _run_witness(conf: Path, solver: SubprocessSolver, verbosity: int = 0) -> in
     if verbosity >= 1:
         print(f"Loaded {len(rules)} rules from {conf}")
     checker = WitnessChecker(solver, verbosity=verbosity)
-    results = checker.find_witnesses(rules)
+    results = checker.find_chain_witnesses(rules)
 
     sat_results = [r for r in results if r.has_witness]
     unsat_results = [r for r in results if r.result.value == "unsat"]
@@ -137,20 +137,20 @@ def _run_witness(conf: Path, solver: SubprocessSolver, verbosity: int = 0) -> in
 
     print(f"Concrete triggering inputs  ({len(sat_results)} rule(s))\n")
     for res in sat_results:
-        print(f"  {_rule_label(res.rule, pat_width=50)}")
+        print(f"  {_chain_label(res.chain, pat_width=50)}")
         print(res.format_model())
         print()
 
     if unsat_results:
         print(f"Rules that never match  ({len(unsat_results)})")
         for res in unsat_results:
-            print(f"  {_rule_label(res.rule, pat_width=50)}")
+            print(f"  {_chain_label(res.chain, pat_width=50)}")
         print()
 
     if unknown_results:
         print(f"Rules with unknown result  ({len(unknown_results)}, unsupported features or timeout)")
         for res in unknown_results:
-            print(f"  {_rule_label(res.rule, pat_width=50)}")
+            print(f"  {_chain_label(res.chain, pat_width=50)}")
 
     return 0
 
