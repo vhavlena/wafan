@@ -13,6 +13,7 @@ from typing import Sequence
 from ..parser import SecRule, group_chains
 from ..smt import (
     SMT_LOGIC,
+    SmtFormula,
     UnsupportedOperatorError,
     UnsupportedTransformError,
     _merge_unique,
@@ -79,7 +80,12 @@ def subsumption_smt2(rule1: SecRule, rule2: SecRule) -> str:
     return "\n".join(lines)
 
 
-def chain_subsumption_smt2(chain1: Sequence[SecRule], chain2: Sequence[SecRule]) -> str:
+def chain_subsumption_smt2(
+    chain1: Sequence[SecRule],
+    chain2: Sequence[SecRule],
+    f1: SmtFormula | None = None,
+    f2: SmtFormula | None = None,
+) -> str:
     """Return an SMT-LIB2 string that is UNSAT iff chain1 is subsumed by chain2.
 
     Each chain matches only if all of its links match (logical AND, see
@@ -90,10 +96,13 @@ def chain_subsumption_smt2(chain1: Sequence[SecRule], chain2: Sequence[SecRule])
     chains are merged, so both chains' conditions are evaluated against the
     same request.
 
+    *f1*/*f2* may be precomputed chain_to_smt() results (e.g. shared across
+    multiple pairwise comparisons); if omitted, they are computed here.
+
     Raises UnsupportedTransformError if any link uses an unknown transform.
     """
-    f1 = chain_to_smt(chain1)
-    f2 = chain_to_smt(chain2)
+    f1 = f1 if f1 is not None else chain_to_smt(chain1)
+    f2 = f2 if f2 is not None else chain_to_smt(chain2)
 
     declarations = _merge_unique(f1.declarations, f2.declarations)
     fun_decls = _merge_unique(f1.fun_declarations, f2.fun_declarations)
@@ -208,13 +217,20 @@ class SubsumptionChecker:
         return results
 
     def check_chain_pair(
-        self, chain1: Sequence[SecRule], chain2: Sequence[SecRule]
+        self,
+        chain1: Sequence[SecRule],
+        chain2: Sequence[SecRule],
+        f1: SmtFormula | None = None,
+        f2: SmtFormula | None = None,
     ) -> ChainSubsumptionResult:
         """Check if chain1 is subsumed by chain2.
 
         Returns UNKNOWN if either chain contains a non-@rx link, uses an
         unsupported transform, or the chains target disjoint sets of
         variables.
+
+        *f1*/*f2* may be precomputed chain_to_smt() results for chain1/chain2
+        (see find_subsumed_chains), avoiding recomputation across pairs.
         """
         chain1, chain2 = list(chain1), list(chain2)
         lhs = _chain_label(chain1)
@@ -232,7 +248,7 @@ class SubsumptionChecker:
             return ChainSubsumptionResult(chain1, chain2, SolverResult.UNKNOWN)
 
         try:
-            smt2 = chain_subsumption_smt2(chain1, chain2)
+            smt2 = chain_subsumption_smt2(chain1, chain2, f1, f2)
         except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
@@ -264,11 +280,18 @@ class SubsumptionChecker:
             print(f"Chain subsumption analysis: {n} chains, {n * (n - 1)} ordered pairs\n")
         results: list[ChainSubsumptionResult] = []
 
+        formulas: list[SmtFormula | None] = []
+        for chain in chains:
+            try:
+                formulas.append(chain_to_smt(chain) if _all_supported(chain) else None)
+            except (UnsupportedTransformError, UnsupportedOperatorError):
+                formulas.append(None)
+
         for i, c1 in enumerate(chains):
             for j, c2 in enumerate(chains):
                 if i == j:
                     continue
-                res = self.check_chain_pair(c1, c2)
+                res = self.check_chain_pair(c1, c2, formulas[i], formulas[j])
                 if res.result != SolverResult.UNKNOWN:
                     results.append(res)
 

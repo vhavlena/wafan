@@ -10,7 +10,11 @@ Supported operators (see _OPERATORS / is_supported_operator):
   @within      – input is a substring of one of a space-separated list of values
   @pm          – any of a space-separated list of phrases is a substring of the input
   @eq/@ge/@gt/@le/@lt – numeric comparison of (str.to_int input) against an
-                 integer argument
+                 integer argument; the argument must be a literal integer
+                 (macro expansions and floats are not supported and raise
+                 UnsupportedOperatorError), and the input is additionally
+                 required to be a non-empty digit string, since
+                 (str.to_int input) is -1 for any non-digit string
 
 All operators support ``!`` negation (e.g. ``!@rx``) and the rule-level
 ``negated`` flag.
@@ -427,7 +431,11 @@ def _make_numeric_op(smt_op: str):
             raise UnsupportedOperatorError(
                 f"Operator argument '{argument}' is not an integer"
             ) from exc
-        atom = f"({smt_op} (str.to_int {var_expr}) {value})"
+        # (str.to_int var_expr) is -1 for any non-digit string, which would
+        # otherwise satisfy e.g. "@lt 5" for arbitrary non-numeric input.
+        # Require var_expr to be a digit string for the comparison to hold.
+        is_digits = f'(str.in_re {var_expr} (re.+ (re.range "0" "9")))'
+        atom = f"(and {is_digits} ({smt_op} (str.to_int {var_expr}) {value}))"
         return _wrap_negated(atom, negated)
 
     return _op
@@ -521,15 +529,11 @@ def rule_to_smt(rule: SecRule) -> SmtFormula:
     )
 
 
-# Backwards-compatible alias: rule_to_smt now supports more than @rx.
-rx_rule_to_smt = rule_to_smt
-
-
 def chain_to_smt(chain: Sequence[SecRule]) -> SmtFormula:
     """Convert a chained sequence of @rx SecRules to a single SmtFormula.
 
     Each link's match condition is computed independently via
-    rx_rule_to_smt(); the chain as a whole matches only if every link
+    rule_to_smt(); the chain as a whole matches only if every link
     matches (logical AND), mirroring ModSecurity's chained-rule semantics
     where a chained rule "fires" only if all of its links match the same
     request. Declarations, function declarations and axioms are merged
