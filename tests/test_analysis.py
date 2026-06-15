@@ -342,9 +342,19 @@ class TestFindSubsumed:
         checker = SubsumptionChecker(ConstantSolver(SolverResult.UNSAT))
         assert checker.find_subsumed([r_pm, r_pm]) == []
 
-    def test_unknown_results_excluded(self):
+    def test_solver_unknown_results_kept(self):
         checker = SubsumptionChecker(ConstantSolver(SolverResult.UNKNOWN))
         rules = [make_rule(rule_id="1"), make_rule(rule_id="2")]
+        results = checker.find_subsumed(rules)
+        assert len(results) == 2
+        assert all(r.result == SolverResult.UNKNOWN for r in results)
+
+    def test_skipped_results_excluded(self):
+        checker = SubsumptionChecker(ConstantSolver(SolverResult.UNSAT))
+        rules = [
+            make_rule(rule_id="1", var_name="ARGS"),
+            make_rule(rule_id="2", var_name="REQUEST_HEADERS"),
+        ]
         assert checker.find_subsumed(rules) == []
 
     def test_all_subsumed_when_solver_always_unsat(self):
@@ -646,9 +656,19 @@ class TestFindIntersecting:
         checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
         assert checker.find_intersecting([r_pm, r_pm]) == []
 
-    def test_unknown_results_excluded(self):
+    def test_solver_unknown_results_kept(self):
         checker = IntersectionChecker(ConstantSolver(SolverResult.UNKNOWN))
         rules = [make_rule(rule_id="1"), make_rule(rule_id="2")]
+        results = checker.find_intersecting(rules)
+        assert len(results) == 1
+        assert results[0].result == SolverResult.UNKNOWN
+
+    def test_skipped_results_excluded(self):
+        checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
+        rules = [
+            make_rule(rule_id="1", var_name="ARGS"),
+            make_rule(rule_id="2", var_name="REQUEST_HEADERS"),
+        ]
         assert checker.find_intersecting(rules) == []
 
     def test_three_rules_unordered_pairs(self):

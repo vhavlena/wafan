@@ -129,6 +129,7 @@ class IntersectionResult:
     rule1: SecRule
     rule2: SecRule
     result: SolverResult
+    skipped: bool = False
 
     @property
     def has_intersection(self) -> bool:
@@ -142,6 +143,7 @@ class ChainIntersectionResult:
     chain1: list[SecRule]
     chain2: list[SecRule]
     result: SolverResult
+    skipped: bool = False
 
     @property
     def has_intersection(self) -> bool:
@@ -168,14 +170,14 @@ class IntersectionChecker:
         if not rules_share_variable(rule1, rule2):
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (no shared variable)")
-            return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN)
+            return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN, skipped=True)
 
         try:
             smt2 = intersection_smt2(rule1, rule2)
         except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
-            return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN)
+            return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN, skipped=True)
 
         result = self._solver.solve(smt2)
         if self._verbosity >= 1:
@@ -193,7 +195,9 @@ class IntersectionChecker:
         """Return all unordered pairs (R1, R2) whose intersection is non-empty.
 
         Only @rx / !@rx rules are considered.  Each unordered pair is checked
-        once; pairs where the solver returns UNKNOWN are excluded.
+        once; pairs skipped due to disjoint variables or unsupported
+        transforms are excluded, but pairs where the solver itself returns
+        UNKNOWN (e.g. timeout) are kept with that result.
         """
         rx_rules = [r for r in rules if is_supported_operator(r.operator)]
         n = len(rx_rules)
@@ -204,7 +208,7 @@ class IntersectionChecker:
         for i, r1 in enumerate(rx_rules):
             for r2 in rx_rules[i + 1:]:
                 res = self.check_pair(r1, r2)
-                if res.result != SolverResult.UNKNOWN:
+                if not res.skipped:
                     results.append(res)
 
         return results
@@ -233,19 +237,19 @@ class IntersectionChecker:
         if not _all_supported(chain1) or not _all_supported(chain2):
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported operator)")
-            return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN)
+            return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True)
 
         if not chains_share_variable(chain1, chain2):
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (no shared variable)")
-            return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN)
+            return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True)
 
         try:
             smt2 = chain_intersection_smt2(chain1, chain2, f1, f2)
         except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
-            return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN)
+            return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True)
 
         result = self._solver.solve(smt2)
         if self._verbosity >= 1:
@@ -265,7 +269,9 @@ class IntersectionChecker:
         Rules are grouped into chains via group_chains() (a non-chained rule
         forms a chain of its own); only chains whose every link is @rx /
         !@rx are considered. Each unordered pair is checked once; pairs
-        where the solver returns UNKNOWN are excluded.
+        skipped due to disjoint variables or unsupported transforms are
+        excluded, but pairs where the solver itself returns UNKNOWN (e.g.
+        timeout) are kept with that result.
         """
         chains = group_chains(list(rules))
         n = len(chains)
@@ -283,7 +289,7 @@ class IntersectionChecker:
         for i, c1 in enumerate(chains):
             for j, c2 in enumerate(chains[i + 1:], start=i + 1):
                 res = self.check_chain_pair(c1, c2, formulas[i], formulas[j])
-                if res.result != SolverResult.UNKNOWN:
+                if not res.skipped:
                     results.append(res)
 
         return results

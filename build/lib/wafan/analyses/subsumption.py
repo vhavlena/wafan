@@ -133,6 +133,7 @@ class SubsumptionResult:
     rule1: SecRule
     rule2: SecRule
     result: SolverResult
+    skipped: bool = False
 
     @property
     def is_subsumed(self) -> bool:
@@ -146,6 +147,7 @@ class ChainSubsumptionResult:
     chain1: list[SecRule]
     chain2: list[SecRule]
     result: SolverResult
+    skipped: bool = False
 
     @property
     def is_subsumed(self) -> bool:
@@ -172,14 +174,14 @@ class SubsumptionChecker:
         if not rules_share_variable(rule1, rule2):
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (no shared variable)")
-            return SubsumptionResult(rule1, rule2, SolverResult.UNKNOWN)
+            return SubsumptionResult(rule1, rule2, SolverResult.UNKNOWN, skipped=True)
 
         try:
             smt2 = subsumption_smt2(rule1, rule2)
         except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
-            return SubsumptionResult(rule1, rule2, SolverResult.UNKNOWN)
+            return SubsumptionResult(rule1, rule2, SolverResult.UNKNOWN, skipped=True)
 
         result = self._solver.solve(smt2)
         if self._verbosity >= 1:
@@ -197,8 +199,9 @@ class SubsumptionChecker:
         """Return all ordered pairs (R1, R2) where R1 is subsumed by R2.
 
         Only @rx / !@rx rules are considered.  All ordered pairs with distinct
-        rule ids are checked; pairs where the solver returns UNKNOWN are
-        excluded from the result.
+        rule ids are checked; pairs skipped due to disjoint variables or
+        unsupported transforms are excluded, but pairs where the solver
+        itself returns UNKNOWN (e.g. timeout) are kept with that result.
         """
         rx_rules = [r for r in rules if is_supported_operator(r.operator)]
         n = len(rx_rules)
@@ -211,7 +214,7 @@ class SubsumptionChecker:
                 if i == j:
                     continue
                 res = self.check_pair(r1, r2)
-                if res.result != SolverResult.UNKNOWN:
+                if not res.skipped:
                     results.append(res)
 
         return results
@@ -240,19 +243,19 @@ class SubsumptionChecker:
         if not _all_supported(chain1) or not _all_supported(chain2):
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported operator)")
-            return ChainSubsumptionResult(chain1, chain2, SolverResult.UNKNOWN)
+            return ChainSubsumptionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True)
 
         if not chains_share_variable(chain1, chain2):
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (no shared variable)")
-            return ChainSubsumptionResult(chain1, chain2, SolverResult.UNKNOWN)
+            return ChainSubsumptionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True)
 
         try:
             smt2 = chain_subsumption_smt2(chain1, chain2, f1, f2)
         except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
-            return ChainSubsumptionResult(chain1, chain2, SolverResult.UNKNOWN)
+            return ChainSubsumptionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True)
 
         result = self._solver.solve(smt2)
         if self._verbosity >= 1:
@@ -272,7 +275,9 @@ class SubsumptionChecker:
         Rules are grouped into chains via group_chains() (a non-chained rule
         forms a chain of its own); only chains whose every link is @rx /
         !@rx are considered. All ordered pairs of distinct chains are
-        checked; pairs where the solver returns UNKNOWN are excluded.
+        checked; pairs skipped due to disjoint variables or unsupported
+        transforms are excluded, but pairs where the solver itself returns
+        UNKNOWN (e.g. timeout) are kept with that result.
         """
         chains = group_chains(list(rules))
         n = len(chains)
@@ -292,7 +297,7 @@ class SubsumptionChecker:
                 if i == j:
                     continue
                 res = self.check_chain_pair(c1, c2, formulas[i], formulas[j])
-                if res.result != SolverResult.UNKNOWN:
+                if not res.skipped:
                     results.append(res)
 
         return results
