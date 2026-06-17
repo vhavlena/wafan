@@ -5,13 +5,14 @@ from pathlib import Path
 
 from wafan.parser import parse_file, parse_rx_rules, SecRule, SecRuleVariable, SecRuleAction
 from wafan.smt import (
-    rx_rule_to_smt,
+    rule_to_smt,
     rules_to_smt,
     extract_transforms,
     apply_transforms_smt,
     transform_preamble,
     SmtFormula,
     SMT_LOGIC,
+    UnsupportedOperatorError,
     UnsupportedTransformError,
 )
 
@@ -147,32 +148,32 @@ class TestApplyTransformsSmt:
 
 
 # ---------------------------------------------------------------------------
-# rx_rule_to_smt (transform integration)
+# rule_to_smt (transform integration)
 # ---------------------------------------------------------------------------
 
 class TestRxRuleToSmt:
     def test_returns_smt_formula(self):
-        assert isinstance(rx_rule_to_smt(make_rule()), SmtFormula)
+        assert isinstance(rule_to_smt(make_rule()), SmtFormula)
 
     def test_declares_variable(self):
-        f = rx_rule_to_smt(make_rule(var_name="RESPONSE_BODY"))
+        f = rule_to_smt(make_rule(var_name="RESPONSE_BODY"))
         assert any("RESPONSE_BODY" in d for d in f.declarations)
 
     def test_declaration_is_string_sort(self):
-        f = rx_rule_to_smt(make_rule(var_name="REQUEST_URI"))
+        f = rule_to_smt(make_rule(var_name="REQUEST_URI"))
         assert any("String" in d for d in f.declarations)
 
     def test_assertion_uses_str_in_re(self):
-        f = rx_rule_to_smt(make_rule(pattern="foo.*bar"))
+        f = rule_to_smt(make_rule(pattern="foo.*bar"))
         assert "str.in_re" in f.assertion
 
     def test_assertion_uses_from_ecma2020(self):
-        f = rx_rule_to_smt(make_rule(pattern="foo.*bar"))
+        f = rule_to_smt(make_rule(pattern="foo.*bar"))
         assert "re.from_ecma2020" in f.assertion
 
     def test_pattern_embedded_in_assertion(self):
         # (?i) is expanded in-place: letters become [xX] classes
-        f = rx_rule_to_smt(make_rule(pattern="(?i)[a-z]+inetpub"))
+        f = rule_to_smt(make_rule(pattern="(?i)[a-z]+inetpub"))
         assert "re.from_ecma2020" in f.assertion
         assert "re.from_ecma2020_flags" not in f.assertion
         # [a-z] expanded to [a-zA-Z], literal letters wrapped
@@ -180,25 +181,25 @@ class TestRxRuleToSmt:
         assert "[iI]" in f.assertion
 
     def test_positive_assertion_no_not(self):
-        f = rx_rule_to_smt(make_rule(negated=False))
+        f = rule_to_smt(make_rule(negated=False))
         assert not f.assertion.startswith("(not ")
 
     def test_negated_rule_wraps_with_not(self):
-        f = rx_rule_to_smt(make_rule(negated=True))
+        f = rule_to_smt(make_rule(negated=True))
         assert f.assertion.startswith("(not ")
 
     def test_operator_bang_rx_treated_as_negated(self):
-        f = rx_rule_to_smt(make_rule(operator="!@rx", negated=False))
+        f = rule_to_smt(make_rule(operator="!@rx", negated=False))
         assert f.assertion.startswith("(not ")
 
     def test_non_rx_operator_raises(self):
         rule = make_rule()
-        rule.operator = "@pm"
-        with pytest.raises(ValueError, match="not @rx"):
-            rx_rule_to_smt(rule)
+        rule.operator = "@geoLookup"
+        with pytest.raises(UnsupportedOperatorError, match="not supported"):
+            rule_to_smt(rule)
 
     def test_backslash_in_pattern_escaped(self):
-        f = rx_rule_to_smt(make_rule(pattern=r"[a-z]:\inetpub"))
+        f = rule_to_smt(make_rule(pattern=r"[a-z]:\inetpub"))
         assert "\\\\" in f.assertion
 
     def test_multiple_variables_uses_or(self):
@@ -212,7 +213,7 @@ class TestRxRuleToSmt:
             chained=False,
             lineno=1,
         )
-        f = rx_rule_to_smt(rule)
+        f = rule_to_smt(rule)
         assert f.assertion.startswith("(or ")
 
     def test_multiple_variables_deduped_declarations(self):
@@ -226,7 +227,7 @@ class TestRxRuleToSmt:
             chained=False,
             lineno=1,
         )
-        assert len(rx_rule_to_smt(rule).declarations) == 1
+        assert len(rule_to_smt(rule).declarations) == 1
 
     def test_variable_part_included_in_name(self):
         rule = SecRule(
@@ -239,45 +240,45 @@ class TestRxRuleToSmt:
             chained=False,
             lineno=1,
         )
-        assert "REQUEST_HEADERS__User_Agent" in rx_rule_to_smt(rule).declarations[0]
+        assert "REQUEST_HEADERS__User_Agent" in rule_to_smt(rule).declarations[0]
 
     def test_rule_id_preserved(self):
-        assert rx_rule_to_smt(make_rule(rule_id="954100")).rule_id == "954100"
+        assert rule_to_smt(make_rule(rule_id="954100")).rule_id == "954100"
 
     # --- transform integration ---
 
     def test_no_transform_var_used_directly(self):
-        f = rx_rule_to_smt(make_rule(var_name="BODY", pattern="x"))
+        f = rule_to_smt(make_rule(var_name="BODY", pattern="x"))
         assert "str.in_re BODY" in f.assertion
 
     def test_t_none_only_no_wrapping(self):
-        f = rx_rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["none"]))
+        f = rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["none"]))
         assert "str.in_re BODY" in f.assertion
 
     def test_lowercase_transform_applied(self):
-        f = rx_rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["lowercase"]))
+        f = rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["lowercase"]))
         assert "(str.to_lower BODY)" in f.assertion
 
     def test_uppercase_transform_applied(self):
-        f = rx_rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["uppercase"]))
+        f = rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["uppercase"]))
         assert "(str.to_upper BODY)" in f.assertion
 
     def test_none_then_lowercase(self):
-        f = rx_rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["none", "lowercase"]))
+        f = rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["none", "lowercase"]))
         assert "(str.to_lower BODY)" in f.assertion
 
     def test_lowercase_then_none_resets(self):
-        f = rx_rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["lowercase", "none"]))
+        f = rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["lowercase", "none"]))
         assert "str.in_re BODY" in f.assertion
         assert "str.to_lower" not in f.assertion
 
     def test_stacked_transforms_nested(self):
-        f = rx_rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["lowercase", "uppercase"]))
+        f = rule_to_smt(make_rule(var_name="BODY", pattern="x", transforms=["lowercase", "uppercase"]))
         assert "(str.to_upper (str.to_lower BODY))" in f.assertion
 
     def test_truly_unknown_transform_raises(self):
         with pytest.raises(UnsupportedTransformError):
-            rx_rule_to_smt(make_rule(transforms=["__unknown_transform__"]))
+            rule_to_smt(make_rule(transforms=["__unknown_transform__"]))
 
     def test_transform_applied_to_all_variables(self):
         rule = SecRule(
@@ -290,19 +291,100 @@ class TestRxRuleToSmt:
             chained=False,
             lineno=1,
         )
-        f = rx_rule_to_smt(rule)
+        f = rule_to_smt(rule)
         assert "(str.to_lower A)" in f.assertion
         assert "(str.to_lower B)" in f.assertion
 
     def test_conf_file_rules_translate_with_expected_transforms(self):
         rules = parse_rx_rules(CONF)
         for rule in rules:
-            f = rx_rule_to_smt(rule)
+            f = rule_to_smt(rule)
             if rule.rule_id == "500":
                 assert "str.to_lower" in f.assertion
             else:
                 assert "str.to_lower" not in f.assertion
             assert "str.to_upper" not in f.assertion
+
+
+# ---------------------------------------------------------------------------
+# Additional operators (@streq, @contains, @beginsWith, @endsWith, @within,
+# @pm, @eq/@ge/@gt/@le/@lt)
+# ---------------------------------------------------------------------------
+
+class TestStreqOperator:
+    def test_assertion_uses_equality(self):
+        f = rule_to_smt(make_rule(var_name="BODY", pattern="foo", operator="@streq"))
+        assert f.assertion == '(= BODY "foo")'
+
+    def test_negated(self):
+        f = rule_to_smt(make_rule(var_name="BODY", pattern="foo", operator="@streq", negated=True))
+        assert f.assertion == '(not (= BODY "foo"))'
+
+    def test_bang_operator_negates(self):
+        f = rule_to_smt(make_rule(var_name="BODY", pattern="foo", operator="!@streq"))
+        assert f.assertion == '(not (= BODY "foo"))'
+
+
+class TestContainsOperator:
+    def test_assertion_uses_str_contains(self):
+        f = rule_to_smt(make_rule(var_name="ARGS", pattern="evil", operator="@contains"))
+        assert f.assertion == '(str.contains ARGS "evil")'
+
+    def test_negated(self):
+        f = rule_to_smt(make_rule(var_name="ARGS", pattern="evil", operator="!@contains"))
+        assert f.assertion == '(not (str.contains ARGS "evil"))'
+
+
+class TestBeginsWithOperator:
+    def test_assertion_uses_str_prefixof(self):
+        f = rule_to_smt(make_rule(var_name="ARGS", pattern="/admin", operator="@beginsWith"))
+        assert f.assertion == '(str.prefixof "/admin" ARGS)'
+
+
+class TestEndsWithOperator:
+    def test_assertion_uses_str_suffixof(self):
+        f = rule_to_smt(make_rule(var_name="ARGS", pattern=".php", operator="@endsWith"))
+        assert f.assertion == '(str.suffixof ".php" ARGS)'
+
+
+class TestWithinOperator:
+    def test_single_value(self):
+        f = rule_to_smt(make_rule(var_name="ARGS", pattern="GET", operator="@within"))
+        assert f.assertion == '(str.contains "GET" ARGS)'
+
+    def test_multiple_values_uses_or(self):
+        f = rule_to_smt(make_rule(var_name="ARGS", pattern="GET POST", operator="@within"))
+        assert f.assertion == '(or (str.contains "GET" ARGS) (str.contains "POST" ARGS))'
+
+
+class TestPmOperator:
+    def test_single_value(self):
+        f = rule_to_smt(make_rule(var_name="ARGS", pattern="evil", operator="@pm"))
+        assert f.assertion == '(str.contains ARGS "evil")'
+
+    def test_multiple_values_uses_or(self):
+        f = rule_to_smt(make_rule(var_name="ARGS", pattern="foo bar", operator="@pm"))
+        assert f.assertion == '(or (str.contains ARGS "foo") (str.contains ARGS "bar"))'
+
+
+class TestNumericOperators:
+    @pytest.mark.parametrize(
+        "operator,smt_op",
+        [("@eq", "="), ("@ge", ">="), ("@gt", ">"), ("@le", "<="), ("@lt", "<")],
+    )
+    def test_assertion_uses_str_to_int(self, operator, smt_op):
+        f = rule_to_smt(make_rule(var_name="ARGS", pattern="5", operator=operator))
+        digits = '(str.in_re ARGS (re.+ (re.range "0" "9")))'
+        assert f.assertion == f"(and {digits} ({smt_op} (str.to_int ARGS) 5))"
+
+    def test_negated(self):
+        f = rule_to_smt(make_rule(var_name="ARGS", pattern="0", operator="@eq", negated=True))
+        digits = '(str.in_re ARGS (re.+ (re.range "0" "9")))'
+        assert f.assertion == f"(not (and {digits} (= (str.to_int ARGS) 0)))"
+
+    def test_non_integer_argument_raises(self):
+        with pytest.raises(UnsupportedOperatorError):
+            rule_to_smt(make_rule(var_name="ARGS", pattern="not-a-number", operator="@eq"))
 
 
 # ---------------------------------------------------------------------------
@@ -435,24 +517,24 @@ class TestTransformPreamble:
 class TestSmtFormulaWithPreamble:
     def test_fun_declarations_in_to_smt2(self):
         rule = make_rule(var_name="BODY", pattern="x", transforms=["urlDecode"])
-        f = rx_rule_to_smt(rule)
+        f = rule_to_smt(rule)
         smt2 = f.to_smt2()
         assert "(declare-fun t_urlDecode" in smt2
 
     def test_axioms_in_to_smt2(self):
         rule = make_rule(var_name="BODY", pattern="x", transforms=["urlDecode"])
-        f = rx_rule_to_smt(rule)
+        f = rule_to_smt(rule)
         smt2 = f.to_smt2()
         assert "(assert (forall" in smt2
 
     def test_fun_decl_before_declare_const(self):
         rule = make_rule(var_name="BODY", pattern="x", transforms=["urlDecode"])
-        smt2 = rx_rule_to_smt(rule).to_smt2()
+        smt2 = rule_to_smt(rule).to_smt2()
         assert smt2.index("declare-fun") < smt2.index("declare-const")
 
     def test_axioms_before_assert(self):
         rule = make_rule(var_name="BODY", pattern="x", transforms=["urlDecode"])
-        smt2 = rx_rule_to_smt(rule).to_smt2()
+        smt2 = rule_to_smt(rule).to_smt2()
         # All forall axioms must appear before the final (assert (str.in_re
         forall_pos = smt2.rfind("(assert (forall")
         main_pos   = smt2.index("(assert (str.in_re")
@@ -460,24 +542,24 @@ class TestSmtFormulaWithPreamble:
 
     def test_uninterpreted_fn_in_assertion(self):
         rule = make_rule(var_name="BODY", pattern="x", transforms=["urlDecode"])
-        f = rx_rule_to_smt(rule)
+        f = rule_to_smt(rule)
         assert "t_urlDecode BODY" in f.assertion
 
     def test_no_preamble_for_direct_transforms(self):
         rule = make_rule(transforms=["lowercase"])
-        f = rx_rule_to_smt(rule)
+        f = rule_to_smt(rule)
         assert f.fun_declarations == []
         assert f.axioms == []
 
     def test_stacked_uninterpreted_and_direct(self):
         rule = make_rule(var_name="V", pattern="p", transforms=["urlDecode", "lowercase"])
-        f = rx_rule_to_smt(rule)
+        f = rule_to_smt(rule)
         assert "str.to_lower (t_urlDecode V)" in f.assertion
         assert len(f.fun_declarations) == 1
 
     def test_htmlentitydecode_define_fun_call_in_assertion(self):
         rule = make_rule(var_name="BODY", pattern="x", transforms=["htmlEntityDecode"])
-        f = rx_rule_to_smt(rule)
+        f = rule_to_smt(rule)
         assert len(f.fun_declarations) == 1
         assert f.fun_declarations[0].startswith("(define-fun t_htmlEntityDecode")
         assert f.axioms == []
@@ -486,7 +568,7 @@ class TestSmtFormulaWithPreamble:
     @pytest.mark.parametrize("t", UNINTERPRETED)
     def test_all_uninterpreted_produce_well_formed_smt2(self, t):
         rule = make_rule(var_name="BODY", pattern="test", transforms=[t])
-        smt2 = rx_rule_to_smt(rule).to_smt2()
+        smt2 = rule_to_smt(rule).to_smt2()
         assert "(set-logic" in smt2
         assert "(declare-fun" in smt2
         assert "(declare-const" in smt2

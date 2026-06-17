@@ -191,5 +191,27 @@ def parse_file(path: str | Path) -> list[SecRule]:
 
 
 def parse_rx_rules(path: str | Path) -> list[SecRule]:
-    """Return only @rx (regex-matching) rules from a conf file."""
-    return [r for r in parse_file(path) if r.operator in ("@rx", "!@rx")]
+    """Return only rules with an SMT-convertible operator from a conf file."""
+    from .smt import is_supported_operator
+
+    return [r for r in parse_file(path) if is_supported_operator(r.operator)]
+
+
+def group_chains(rules: list[SecRule]) -> list[list[SecRule]]:
+    """Group consecutive rules into chains based on the ``chain`` action.
+
+    A rule whose ``chained`` flag is set continues into the next rule, which
+    becomes the next link of the same chain; the chain ends at (and includes)
+    the first subsequent rule whose ``chained`` flag is not set. Rules
+    without ``chain`` form a chain of length one.
+    """
+    chains: list[list[SecRule]] = []
+    current: list[SecRule] = []
+    for rule in rules:
+        current.append(rule)
+        if not rule.chained:
+            chains.append(current)
+            current = []
+    if current:
+        chains.append(current)
+    return chains

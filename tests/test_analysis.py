@@ -1,4 +1,4 @@
-"""Tests for wafan.analysis – subsumption and intersection checking.
+"""Tests for wafan.analyses – subsumption, intersection and witness checking.
 
 The e2e tests use a PythonReSolver that resolves queries by extracting
 patterns from the SMT2 text and checking them with Python's re module.
@@ -14,9 +14,9 @@ from typing import Callable
 
 import pytest
 
-from wafan.parser import parse_rx_rules, SecRule, SecRuleVariable, SecRuleAction
-from wafan.smt import UnsupportedTransformError
-from wafan.analysis import (
+from wafan.parser import parse_rx_rules, group_chains, SecRule, SecRuleVariable, SecRuleAction
+from wafan.smt import UnsupportedOperatorError, UnsupportedTransformError, chain_to_smt
+from wafan.analyses import (
     SolverResult,
     SubprocessSolver,
     SubsumptionResult,
@@ -29,6 +29,13 @@ from wafan.analysis import (
     WitnessResult,
     WitnessChecker,
     witness_smt2,
+    ChainSubsumptionResult,
+    ChainIntersectionResult,
+    ChainWitnessResult,
+    chain_subsumption_smt2,
+    chain_intersection_smt2,
+    chain_witness_smt2,
+    chains_share_variable,
     _parse_get_value_output,
 )
 
@@ -331,13 +338,23 @@ class TestFindSubsumed:
 
     def test_non_rx_rules_skipped(self):
         r_pm = make_rule()
-        r_pm.operator = "@pm"
+        r_pm.operator = "@geoLookup"
         checker = SubsumptionChecker(ConstantSolver(SolverResult.UNSAT))
         assert checker.find_subsumed([r_pm, r_pm]) == []
 
-    def test_unknown_results_excluded(self):
+    def test_solver_unknown_results_kept(self):
         checker = SubsumptionChecker(ConstantSolver(SolverResult.UNKNOWN))
         rules = [make_rule(rule_id="1"), make_rule(rule_id="2")]
+        results = checker.find_subsumed(rules)
+        assert len(results) == 2
+        assert all(r.result == SolverResult.UNKNOWN for r in results)
+
+    def test_skipped_results_excluded(self):
+        checker = SubsumptionChecker(ConstantSolver(SolverResult.UNSAT))
+        rules = [
+            make_rule(rule_id="1", var_name="ARGS"),
+            make_rule(rule_id="2", var_name="REQUEST_HEADERS"),
+        ]
         assert checker.find_subsumed(rules) == []
 
     def test_all_subsumed_when_solver_always_unsat(self):
@@ -635,13 +652,23 @@ class TestFindIntersecting:
 
     def test_non_rx_rules_skipped(self):
         r_pm = make_rule()
-        r_pm.operator = "@pm"
+        r_pm.operator = "@geoLookup"
         checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
         assert checker.find_intersecting([r_pm, r_pm]) == []
 
-    def test_unknown_results_excluded(self):
+    def test_solver_unknown_results_kept(self):
         checker = IntersectionChecker(ConstantSolver(SolverResult.UNKNOWN))
         rules = [make_rule(rule_id="1"), make_rule(rule_id="2")]
+        results = checker.find_intersecting(rules)
+        assert len(results) == 1
+        assert results[0].result == SolverResult.UNKNOWN
+
+    def test_skipped_results_excluded(self):
+        checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
+        rules = [
+            make_rule(rule_id="1", var_name="ARGS"),
+            make_rule(rule_id="2", var_name="REQUEST_HEADERS"),
+        ]
         assert checker.find_intersecting(rules) == []
 
     def test_three_rules_unordered_pairs(self):
@@ -828,8 +855,8 @@ class TestWitnessSmt2:
 
     def test_non_rx_operator_raises(self):
         r = make_rule(pattern="foo")
-        r.operator = "@pm"
-        with pytest.raises(ValueError):
+        r.operator = "@geoLookup"
+        with pytest.raises(UnsupportedOperatorError):
             witness_smt2(r)
 
 
@@ -887,7 +914,7 @@ class TestWitnessCheckerUnit:
         solver = ModelSolver(SolverResult.SAT, {"ARGS": "x"})
         checker = WitnessChecker(solver)
         r = make_rule()
-        r.operator = "@pm"
+        r.operator = "@geoLookup"
         res = checker.check_rule(r)
         assert res.result == SolverResult.UNKNOWN
 
@@ -916,7 +943,7 @@ class TestWitnessCheckerUnit:
         solver = ModelSolver(SolverResult.SAT, {"ARGS": "v"})
         checker = WitnessChecker(solver)
         r_pm = make_rule()
-        r_pm.operator = "@pm"
+        r_pm.operator = "@geoLookup"
         results = checker.find_witnesses([r_pm, make_rule(rule_id="2")])
         assert len(results) == 1
 
@@ -979,3 +1006,218 @@ class TestWitnessE2E:
         res = checker.check_rule(r)
         assert res.has_witness
         assert "REQUEST_URI" in res.model
+
+
+# ---------------------------------------------------------------------------
+# Chained rule semantics
+# ---------------------------------------------------------------------------
+
+def make_chain(specs: list[dict]) -> list[SecRule]:
+    """Build a chain of SecRules; all but the last get chained=True."""
+    rules = []
+    for i, spec in enumerate(specs):
+        rule = make_rule(**spec)
+        rule.chained = i < len(specs) - 1
+        rules.append(rule)
+    return rules
+
+
+class TestGroupChains:
+    def test_single_unchained_rule_is_its_own_chain(self):
+        rules = [make_rule(rule_id="1")]
+        assert group_chains(rules) == [[rules[0]]]
+
+    def test_chained_rules_grouped_together(self):
+        chain = make_chain([
+            dict(rule_id="1", var_name="REQUEST_HEADERS", pattern="foo"),
+            dict(rule_id="", var_name="ARGS", pattern="bar"),
+        ])
+        groups = group_chains(chain)
+        assert groups == [chain]
+
+    def test_independent_chains_kept_separate(self):
+        chain1 = make_chain([
+            dict(rule_id="1", pattern="foo"),
+            dict(rule_id="", pattern="bar"),
+        ])
+        chain2 = [make_rule(rule_id="2", pattern="baz")]
+        groups = group_chains(chain1 + chain2)
+        assert groups == [chain1, chain2]
+
+    def test_trailing_chained_rule_without_terminator(self):
+        rules = make_chain([dict(rule_id="1"), dict(rule_id="")])
+        # both links are chained=True; the helper still groups them together
+        rules[-1].chained = True
+        assert group_chains(rules) == [rules]
+
+
+class TestChainToSmt:
+    def test_single_link_matches_rx_rule_to_smt(self):
+        rule = make_rule(rule_id="1", pattern="foo")
+        formula = chain_to_smt([rule])
+        assert formula.rule_id == "1"
+        assert "foo" in formula.assertion
+
+    def test_multi_link_assertion_is_conjunction(self):
+        chain = make_chain([
+            dict(rule_id="1", var_name="REQUEST_HEADERS", pattern="foo"),
+            dict(rule_id="", var_name="ARGS", pattern="bar"),
+        ])
+        formula = chain_to_smt(chain)
+        assert formula.rule_id == "1"
+        assert formula.assertion.startswith("(and ")
+        assert "foo" in formula.assertion
+        assert "bar" in formula.assertion
+        assert "REQUEST_HEADERS" in formula.assertion
+        assert "ARGS" in formula.assertion
+
+    def test_declarations_deduplicated_for_shared_variable(self):
+        chain = make_chain([
+            dict(rule_id="1", var_name="ARGS", pattern="foo"),
+            dict(rule_id="", var_name="ARGS", pattern="bar"),
+        ])
+        formula = chain_to_smt(chain)
+        assert formula.declarations == ["(declare-const ARGS String)"]
+
+    def test_non_rx_link_raises(self):
+        chain = make_chain([
+            dict(rule_id="1", pattern="foo"),
+            dict(rule_id="", pattern="bar"),
+        ])
+        chain[1].operator = "@geoLookup"
+        with pytest.raises(UnsupportedOperatorError):
+            chain_to_smt(chain)
+
+    def test_unsupported_transform_raises(self):
+        chain = make_chain([
+            dict(rule_id="1", pattern="foo", transforms=["__unknown__"]),
+            dict(rule_id="", pattern="bar"),
+        ])
+        with pytest.raises(UnsupportedTransformError):
+            chain_to_smt(chain)
+
+
+class TestChainsShareVariable:
+    def test_shares_variable_via_any_link(self):
+        chain1 = make_chain([
+            dict(rule_id="1", var_name="REQUEST_HEADERS", pattern="foo"),
+            dict(rule_id="", var_name="ARGS", pattern="bar"),
+        ])
+        chain2 = [make_rule(rule_id="2", var_name="ARGS", pattern="baz")]
+        assert chains_share_variable(chain1, chain2)
+
+    def test_disjoint_variables(self):
+        chain1 = [make_rule(rule_id="1", var_name="ARGS", pattern="foo")]
+        chain2 = [make_rule(rule_id="2", var_name="RESPONSE_BODY", pattern="bar")]
+        assert not chains_share_variable(chain1, chain2)
+
+
+class TestChainSubsumptionAndIntersectionSmt2:
+    def test_subsumption_query_structure(self):
+        chain1 = [make_rule(rule_id="1", pattern="foo")]
+        chain2 = [make_rule(rule_id="2", pattern="foo|bar")]
+        smt2 = chain_subsumption_smt2(chain1, chain2)
+        assert "(declare-const ARGS String)" in smt2
+        assert smt2.count("(declare-const ARGS String)") == 1
+        assert "(assert (not " in smt2
+
+    def test_intersection_query_shares_declarations(self):
+        chain1 = make_chain([
+            dict(rule_id="1", var_name="ARGS", pattern="foo"),
+            dict(rule_id="", var_name="REQUEST_HEADERS", pattern="bar"),
+        ])
+        chain2 = [make_rule(rule_id="2", var_name="ARGS", pattern="baz")]
+        smt2 = chain_intersection_smt2(chain1, chain2)
+        assert smt2.count("(declare-const ARGS String)") == 1
+        assert "(declare-const REQUEST_HEADERS String)" in smt2
+
+
+class TestSubsumptionCheckerChainPair:
+    def test_skips_when_chain_has_non_rx_link(self):
+        checker = SubsumptionChecker(ConstantSolver(SolverResult.UNSAT))
+        chain1 = make_chain([dict(rule_id="1"), dict(rule_id="")])
+        chain1[1].operator = "@geoLookup"
+        chain2 = [make_rule(rule_id="2")]
+        res = checker.check_chain_pair(chain1, chain2)
+        assert res.result == SolverResult.UNKNOWN
+
+    def test_skips_when_no_shared_variable(self):
+        checker = SubsumptionChecker(ConstantSolver(SolverResult.UNSAT))
+        chain1 = [make_rule(rule_id="1", var_name="ARGS")]
+        chain2 = [make_rule(rule_id="2", var_name="RESPONSE_BODY")]
+        res = checker.check_chain_pair(chain1, chain2)
+        assert res.result == SolverResult.UNKNOWN
+
+    def test_unsat_means_subsumed(self):
+        checker = SubsumptionChecker(ConstantSolver(SolverResult.UNSAT))
+        chain1 = [make_rule(rule_id="1")]
+        chain2 = [make_rule(rule_id="2")]
+        res = checker.check_chain_pair(chain1, chain2)
+        assert isinstance(res, ChainSubsumptionResult)
+        assert res.is_subsumed
+
+    def test_find_subsumed_chains_groups_rules(self):
+        checker = SubsumptionChecker(ConstantSolver(SolverResult.UNSAT))
+        chain = make_chain([
+            dict(rule_id="1", pattern="foo"),
+            dict(rule_id="", pattern="bar"),
+        ])
+        other = [make_rule(rule_id="2", pattern="baz")]
+        results = checker.find_subsumed_chains(chain + other)
+        assert len(results) == 2  # (chain⊆other) and (other⊆chain)
+        for res in results:
+            assert isinstance(res, ChainSubsumptionResult)
+
+
+class TestIntersectionCheckerChainPair:
+    def test_sat_means_intersecting(self):
+        checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
+        chain1 = [make_rule(rule_id="1")]
+        chain2 = [make_rule(rule_id="2")]
+        res = checker.check_chain_pair(chain1, chain2)
+        assert isinstance(res, ChainIntersectionResult)
+        assert res.has_intersection
+
+    def test_find_intersecting_chains_groups_rules(self):
+        checker = IntersectionChecker(ConstantSolver(SolverResult.SAT))
+        chain = make_chain([
+            dict(rule_id="1", pattern="foo"),
+            dict(rule_id="", pattern="bar"),
+        ])
+        other = [make_rule(rule_id="2", pattern="baz")]
+        results = checker.find_intersecting_chains(chain + other)
+        assert len(results) == 1
+        assert isinstance(results[0], ChainIntersectionResult)
+
+
+class TestWitnessCheckerChain:
+    def test_chain_witness_sat(self):
+        solver = ModelSolver(SolverResult.SAT, {"ARGS": "foo", "REQUEST_HEADERS": "bar"})
+        checker = WitnessChecker(solver)
+        chain = make_chain([
+            dict(rule_id="1", var_name="ARGS", pattern="foo"),
+            dict(rule_id="", var_name="REQUEST_HEADERS", pattern="bar"),
+        ])
+        res = checker.check_chain(chain)
+        assert isinstance(res, ChainWitnessResult)
+        assert res.has_witness
+        assert res.model == {"ARGS": "foo", "REQUEST_HEADERS": "bar"}
+
+    def test_chain_with_non_rx_link_returns_unknown(self):
+        solver = ModelSolver(SolverResult.SAT, {"ARGS": "foo"})
+        checker = WitnessChecker(solver)
+        chain = make_chain([dict(rule_id="1"), dict(rule_id="")])
+        chain[1].operator = "@geoLookup"
+        res = checker.check_chain(chain)
+        assert res.result == SolverResult.UNKNOWN
+
+    def test_find_chain_witnesses_groups_rules(self):
+        solver = ModelSolver(SolverResult.SAT, {"ARGS": "foo"})
+        checker = WitnessChecker(solver)
+        chain = make_chain([
+            dict(rule_id="1", pattern="foo"),
+            dict(rule_id="", pattern="bar"),
+        ])
+        other = [make_rule(rule_id="2", pattern="baz")]
+        results = checker.find_chain_witnesses(chain + other)
+        assert len(results) == 2

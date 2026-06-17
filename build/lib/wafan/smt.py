@@ -1,7 +1,23 @@
 """Convert SecRule conditions to SMT-LIB2 format.
 
-Only @rx (ECMA regex matching) is supported, via the `re.from_ecma2020`
-SMT-LIB function, targeting the z3-noodler backend.
+Supported operators (see _OPERATORS / is_supported_operator):
+  @rx          – ECMA regex matching, via the `re.from_ecma2020` SMT-LIB
+                 function, targeting the z3-noodler backend.
+  @streq       – string equality (str.=)
+  @contains    – substring match (str.contains)
+  @beginsWith  – prefix match (str.prefixof)
+  @endsWith    – suffix match (str.suffixof)
+  @within      – input is a substring of one of a space-separated list of values
+  @pm          – any of a space-separated list of phrases is a substring of the input
+  @eq/@ge/@gt/@le/@lt – numeric comparison of (str.to_int input) against an
+                 integer argument; the argument must be a literal integer
+                 (macro expansions and floats are not supported and raise
+                 UnsupportedOperatorError), and the input is additionally
+                 required to be a non-empty digit string, since
+                 (str.to_int input) is -1 for any non-digit string
+
+All operators support ``!`` negation (e.g. ``!@rx``) and the rule-level
+``negated`` flag.
 
 SecRule ``t:`` transformations are handled in two ways:
 
@@ -11,8 +27,9 @@ Direct SMT-LIB counterparts (applied inline):
   uppercase       – str.to_upper
 
 Modelled precisely as a define-fun chaining literal str.replace_all passes:
-  htmlEntityDecode– t_htmlEntityDecode, see _html_entity_decode_fun_decl for
-                    the full table and pass-ordering rules.
+  htmlEntityDecode– t_htmlEntityDecode, see
+                    wafan.transforms.html_entity_decode for the full table
+                    and pass-ordering rules.
 
 Uninterpreted functions (declared per-formula with constraining axioms):
   urlDecode       – t_urlDecode       : length-non-increasing, idempotent
@@ -33,10 +50,11 @@ Transforms not listed above raise UnsupportedTransformError.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Callable, Sequence
 
 from .parser import SecRule, SecRuleAction, SecRuleVariable
 from .regex_conv import UnsupportedPatternError, pcre_to_ecma2020
+from .transforms.html_entity_decode import HTML_ENTITY_DECODE_FUN_DECL
 
 
 SMT_LOGIC = "QF_SLIA"
@@ -150,117 +168,6 @@ _NORM_PATH_WIN_AXIOMS = (
     _no_substring("t_normalizePathWin", "\\.\\"),
 )
 
-# ---------------------------------------------------------------------------
-# t:htmlEntityDecode — modelled as a chain of literal str.replace_all passes
-# ---------------------------------------------------------------------------
-#
-# ModSecurity's htmlEntityDecode (apache2/msc_util.c / html_entity_decode.cc)
-# decodes a fixed 6-entry named-entity table plus decimal/hex numeric
-# character references, always emitting a single byte (values >= 256 are
-# truncated to their low byte). Each decoded entity is a fixed-length literal
-# string, so the whole transform can be expressed precisely as a sequence of
-# (str.replace_all s "&...;" "<byte>") passes (re.from_ecma2020-based
-# str.replace_re_all is not usable here: this z3-noodler build does not
-# support it).
-#
-# Pass ordering rules that make the literal-replace chain behave like
-# ModSecurity's single left-to-right scan:
-#   1. Forms WITH a trailing ';' are processed before forms WITHOUT one,
-#      so e.g. "&lt;" is decoded as "<" rather than "&lt" -> "<" + ";".
-#   2. Within the "no trailing ';'" group, longer literals are processed
-#      first (e.g. "&#012" before "&#01" before "&#1"), so a longer
-#      reference is never partially matched by a shorter one's prefix.
-#   3. Entities that decode to '&' (&amp; / &#38; / &#x26;) are processed
-#      last within their group, so their output '&' cannot be picked up by
-#      an earlier pass and trigger a second decoding step (htmlEntityDecode
-#      is documented as single-pass: "&amp;lt;" -> "&lt;", not "<").
-#
-# Known limitations (documented, not modelled):
-#   - numeric references >= 256 / >= 0x100 (low-byte truncation of multi-
-#     digit values beyond the enumerated 0-255 forms below) are left as-is.
-#   - unknown named entities and HTML5 named entities correctly pass through
-#     unchanged (they are simply absent from the replacement table).
-#   - the canonical "&amp;lt;" -> "&lt;" (single-pass, NOT "<") example from
-#     the spec is not reproduced exactly: once "&amp;" is decoded to '&' it
-#     forms a new "&lt;", and the no-semicolon pass 4 ("&lt" -> "<") then
-#     matches its "&lt" prefix, yielding "<;" instead of "&lt;". A fully
-#     faithful single-pass scan would require a non-recursive string theory
-#     this z3 build does not provide.
-
-_HTML_NAMED_ENTITIES: tuple[tuple[str, int], ...] = (
-    ("lt", 0x3C),
-    ("gt", 0x3E),
-    ("quot", 0x22),
-    ("nbsp", 0xA0),
-    ("apos", 0x27),
-    ("amp", 0x26),  # produces '&' — must stay last in each group
-)
-
-
-def _smt_char_literal(byte: int) -> str:
-    return f"\\u{{{byte:02x}}}"
-
-
-def _html_entity_decode_pairs() -> list[tuple[str, str]]:
-    """Ordered (literal_pattern, literal_replacement) pairs for htmlEntityDecode."""
-    pairs: list[tuple[str, str]] = []
-
-    # 1) named entities, with trailing ';' (amp last, see module docstring)
-    for name, val in _HTML_NAMED_ENTITIES:
-        pairs.append((f"&{name};", _smt_char_literal(val)))
-
-    # 2) numeric entities (decimal + hex), 0-255, with trailing ';'.
-    #    A single optional leading zero is supported for both bases
-    #    (covers e.g. "&#060;" / "&#x03C;"). '&'-producing value 0x26 last.
-    numeric_semi: list[tuple[str, str]] = []
-    amp_numeric_semi: list[tuple[str, str]] = []
-    for v in range(256):
-        ch = _smt_char_literal(v)
-        dec = str(v)
-        hx = f"{v:02x}"
-        forms = {f"&#{dec};", f"&#0{dec};"}
-        for h in {hx, hx.upper()}:
-            forms |= {f"&#x{h};", f"&#X{h};", f"&#x0{h};", f"&#X0{h};"}
-        target = amp_numeric_semi if v == 0x26 else numeric_semi
-        target.extend((f, ch) for f in forms)
-    pairs.extend(numeric_semi)
-    pairs.extend(amp_numeric_semi)
-
-    # 3) numeric entities without trailing ';', longest pattern first so a
-    #    shorter reference's literal can't match as a prefix of a longer one.
-    nosemi: list[tuple[str, str, bool]] = []
-    for v in range(256):
-        ch = _smt_char_literal(v)
-        dec = str(v)
-        hx = f"{v:02x}"
-        forms = {f"&#{dec}", f"&#0{dec}"}
-        for h in {hx, hx.upper()}:
-            forms |= {f"&#x{h}", f"&#X{h}", f"&#x0{h}", f"&#X0{h}"}
-        nosemi.extend((f, ch, v == 0x26) for f in forms)
-    nosemi.sort(key=lambda t: -len(t[0]))
-    pairs.extend((p, c) for p, c, is_amp in nosemi if not is_amp)
-    pairs.extend((p, c) for p, c, is_amp in nosemi if is_amp)
-
-    # 4) named entities without trailing ';' (amp last)
-    for name, val in _HTML_NAMED_ENTITIES:
-        pairs.append((f"&{name}", _smt_char_literal(val)))
-
-    return pairs
-
-
-_HTML_ENTITY_DECODE_PAIRS = _html_entity_decode_pairs()
-
-
-def _html_entity_decode_fun_decl() -> str:
-    body = "s"
-    for pattern, replacement in _HTML_ENTITY_DECODE_PAIRS:
-        body = f'(str.replace_all {body} "{pattern}" "{replacement}")'
-    return f"(define-fun t_htmlEntityDecode ((s String)) String {body})"
-
-
-_HTML_ENTITY_DECODE_FUN_DECL = _html_entity_decode_fun_decl()
-
-
 # Keys are normalised (lower-cased) transform names.
 # "none" is excluded — it is handled specially by extract_transforms.
 _TRANSFORMS: dict[str, _TransformDef] = {
@@ -275,7 +182,7 @@ _TRANSFORMS: dict[str, _TransformDef] = {
                              _empty_fixed("t_urlDecodeUni"),
                          ),
     "htmlentitydecode":  _TransformDef(smt_fn="t_htmlEntityDecode",
-                                        fun_decl=_HTML_ENTITY_DECODE_FUN_DECL),
+                                        fun_decl=HTML_ENTITY_DECODE_FUN_DECL),
     "removewhitespace":  _uninterpreted("t_removeWhitespace",   *_REMOVE_WS_AXIOMS),
     "compresswhitespace":_uninterpreted("t_compressWhitespace", *_COMPRESS_WS_AXIOMS),
     "removenulls":       _uninterpreted("t_removeNulls",        *_REMOVE_NULLS_AXIOMS),
@@ -369,6 +276,19 @@ def extract_transforms(actions: Sequence[SecRuleAction]) -> list[str]:
     return transforms
 
 
+def effective_transforms(rule: SecRule) -> list[str]:
+    """Return the effective ordered list of transformation names for *rule*.
+
+    ModSecurity inherits transformations from the closest preceding
+    ``SecDefaultAction`` in the same phase, but only when the rule itself
+    does not define any ``t:`` action (including ``t:none``); a rule that
+    defines its own transformations entirely replaces the inherited ones.
+    """
+    if any(action.name == "t" for action in rule.actions):
+        return extract_transforms(rule.actions)
+    return extract_transforms(rule.inherited_actions)
+
+
 def apply_transforms_smt(var_expr: str, transforms: Sequence[str]) -> str:
     """Wrap *var_expr* with SMT-LIB transformation functions.
 
@@ -435,12 +355,130 @@ def _rx_assertion(var_expr: str, pattern: str, negated: bool) -> str:
     return f"(not {inner})" if negated else inner
 
 
+def _wrap_negated(atom: str, negated: bool) -> str:
+    return f"(not {atom})" if negated else atom
+
+
+# ---------------------------------------------------------------------------
+# Operator table
+# ---------------------------------------------------------------------------
+
+class UnsupportedOperatorError(Exception):
+    """Raised when a SecRule operator cannot be converted to SMT."""
+
+
+def _op_rx(var_expr: str, argument: str, negated: bool) -> str:
+    conv = pcre_to_ecma2020(argument)
+    return _rx_assertion(var_expr, conv.pattern, negated)
+
+
+def _op_streq(var_expr: str, argument: str, negated: bool) -> str:
+    atom = f'(= {var_expr} "{_escape_smt_string(argument)}")'
+    return _wrap_negated(atom, negated)
+
+
+def _op_contains(var_expr: str, argument: str, negated: bool) -> str:
+    atom = f'(str.contains {var_expr} "{_escape_smt_string(argument)}")'
+    return _wrap_negated(atom, negated)
+
+
+def _op_beginswith(var_expr: str, argument: str, negated: bool) -> str:
+    atom = f'(str.prefixof "{_escape_smt_string(argument)}" {var_expr})'
+    return _wrap_negated(atom, negated)
+
+
+def _op_endswith(var_expr: str, argument: str, negated: bool) -> str:
+    atom = f'(str.suffixof "{_escape_smt_string(argument)}" {var_expr})'
+    return _wrap_negated(atom, negated)
+
+
+def _disjunction(atoms: list[str]) -> str:
+    if not atoms:
+        return "false"
+    if len(atoms) == 1:
+        return atoms[0]
+    return "(or " + " ".join(atoms) + ")"
+
+
+def _op_within(var_expr: str, argument: str, negated: bool) -> str:
+    # @within: matches if var_expr is a substring of one of the
+    # space-separated values in argument.
+    atoms = [
+        f'(str.contains "{_escape_smt_string(v)}" {var_expr})'
+        for v in argument.split()
+    ]
+    return _wrap_negated(_disjunction(atoms), negated)
+
+
+def _op_pm(var_expr: str, argument: str, negated: bool) -> str:
+    # @pm: matches if any of the space-separated phrases is a substring of
+    # var_expr.
+    atoms = [
+        f'(str.contains {var_expr} "{_escape_smt_string(v)}")'
+        for v in argument.split()
+    ]
+    return _wrap_negated(_disjunction(atoms), negated)
+
+
+_NUMERIC_OPS = {"eq": "=", "ge": ">=", "gt": ">", "le": "<=", "lt": "<"}
+
+
+def _make_numeric_op(smt_op: str):
+    def _op(var_expr: str, argument: str, negated: bool) -> str:
+        try:
+            value = int(argument.strip())
+        except ValueError as exc:
+            raise UnsupportedOperatorError(
+                f"Operator argument '{argument}' is not an integer"
+            ) from exc
+        # (str.to_int var_expr) is -1 for any non-digit string, which would
+        # otherwise satisfy e.g. "@lt 5" for arbitrary non-numeric input.
+        # Require var_expr to be a digit string for the comparison to hold.
+        is_digits = f'(str.in_re {var_expr} (re.+ (re.range "0" "9")))'
+        atom = f"(and {is_digits} ({smt_op} (str.to_int {var_expr}) {value}))"
+        return _wrap_negated(atom, negated)
+
+    return _op
+
+
+_OPERATORS: dict[str, Callable[[str, str, bool], str]] = {
+    "rx": _op_rx,
+    "streq": _op_streq,
+    "contains": _op_contains,
+    "beginswith": _op_beginswith,
+    "endswith": _op_endswith,
+    "within": _op_within,
+    "pm": _op_pm,
+    **{name: _make_numeric_op(smt_op) for name, smt_op in _NUMERIC_OPS.items()},
+}
+
+
+def _normalize_operator(operator: str) -> tuple[str, bool]:
+    """Split *operator* into (normalised name, bang-negated).
+
+    e.g. ``"!@rx"`` -> ``("rx", True)``, ``"@beginsWith"`` -> ``("beginswith", False)``.
+    """
+    op = operator
+    negated = op.startswith("!")
+    if negated:
+        op = op[1:]
+    if op.startswith("@"):
+        op = op[1:]
+    return op.lower(), negated
+
+
+def is_supported_operator(operator: str) -> bool:
+    """True if *operator* (with optional leading ``!``/``@``) can be converted to SMT."""
+    name, _ = _normalize_operator(operator)
+    return name in _OPERATORS
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def rx_rule_to_smt(rule: SecRule) -> SmtFormula:
-    """Convert a single @rx SecRule to an SmtFormula.
+def rule_to_smt(rule: SecRule) -> SmtFormula:
+    """Convert a single SecRule to an SmtFormula.
 
     Transformation actions (t:) are extracted and applied as SMT-LIB wrappers
     around each variable expression.  Uninterpreted transforms are declared and
@@ -449,19 +487,23 @@ def rx_rule_to_smt(rule: SecRule) -> SmtFormula:
     Each ModSecurity variable becomes a free String constant.  Multiple
     variables produce a disjunctive assertion.
 
+    Supported operators: @rx, @streq, @contains, @beginsWith, @endsWith,
+    @within, @pm, @eq, @ge, @gt, @le, @lt (each with optional ``!`` negation).
+
     Raises:
-        ValueError: if the operator is not @rx / !@rx.
+        UnsupportedOperatorError: if the operator is not supported, or (for
+            numeric operators) its argument is not an integer.
         UnsupportedTransformError: if a t: action is unknown.
     """
-    if rule.operator not in ("@rx", "!@rx"):
-        raise ValueError(
-            f"Rule {rule.rule_id}: operator '{rule.operator}' is not @rx"
+    op_name, op_negated = _normalize_operator(rule.operator)
+    builder = _OPERATORS.get(op_name)
+    if builder is None:
+        raise UnsupportedOperatorError(
+            f"Rule {rule.rule_id}: operator '{rule.operator}' is not supported"
         )
 
-    negated = rule.negated or rule.operator == "!@rx"
-    conv = pcre_to_ecma2020(rule.operator_argument)
-    pattern = conv.pattern
-    transforms = extract_transforms(rule.actions)
+    negated = rule.negated or op_negated
+    transforms = effective_transforms(rule)
     fun_decls, axioms = transform_preamble(transforms)
 
     declarations: list[str] = []
@@ -474,7 +516,7 @@ def rx_rule_to_smt(rule: SecRule) -> SmtFormula:
             declarations.append(f"(declare-const {v} String)")
             seen.add(v)
         var_expr = apply_transforms_smt(v, transforms)
-        assertions.append(_rx_assertion(var_expr, pattern, negated))
+        assertions.append(builder(var_expr, rule.operator_argument, negated))
 
     assertion = assertions[0] if len(assertions) == 1 else "(or " + " ".join(assertions) + ")"
 
@@ -487,10 +529,55 @@ def rx_rule_to_smt(rule: SecRule) -> SmtFormula:
     )
 
 
+def chain_to_smt(chain: Sequence[SecRule]) -> SmtFormula:
+    """Convert a chained sequence of @rx SecRules to a single SmtFormula.
+
+    Each link's match condition is computed independently via
+    rule_to_smt(); the chain as a whole matches only if every link
+    matches (logical AND), mirroring ModSecurity's chained-rule semantics
+    where a chained rule "fires" only if all of its links match the same
+    request. Declarations, function declarations and axioms are merged
+    across links, deduplicating identical entries (e.g. when multiple links
+    reference the same ModSecurity variable or transform).
+
+    Raises:
+        UnsupportedOperatorError: if any link's operator is not supported.
+        UnsupportedTransformError: if any link uses an unknown transform.
+    """
+    formulas = [rule_to_smt(rule) for rule in chain]
+
+    declarations = _merge_unique([], [])
+    fun_declarations: list[str] = []
+    axioms: list[str] = []
+    for f in formulas:
+        declarations = _merge_unique(declarations, f.declarations)
+        fun_declarations = _merge_unique(fun_declarations, f.fun_declarations)
+        axioms = _merge_unique(axioms, f.axioms)
+
+    if len(formulas) == 1:
+        assertion = formulas[0].assertion
+    else:
+        assertion = "(and " + " ".join(f.assertion for f in formulas) + ")"
+
+    return SmtFormula(
+        rule_id=chain[0].rule_id,
+        declarations=declarations,
+        assertion=assertion,
+        fun_declarations=fun_declarations,
+        axioms=axioms,
+    )
+
+
+def _merge_unique(a: list[str], b: list[str]) -> list[str]:
+    """Concatenate two lists, dropping duplicates from b that already appear in a."""
+    seen = set(a)
+    return a + [x for x in b if x not in seen]
+
+
 def rules_to_smt(rules: Sequence[SecRule]) -> list[SmtFormula]:
-    """Convert a sequence of @rx SecRules to SmtFormulas, skipping others."""
+    """Convert a sequence of SecRules to SmtFormulas, skipping unsupported operators."""
     result = []
     for rule in rules:
-        if rule.operator in ("@rx", "!@rx"):
-            result.append(rx_rule_to_smt(rule))
+        if is_supported_operator(rule.operator):
+            result.append(rule_to_smt(rule))
     return result
