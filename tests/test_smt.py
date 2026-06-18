@@ -476,7 +476,9 @@ class TestTransformPreamble:
         fun_decls, axioms = transform_preamble(["htmlEntityDecode"])
         assert len(fun_decls) == 1
         assert fun_decls[0].startswith("(define-fun t_htmlEntityDecode ((s String)) String")
-        assert fun_decls[0].count("str.replace_all") > 100
+        # 4 groups × 256 bytes via str.replace_re_all + 12 named via str.replace_all
+        assert fun_decls[0].count("str.replace_re_all") == 1024
+        assert fun_decls[0].count("str.replace_all ") == 12
         assert axioms == []
 
     def test_urldecode_define_fun_no_axioms(self):
