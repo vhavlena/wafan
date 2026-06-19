@@ -65,14 +65,10 @@ def _percent_re(byte: int) -> str:
     return f'(re.++ (str.to_re "%") {_nibble_re(hi)} {_nibble_re(lo)})'
 
 
-def url_decode_fun_decl() -> str:
-    """Return the (define-fun t_urlDecode ...) SMT-LIB2 declaration."""
-    body = "s"
-
-    # Pass 1: literal '+' → space
+def _url_decode_body(inner: str) -> str:
+    """Build the urlDecode pass chain applied to *inner*, returning an SMT expression."""
+    body = inner
     body = f'(str.replace_all {body} "+" "{_smt_char_literal(0x20)}")'
-
-    # Passes 2..N-1: '%XX' → byte for every value except 0x25
     for byte in range(256):
         if byte == 0x25:
             continue
@@ -80,14 +76,16 @@ def url_decode_fun_decl() -> str:
             f'(str.replace_re_all {body} {_percent_re(byte)}'
             f' "{_smt_char_literal(byte)}")'
         )
-
-    # Pass N: '%25' → '%'  (must be last)
     body = (
         f'(str.replace_re_all {body} {_percent_re(0x25)}'
         f' "{_smt_char_literal(0x25)}")'
     )
+    return body
 
-    return f"(define-fun t_urlDecode ((s String)) String {body})"
+
+def url_decode_fun_decl() -> str:
+    """Return the (define-fun t_urlDecode ...) SMT-LIB2 declaration."""
+    return f"(define-fun t_urlDecode ((s String)) String {_url_decode_body('s')})"
 
 
 URL_DECODE_FUN_DECL = url_decode_fun_decl()

@@ -15,8 +15,9 @@ Pass structure (1036 passes total vs ~5132 in the literal-only version):
                                   variants folded into re.union terms
 
   Group 2 — forms WITHOUT trailing ';':
-    d. str.replace_re_all × 256  Hex:     &#[xX]0?HH  — no ordering needed;
-                                  all patterns have a constant-length suffix
+    d. str.replace_re_all × 256  Hex:     &#[xX]0?HH  — ordering required;
+                                  (re.opt "0") makes patterns variable-length,
+                                  so hi-nibble>0 bytes first, 0x00 last
     e. str.replace_re_all × 256  Decimal: &#0?DEC  — MUST be processed in
                                   descending decimal-digit-count order so that
                                   e.g. '&#10' is consumed as LF before the
@@ -48,6 +49,8 @@ Known limitations (documented, not modelled):
 
 from __future__ import annotations
 
+from .url_decode import _smt_char_literal, _nibble_re
+
 _HTML_NAMED_ENTITIES: tuple[tuple[str, int], ...] = (
     ("lt",   0x3C),
     ("gt",   0x3E),
@@ -56,19 +59,6 @@ _HTML_NAMED_ENTITIES: tuple[tuple[str, int], ...] = (
     ("apos", 0x27),
     ("amp",  0x26),  # produces '&' — must stay last in each group
 )
-
-
-def _smt_char_literal(byte: int) -> str:
-    return f"\\u{{{byte:02x}}}"
-
-
-def _nibble_re(nibble: int) -> str:
-    """SMT-LIB2 regex term matching both case variants of a hex nibble."""
-    if nibble < 10:
-        return f'(str.to_re "{nibble}")'
-    lo = chr(ord("a") + nibble - 10)
-    hi = lo.upper()
-    return f'(re.union (str.to_re "{lo}") (str.to_re "{hi}"))'
 
 
 _X_RE = '(re.union (str.to_re "x") (str.to_re "X"))'
@@ -130,9 +120,18 @@ def html_entity_decode_fun_decl() -> str:
     # --- Group 2: forms WITHOUT trailing ';' ---
 
     # (d) Hex numeric WITHOUT ';': &#[xX]0?HH
-    # All patterns have the same constant-length suffix structure, so no
-    # ordering is needed among them.
-    for v in _bytes_amp_last():
+    # Ordering IS required: (re.opt "0") makes patterns variable-length.
+    # Byte 0x0K's 5-char form '&#x0K' (opt-skip) is a prefix of byte
+    # 0xKL's 6-char form '&#x0KL' (opt-consume).  Process bytes with
+    # hi nibble > 0 first so their 6-char forms are consumed before the
+    # hi=0 bytes' 5-char forms can steal the prefix.  Within hi=0: 0x00
+    # last (its 5-char '&#x00' overlaps the 6-char forms of 0x01–0x0F).
+    # Amp (0x26) last within the hi>0 group.
+    def _hex_nosemi_key(v: int) -> tuple:
+        hi = v >> 4
+        return (hi == 0, v == 0, v == 0x26)
+
+    for v in sorted(range(256), key=_hex_nosemi_key):
         body = (f'(str.replace_re_all {body} {_hex_entity_re(v, semi=False)}'
                 f' "{_smt_char_literal(v)}")')
 
@@ -142,7 +141,9 @@ def html_entity_decode_fun_decl() -> str:
     # Sort key: descending decimal digit count, amp (38, 2-digit) last in its
     # digit-count group.
     def _dec_nosemi_key(v: int) -> tuple:
-        return (-len(str(v)), v == 0x26)
+        # Value 0 must come after 1–9: its regex '&#(0?)0' matches '&#0'
+        # (opt-skip path), which is a prefix of '&#0X' for X in 1–9.
+        return (-len(str(v)), v == 0, v == 0x26)
 
     for v in sorted(range(256), key=_dec_nosemi_key):
         body = (f'(str.replace_re_all {body} {_dec_entity_re(v, semi=False)}'

@@ -26,14 +26,16 @@ Direct SMT-LIB counterparts (applied inline):
   lowercase       – str.to_lower
   uppercase       – str.to_upper
 
-Modelled precisely as a define-fun chaining literal str.replace_all passes:
+Modelled precisely as a define-fun:
   htmlEntityDecode– t_htmlEntityDecode, see
                     wafan.transforms.html_entity_decode for the full table
                     and pass-ordering rules.
+  urlDecode       – t_urlDecode, see wafan.transforms.url_decode
 
 Uninterpreted functions (declared per-formula with constraining axioms):
-  urlDecode       – t_urlDecode       : length-non-increasing, idempotent
-  urlDecodeUni    – t_urlDecodeUni    : same axioms as urlDecode
+  urlDecodeUni    – t_urlDecodeUni    : length-non-increasing (idempotence
+                                        is NOT asserted — it does not hold
+                                        for inputs such as '%2541')
   removeWhitespace– t_removeWhitespace: idempotent, result contains no
                                         space / tab / CR / LF
   compressWhitespace–t_compressWhitespace: idempotent, no consecutive spaces
@@ -174,7 +176,6 @@ _TRANSFORMS: dict[str, _TransformDef] = {
                                        fun_decl=URL_DECODE_FUN_DECL),
     "urldecodeuni":      _uninterpreted("t_urlDecodeUni",
                              _len_le("t_urlDecodeUni"),
-                             _idempotent("t_urlDecodeUni"),
                              _empty_fixed("t_urlDecodeUni"),
                          ),
     "htmlentitydecode":  _TransformDef(smt_fn="t_htmlEntityDecode",

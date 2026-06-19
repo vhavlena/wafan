@@ -38,7 +38,7 @@ Pass ordering
 
 from __future__ import annotations
 
-from .url_decode import _smt_char_literal, _nibble_re, _percent_re
+from .url_decode import _smt_char_literal, _nibble_re, _percent_re, _url_decode_body
 
 
 _U_RE = '(re.union (str.to_re "u") (str.to_re "U"))'
@@ -63,23 +63,9 @@ def _percent_u_re(codepoint: int) -> str:
 
 def url_decode_uni_fun_decl() -> str:
     """Return the (define-fun t_urlDecodeUni ...) SMT-LIB2 declaration."""
-    body = "s"
 
-    # --- Group 1: standard urlDecode passes ---
-
-    # Pass 1: '+' → space
-    body = f'(str.replace_all {body} "+" "{_smt_char_literal(0x20)}")'
-
-    # Passes 2..N-1: '%XX' → byte for all bytes except 0x25
-    for byte in range(256):
-        if byte == 0x25:
-            continue
-        body = (f'(str.replace_re_all {body} {_percent_re(byte)}'
-                f' "{_smt_char_literal(byte)}")')
-
-    # Pass N: '%25' → '%' (last among '%XX')
-    body = (f'(str.replace_re_all {body} {_percent_re(0x25)}'
-            f' "{_smt_char_literal(0x25)}")')
+    # --- Group 1: standard urlDecode passes (shared with url_decode.py) ---
+    body = _url_decode_body("s")
 
     # --- Group 2: IIS '%uXXXX' Unicode decoding ---
     # Runs after '%XX' so that '%u002541' → '%41' (not 'A'): '%u0025' decodes
@@ -100,10 +86,10 @@ def url_decode_uni_fun_decl() -> str:
     # --- Group 3: full-width ASCII best-fit mapping ---
     # U+FF01–U+FF5E → U+0021–U+007E (94 characters)
     for i in range(_FULLWIDTH_LAST - _FULLWIDTH_FIRST + 1):
-        fw    = _FULLWIDTH_FIRST + i
-        ascii = _ASCII_FIRST + i
+        fw      = _FULLWIDTH_FIRST + i
+        ascii_cp = _ASCII_FIRST + i
         body = (f'(str.replace_all {body} "{_smt_char_unicode(fw)}"'
-                f' "{_smt_char_unicode(ascii)}")')
+                f' "{_smt_char_unicode(ascii_cp)}")')
 
     return f"(define-fun t_urlDecodeUni ((s String)) String {body})"
 
@@ -113,6 +99,3 @@ def url_decode_uni_fun_decl() -> str:
 # SMT formula is too large for practical solver use; urlDecodeUni is therefore
 # kept as an uninterpreted function with axioms in smt.py.  This module exists
 # to demonstrate that the exact define-fun model is achievable in principle.
-def _build_url_decode_uni_fun_decl() -> str:
-    """Build on demand — expensive (~15 s, ~13 MB)."""
-    return url_decode_uni_fun_decl()
