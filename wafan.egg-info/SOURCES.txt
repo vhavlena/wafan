@@ -3,6 +3,7 @@ pyproject.toml
 tests/test_analysis.py
 tests/test_cli.py
 tests/test_default_action.py
+tests/test_e2e.py
 tests/test_parser.py
 tests/test_smt.py
 wafan/__init__.py
@@ -24,3 +25,4 @@ wafan/analyses/subsumption.py
 wafan/analyses/witness.py
 wafan/transforms/__init__.py
 wafan/transforms/html_entity_decode.py
+wafan/transforms/url_decode.py

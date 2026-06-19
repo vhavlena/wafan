@@ -26,14 +26,16 @@ Direct SMT-LIB counterparts (applied inline):
   lowercase       – str.to_lower
   uppercase       – str.to_upper
 
-Modelled precisely as a define-fun chaining literal str.replace_all passes:
+Modelled precisely as a define-fun:
   htmlEntityDecode– t_htmlEntityDecode, see
                     wafan.transforms.html_entity_decode for the full table
                     and pass-ordering rules.
+  urlDecode       – t_urlDecode, see wafan.transforms.url_decode
 
 Uninterpreted functions (declared per-formula with constraining axioms):
-  urlDecode       – t_urlDecode       : length-non-increasing, idempotent
-  urlDecodeUni    – t_urlDecodeUni    : same axioms as urlDecode
+  urlDecodeUni    – t_urlDecodeUni    : length-non-increasing (idempotence
+                                        is NOT asserted — it does not hold
+                                        for inputs such as '%2541')
   removeWhitespace– t_removeWhitespace: idempotent, result contains no
                                         space / tab / CR / LF
   compressWhitespace–t_compressWhitespace: idempotent, no consecutive spaces
@@ -55,6 +57,7 @@ from typing import Callable, Sequence
 from .parser import SecRule, SecRuleAction, SecRuleVariable
 from .regex_conv import UnsupportedPatternError, pcre_to_ecma2020
 from .transforms.html_entity_decode import HTML_ENTITY_DECODE_FUN_DECL
+from .transforms.url_decode import URL_DECODE_FUN_DECL
 
 
 SMT_LOGIC = "QF_SLIA"
@@ -106,12 +109,6 @@ def _no_double(fn: str, sub: str) -> str:
     escaped = sub.replace("\\", "\\\\")
     return _forall(f'(not (str.contains ({fn} s) "{escaped}{escaped}"))')
 
-
-_URL_DECODE_AXIOMS = (
-    _len_le("t_urlDecode"),
-    _idempotent("t_urlDecode"),
-    _empty_fixed("t_urlDecode"),
-)
 
 _REMOVE_WS_AXIOMS = (
     _len_le("t_removeWhitespace"),
@@ -175,10 +172,10 @@ _TRANSFORMS: dict[str, _TransformDef] = {
     "lowercase":  _TransformDef(smt_fn="str.to_lower"),
     "uppercase":  _TransformDef(smt_fn="str.to_upper"),
     # --- uninterpreted functions ---
-    "urldecode":         _uninterpreted("t_urlDecode",          *_URL_DECODE_AXIOMS),
+    "urldecode":         _TransformDef(smt_fn="t_urlDecode",
+                                       fun_decl=URL_DECODE_FUN_DECL),
     "urldecodeuni":      _uninterpreted("t_urlDecodeUni",
                              _len_le("t_urlDecodeUni"),
-                             _idempotent("t_urlDecodeUni"),
                              _empty_fixed("t_urlDecodeUni"),
                          ),
     "htmlentitydecode":  _TransformDef(smt_fn="t_htmlEntityDecode",

@@ -396,12 +396,13 @@ class TestNumericOperators:
 # ---------------------------------------------------------------------------
 
 UNINTERPRETED = [
-    "urlDecode", "urlDecodeUni",
+    "urlDecodeUni",
     "removeWhitespace", "compressWhitespace", "removeNulls",
     "trim", "trimLeft", "trimRight",
     "normalizePath", "normalizePathWin",
 ]
 
+# All transforms that use a named SMT function (both define-fun and declare-fun)
 SMT_NAMES = {
     "urlDecode": "t_urlDecode",
     "urlDecodeUni": "t_urlDecodeUni",
@@ -475,26 +476,52 @@ class TestTransformPreamble:
         fun_decls, axioms = transform_preamble(["htmlEntityDecode"])
         assert len(fun_decls) == 1
         assert fun_decls[0].startswith("(define-fun t_htmlEntityDecode ((s String)) String")
-        assert fun_decls[0].count("str.replace_all") > 100
+        # 4 groups × 256 bytes via str.replace_re_all + 12 named via str.replace_all
+        assert fun_decls[0].count("str.replace_re_all") == 1024
+        assert fun_decls[0].count("str.replace_all ") == 12
         assert axioms == []
+
+    def test_urldecode_define_fun_no_axioms(self):
+        fun_decls, axioms = transform_preamble(["urlDecode"])
+        assert len(fun_decls) == 1
+        assert fun_decls[0].startswith("(define-fun t_urlDecode ((s String)) String")
+        # 1 str.replace_all ('+') + 256 str.replace_re_all ('%XX')
+        assert fun_decls[0].count("str.replace_re_all") == 256
+        assert fun_decls[0].count("str.replace_all ") == 1
+        assert axioms == []
+
+    def test_urldecode_define_fun_contains_plus_to_space(self):
+        fun_decls, _ = transform_preamble(["urlDecode"])
+        decl = fun_decls[0]
+        # '+' → space must appear as a literal str.replace_all (pass 1)
+        assert '"+" "\\u{20}"' in decl
+
+    def test_urldecode_define_fun_contains_percent_encoding(self):
+        fun_decls, _ = transform_preamble(["urlDecode"])
+        decl = fun_decls[0]
+        # regex terms for representative byte values must be present
+        assert '"\\u{41}"' in decl   # 0x41 = A
+        assert '"\\u{61}"' in decl   # 0x61 = a
+        assert '"\\u{00}"' in decl   # 0x00 = NUL
+        # case-variant union terms appear for hex-letter nibbles
+        assert 're.union' in decl
+
+    def test_urldecode_define_fun_percent25_last(self):
+        fun_decls, _ = transform_preamble(["urlDecode"])
+        decl = fun_decls[0]
+        # the regex for %25 must appear and must come after other %XX regexes
+        pct25_re = '(str.to_re "2") (str.to_re "5")'
+        assert pct25_re in decl
+        pos_25 = decl.rfind(pct25_re)
+        # 0x41 ('A') regex should appear before %25
+        pct41_re = '(str.to_re "4") (str.to_re "1")'
+        assert decl.index(pct41_re) < pos_25
 
     def test_unknown_raises(self):
         with pytest.raises(UnsupportedTransformError):
             transform_preamble(["__unknown__"])
 
     # Specific axiom content checks
-    def test_urldecode_idempotent_axiom(self):
-        _, axioms = transform_preamble(["urlDecode"])
-        assert any("t_urlDecode (t_urlDecode" in a for a in axioms)
-
-    def test_urldecode_length_axiom(self):
-        _, axioms = transform_preamble(["urlDecode"])
-        assert any("str.len" in a for a in axioms)
-
-    def test_urldecode_empty_axiom(self):
-        _, axioms = transform_preamble(["urlDecode"])
-        assert any('""' in a for a in axioms)
-
     def test_removewhitespace_no_space_axiom(self):
         _, axioms = transform_preamble(["removeWhitespace"])
         combined = " ".join(axioms)
@@ -519,25 +546,26 @@ class TestSmtFormulaWithPreamble:
         rule = make_rule(var_name="BODY", pattern="x", transforms=["urlDecode"])
         f = rule_to_smt(rule)
         smt2 = f.to_smt2()
-        assert "(declare-fun t_urlDecode" in smt2
+        assert "(define-fun t_urlDecode" in smt2
 
     def test_axioms_in_to_smt2(self):
-        rule = make_rule(var_name="BODY", pattern="x", transforms=["urlDecode"])
+        rule = make_rule(var_name="BODY", pattern="x", transforms=["removeWhitespace"])
         f = rule_to_smt(rule)
         smt2 = f.to_smt2()
         assert "(assert (forall" in smt2
 
     def test_fun_decl_before_declare_const(self):
-        rule = make_rule(var_name="BODY", pattern="x", transforms=["urlDecode"])
+        rule = make_rule(var_name="BODY", pattern="x", transforms=["removeWhitespace"])
         smt2 = rule_to_smt(rule).to_smt2()
         assert smt2.index("declare-fun") < smt2.index("declare-const")
 
     def test_axioms_before_assert(self):
-        rule = make_rule(var_name="BODY", pattern="x", transforms=["urlDecode"])
+        rule = make_rule(var_name="BODY", pattern="x", transforms=["removeWhitespace"])
         smt2 = rule_to_smt(rule).to_smt2()
         # All forall axioms must appear before the final (assert (str.in_re
         forall_pos = smt2.rfind("(assert (forall")
         main_pos   = smt2.index("(assert (str.in_re")
+        assert forall_pos >= 0
         assert forall_pos < main_pos
 
     def test_uninterpreted_fn_in_assertion(self):

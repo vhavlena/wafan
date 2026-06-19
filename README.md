@@ -183,8 +183,8 @@ wafan supports the most common ModSecurity rule constructs:
 
 **Transforms (`t:`):** Three levels of support:
 
-- *Precisely formalized in SMT:* `lowercase`, `uppercase`, `htmlEntityDecode`, `none`
-- *Accepted but approximated* (modeled as uninterpreted functions with partial axioms — analysis results may be imprecise): `urlDecode`, `urlDecodeUni`, `removeWhitespace`, `compressWhitespace`, `removeNulls`, `trim`, `trimLeft`, `trimRight`, `normalizePath`, `normalizePathWin`
+- *Precisely formalized in SMT:* `lowercase`, `uppercase`, `htmlEntityDecode`, `urlDecode`, `none`
+- *Accepted but approximated* (modeled as uninterpreted functions with partial axioms — analysis results may be imprecise): `urlDecodeUni`, `removeWhitespace`, `compressWhitespace`, `removeNulls`, `trim`, `trimLeft`, `trimRight`, `normalizePath`, `normalizePathWin`
 
 **Rule chaining:** Chained rules (linked with the `chain` action) are treated as a single unit — a chain fires only when all of its links match, mirroring ModSecurity semantics.
 
