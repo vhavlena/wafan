@@ -11,13 +11,18 @@ from __future__ import annotations
 
 import os
 import platform
+import socket
 import stat
 import sys
 import urllib.request
+import uuid
 from pathlib import Path
 
 #: Pinned release; override with WAFAN_Z3_NOODLER_VERSION to track another tag.
 _DEFAULT_VERSION = "v1.6.1"
+
+#: Bound how long a download can block before failing over to a system solver.
+_DOWNLOAD_TIMEOUT_SECONDS = 30
 
 _REPO = "VeriFIT/z3-noodler"
 
@@ -65,7 +70,7 @@ def ensure_z3_noodler(version: str | None = None, quiet: bool = False) -> Path |
     version = version or os.environ.get("WAFAN_Z3_NOODLER_VERSION", _DEFAULT_VERSION)
     dest_dir = cache_dir() / version
     dest = dest_dir / asset
-    if dest.is_file():
+    if dest.is_file() and dest.stat().st_size > 0:
         return dest
 
     url = f"https://github.com/{_REPO}/releases/download/{version}/{asset}"
@@ -73,17 +78,24 @@ def ensure_z3_noodler(version: str | None = None, quiet: bool = False) -> Path |
         print(f"wafan: downloading z3-noodler {version} ({asset})...", file=sys.stderr)
 
     dest_dir.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(".part")
+    # Unique per attempt so concurrent downloads (e.g. parallel CI jobs) can't
+    # corrupt each other's in-flight write to a shared temp path.
+    tmp = dest.with_name(f"{dest.name}.{os.getpid()}-{uuid.uuid4().hex[:8]}.part")
+    old_timeout = socket.getdefaulttimeout()
     try:
+        socket.setdefaulttimeout(_DOWNLOAD_TIMEOUT_SECONDS)
         urllib.request.urlretrieve(url, tmp)
-    except OSError as exc:
+        if tmp.stat().st_size == 0:
+            raise OSError("downloaded file is empty")
+        tmp.chmod(tmp.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        tmp.rename(dest)
+    except Exception as exc:
         if not quiet:
             print(f"wafan: failed to download z3-noodler: {exc}", file=sys.stderr)
         tmp.unlink(missing_ok=True)
         return None
-
-    tmp.chmod(tmp.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    tmp.rename(dest)
+    finally:
+        socket.setdefaulttimeout(old_timeout)
     return dest
 
 

@@ -68,9 +68,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _make_solver(args: argparse.Namespace) -> SubprocessSolver:
     binary = args.solver or os.environ.get("WAFAN_Z3_PATH")
-    if binary is None and not args.no_auto_solver:
+    if not binary and not args.no_auto_solver:
         downloaded = ensure_z3_noodler()
-        binary = str(downloaded) if downloaded is not None else "z3"
+        binary = str(downloaded) if downloaded is not None else None
     binary = binary or "z3"
     argv = [binary, "-in"]
     if args.solver_args:
