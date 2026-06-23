@@ -28,5 +28,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install .[dev]
 
+      - name: Pre-fetch z3-noodler solver
+        run: |
+          wafan-download-solver
+          echo "WAFAN_Z3_PATH=$(python -c 'from wafan.solver_setup import ensure_z3_noodler; print(ensure_z3_noodler())')" >> "$GITHUB_ENV"
+
       - name: Run tests
         run: pytest
