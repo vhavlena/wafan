@@ -6,11 +6,13 @@ tests/test_default_action.py
 tests/test_e2e.py
 tests/test_parser.py
 tests/test_smt.py
+tests/test_solver_setup.py
 wafan/__init__.py
 wafan/__main__.py
 wafan/parser.py
 wafan/regex_conv.py
 wafan/smt.py
+wafan/solver_setup.py
 wafan.egg-info/PKG-INFO
 wafan.egg-info/SOURCES.txt
 wafan.egg-info/dependency_links.txt
@@ -26,3 +28,4 @@ wafan/analyses/witness.py
 wafan/transforms/__init__.py
 wafan/transforms/html_entity_decode.py
 wafan/transforms/url_decode.py
+wafan/transforms/url_decode_uni.py

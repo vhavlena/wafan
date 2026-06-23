@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .analyses import SolverResult, SubprocessSolver, SubsumptionChecker, IntersectionChecker, WitnessChecker, _chain_label
 from .parser import parse_file
+from .solver_setup import ensure_z3_noodler
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -22,8 +23,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Path to the SMT solver binary. "
             "Must support re.from_ecma2020 (mainstream z3 does not). "
-            "Falls back to WAFAN_Z3_PATH env var, then 'z3'."
+            "Falls back to WAFAN_Z3_PATH env var, then to an auto-downloaded "
+            "z3-noodler build, then to 'z3' on PATH."
         ),
+    )
+    p.add_argument(
+        "--no-auto-solver",
+        action="store_true",
+        help="Don't auto-download z3-noodler; use 'z3' on PATH unless --solver/WAFAN_Z3_PATH is set.",
     )
     p.add_argument(
         "--solver-args",
@@ -60,7 +67,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _make_solver(args: argparse.Namespace) -> SubprocessSolver:
-    binary = args.solver or os.environ.get("WAFAN_Z3_PATH") or "z3"
+    binary = args.solver or os.environ.get("WAFAN_Z3_PATH")
+    if binary is None and not args.no_auto_solver:
+        downloaded = ensure_z3_noodler()
+        binary = str(downloaded) if downloaded is not None else "z3"
+    binary = binary or "z3"
     argv = [binary, "-in"]
     if args.solver_args:
         argv += args.solver_args.split()
