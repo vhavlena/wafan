@@ -21,6 +21,14 @@ The tool parses the rule file, translates each rule's matching conditions into a
 
   You don't need to install it yourself: on first run, wafan automatically downloads a prebuilt `z3-noodler` binary matching your platform (Linux x86_64, macOS arm64, or macOS x86_64) and caches it under `~/.cache/wafan` (`~/Library/Caches/wafan` on macOS). On other platforms (e.g. Windows, Linux ARM), or if the download fails, wafan falls back to a `z3` binary on `PATH`. Use `--no-auto-solver` to skip the download and always use `--solver`/`WAFAN_Z3_PATH`/`z3`.
 
+  To pre-fetch the binary ahead of time (e.g. in a CI job or Docker image build, so the first real run doesn't need network access), run:
+
+  ```bash
+  wafan-download-solver
+  ```
+
+  Pass `--version TAG` to fetch a specific z3-noodler release instead of the pinned default (or set `WAFAN_Z3_NOODLER_VERSION`).
+
 ## Installation
 
 ```bash

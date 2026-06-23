@@ -85,3 +85,35 @@ def ensure_z3_noodler(version: str | None = None, quiet: bool = False) -> Path |
     tmp.chmod(tmp.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     tmp.rename(dest)
     return dest
+
+
+def download_solver_cli(argv: list[str] | None = None) -> int:
+    """Entry point for the `wafan-download-solver` console script.
+
+    Pre-fetches the z3-noodler binary so it's already cached before the
+    first `wafan` run — useful in CI/Docker image builds or offline setups.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="wafan-download-solver",
+        description="Pre-fetch the z3-noodler binary used by wafan, without running an analysis.",
+    )
+    parser.add_argument(
+        "--version",
+        default=None,
+        metavar="TAG",
+        help=f"z3-noodler release tag to download (default: {_DEFAULT_VERSION}, or $WAFAN_Z3_NOODLER_VERSION).",
+    )
+    args = parser.parse_args(argv)
+
+    path = ensure_z3_noodler(version=args.version)
+    if path is None:
+        print(
+            "wafan: no prebuilt z3-noodler binary available for this platform "
+            f"({current_platform_key()}); falling back to 'z3' on PATH at runtime",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"wafan: z3-noodler ready at {path}")
+    return 0
