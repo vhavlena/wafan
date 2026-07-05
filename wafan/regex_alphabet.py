@@ -25,8 +25,12 @@ walks the resulting AST, collecting every codepoint the pattern can match:
 
 from __future__ import annotations
 
-import re._constants as _sre
-import re._parser as _sre_parse
+try:
+    import re._constants as _sre
+    import re._parser as _sre_parse
+except ImportError:  # Python < 3.11: internals live in top-level modules.
+    import sre_constants as _sre
+    import sre_parse as _sre_parse
 
 __all__ = ["extract_relevant_codepoints"]
 
