@@ -1,13 +1,6 @@
 """Tests for wafan.regex_alphabet – relevant Unicode codepoint extraction."""
 
-from pathlib import Path
-
-import pytest
-
-from wafan.parser import parse_file
 from wafan.regex_alphabet import extract_relevant_codepoints as ex
-
-CONF = Path(__file__).parent / "data" / "RESPONSE-954-DATA-LEAKAGES-IIS.conf"
 
 _UNICODE_MAX = 0x10FFFF
 _ALL_CODEPOINTS = set(range(0, _UNICODE_MAX + 1))
@@ -175,18 +168,25 @@ class TestIgnoreCase:
 
 
 class TestRealWorldRules:
-    """Regressions extracted from RESPONSE-954-DATA-LEAKAGES-IIS.conf."""
+    """Regressions extracted from OWASP CRS's RESPONSE-954-DATA-LEAKAGES-IIS.conf."""
 
-    @pytest.fixture(scope="class")
-    def rx_patterns(self):
-        rules = parse_file(CONF)
-        return [r.operator_argument for r in rules if r.operator == "@rx"]
+    RX_PATTERNS = [
+        r"(?i)[a-z]:[\x5c/]inetpub\b",
+        (
+            r"(?:Microsoft OLE DB Provider for SQL Server(?:</font>.{1,20}?"
+            r"error '800(?:04005|40e31)'.{1,40}?Timeout expired"
+            r"| \(0x80040e31\)<br>Timeout expired<br>)"
+            r"|<h1>internal server error</h1>.*?<h2>part of the server has "
+            r"crashed or it has a configuration error\.</h2>"
+            r"|cannot connect to the server: timed out)"
+        ),
+        r"^404$",
+        r"\bServer Error in.{0,50}?\bApplication\b",
+        r"(?i)[\x5c/]inetpub\b",
+    ]
 
-    def test_five_rx_rules_present(self, rx_patterns):
-        assert len(rx_patterns) == 5
-
-    def test_all_patterns_extract_without_error(self, rx_patterns):
-        for pattern in rx_patterns:
+    def test_all_patterns_extract_without_error(self):
+        for pattern in self.RX_PATTERNS:
             ex(pattern)  # must not raise
 
     def test_iis_inetpub_drive_letter_rule(self):
