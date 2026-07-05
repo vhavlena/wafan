@@ -37,6 +37,15 @@ Pass-ordering correctness argument
 Known limitation (shared with htmlEntityDecode): the multi-pass chain is not
 an exact model of ModSecurity's single left-to-right scan. The pass ordering
 above handles the known '%25XX' corner case correctly.
+
+Both ``_url_decode_body`` and ``url_decode_fun_decl`` accept an optional
+``relevant`` set of codepoints (see :mod:`wafan.regex_alphabet`): when given,
+only passes whose decoded byte value is in that set are emitted, since a
+pass whose output character cannot affect the regex the transform result
+feeds into contributes nothing but formula size. Pass relative order is
+preserved (only irrelevant passes are dropped), so the correctness argument
+above still holds for the retained passes. ``relevant=None`` (the default)
+keeps the full 0-255 range, i.e. today's unrestricted behaviour.
 """
 
 from __future__ import annotations
@@ -65,27 +74,41 @@ def _percent_re(byte: int) -> str:
     return f'(re.++ (str.to_re "%") {_nibble_re(hi)} {_nibble_re(lo)})'
 
 
-def _url_decode_body(inner: str) -> str:
-    """Build the urlDecode pass chain applied to *inner*, returning an SMT expression."""
+def _url_decode_body(inner: str, relevant: "set[int] | None" = None) -> str:
+    """Build the urlDecode pass chain applied to *inner*, returning an SMT expression.
+
+    If *relevant* is given, only emit a pass for a decoded value (0x20 for the
+    '+' pass, a byte 0-255 for the '%XX' passes) that is a member of it.
+    """
     body = inner
-    body = f'(str.replace_all {body} "+" "{_smt_char_literal(0x20)}")'
+    if relevant is None or 0x20 in relevant:
+        body = f'(str.replace_all {body} "+" "{_smt_char_literal(0x20)}")'
     for byte in range(256):
         if byte == 0x25:
+            continue
+        if relevant is not None and byte not in relevant:
             continue
         body = (
             f'(str.replace_re_all {body} {_percent_re(byte)}'
             f' "{_smt_char_literal(byte)}")'
         )
-    body = (
-        f'(str.replace_re_all {body} {_percent_re(0x25)}'
-        f' "{_smt_char_literal(0x25)}")'
-    )
+    if relevant is None or 0x25 in relevant:
+        body = (
+            f'(str.replace_re_all {body} {_percent_re(0x25)}'
+            f' "{_smt_char_literal(0x25)}")'
+        )
     return body
 
 
-def url_decode_fun_decl() -> str:
-    """Return the (define-fun t_urlDecode ...) SMT-LIB2 declaration."""
-    return f"(define-fun t_urlDecode ((s String)) String {_url_decode_body('s')})"
+def url_decode_fun_decl(relevant: "set[int] | None" = None) -> str:
+    """Return the (define-fun t_urlDecode ...) SMT-LIB2 declaration.
+
+    See ``_url_decode_body`` for the meaning of *relevant*.
+    """
+    return (
+        f"(define-fun t_urlDecode ((s String)) String "
+        f"{_url_decode_body('s', relevant)})"
+    )
 
 
 URL_DECODE_FUN_DECL = url_decode_fun_decl()

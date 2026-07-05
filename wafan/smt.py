@@ -52,12 +52,13 @@ Transforms not listed above raise UnsupportedTransformError.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Sequence
+from typing import Callable, Optional, Sequence
 
 from .parser import SecRule, SecRuleAction, SecRuleVariable
+from .regex_alphabet import extract_relevant_codepoints
 from .regex_conv import UnsupportedPatternError, pcre_to_ecma2020
-from .transforms.html_entity_decode import HTML_ENTITY_DECODE_FUN_DECL
-from .transforms.url_decode import URL_DECODE_FUN_DECL
+from .transforms.html_entity_decode import html_entity_decode_fun_decl
+from .transforms.url_decode import url_decode_fun_decl
 
 
 SMT_LOGIC = "QF_SLIA"
@@ -73,9 +74,19 @@ class _TransformDef:
     smt_fn: str           # SMT function name, e.g. "str.lower"; empty = direct inline
     fun_decl: str = ""    # (declare-fun …) line; empty for built-in SMT functions
     axioms: tuple[str, ...] = ()
+    # For transforms whose (define-fun …) body enumerates one replace pass per
+    # relevant codepoint (urlDecode, htmlEntityDecode): a callable that builds
+    # the declaration, optionally restricted to a set of codepoints. None for
+    # transforms with a fixed (or no) declaration.
+    fun_decl_builder: Optional[Callable[[Optional[set[int]]], str]] = None
 
     def apply(self, expr: str) -> str:
         return f"({self.smt_fn} {expr})"
+
+    def build_fun_decl(self, relevant: Optional[set[int]]) -> str:
+        if self.fun_decl_builder is not None:
+            return self.fun_decl_builder(relevant)
+        return self.fun_decl
 
 
 def _uninterpreted(name: str, *axioms: str) -> _TransformDef:
@@ -173,13 +184,13 @@ _TRANSFORMS: dict[str, _TransformDef] = {
     "uppercase":  _TransformDef(smt_fn="str.to_upper"),
     # --- uninterpreted functions ---
     "urldecode":         _TransformDef(smt_fn="t_urlDecode",
-                                       fun_decl=URL_DECODE_FUN_DECL),
+                                       fun_decl_builder=url_decode_fun_decl),
     "urldecodeuni":      _uninterpreted("t_urlDecodeUni",
                              _len_le("t_urlDecodeUni"),
                              _empty_fixed("t_urlDecodeUni"),
                          ),
     "htmlentitydecode":  _TransformDef(smt_fn="t_htmlEntityDecode",
-                                        fun_decl=HTML_ENTITY_DECODE_FUN_DECL),
+                                        fun_decl_builder=html_entity_decode_fun_decl),
     "removewhitespace":  _uninterpreted("t_removeWhitespace",   *_REMOVE_WS_AXIOMS),
     "compresswhitespace":_uninterpreted("t_compressWhitespace", *_COMPRESS_WS_AXIOMS),
     "removenulls":       _uninterpreted("t_removeNulls",        *_REMOVE_NULLS_AXIOMS),
@@ -305,12 +316,23 @@ def apply_transforms_smt(var_expr: str, transforms: Sequence[str]) -> str:
     return expr
 
 
-def transform_preamble(transforms: Sequence[str]) -> tuple[list[str], list[str]]:
+def transform_preamble(
+    transforms: Sequence[str], relevant: Optional[set[int]] = None
+) -> tuple[list[str], list[str]]:
     """Return ``(fun_declarations, axioms)`` required by *transforms*.
 
     Only uninterpreted transforms contribute entries; direct SMT-LIB functions
     (e.g. ``str.to_lower``) need no declaration.  Duplicates are eliminated while
     preserving first-seen order.
+
+    *relevant*, if given, is a set of codepoints (see
+    :func:`wafan.regex_alphabet.extract_relevant_codepoints`) that the
+    resulting string is actually checked against downstream (typically the
+    codepoints appearing in the rule's ``@rx`` pattern). Transforms whose
+    declaration enumerates one pass per codepoint (``urlDecode``,
+    ``htmlEntityDecode``) use it to skip passes for codepoints that cannot
+    affect the match outcome. ``relevant=None`` keeps the full, unrestricted
+    declaration.
     """
     seen: set[str] = set()
     fun_decls: list[str] = []
@@ -321,9 +343,10 @@ def transform_preamble(transforms: Sequence[str]) -> tuple[list[str], list[str]]
         defn = _TRANSFORMS.get(key)
         if defn is None:
             raise UnsupportedTransformError(f"Transform '{t}' is not supported")
-        if defn.fun_decl and key not in seen:
+        decl = defn.build_fun_decl(relevant)
+        if decl and key not in seen:
             seen.add(key)
-            fun_decls.append(defn.fun_decl)
+            fun_decls.append(decl)
             axioms.extend(defn.axioms)
 
     return fun_decls, axioms
@@ -367,6 +390,23 @@ class UnsupportedOperatorError(Exception):
 def _op_rx(var_expr: str, argument: str, negated: bool) -> str:
     conv = pcre_to_ecma2020(argument)
     return _rx_assertion(var_expr, conv.pattern, negated)
+
+
+def _rx_relevant_codepoints(argument: str) -> Optional[set[int]]:
+    """Return the codepoints an ``@rx`` *argument* can match, or None if unknown.
+
+    The pattern is converted to ECMA2020 first (resolving POSIX classes,
+    ``\\Q...\\E`` blocks, etc. into plain Python-``re``-compatible syntax) and
+    then walked by :func:`extract_relevant_codepoints`. Any failure along the
+    way (an unsupported PCRE construct, or a converted pattern the Python
+    ``re`` parser still can't parse, e.g. leftover ECMA-only escapes) falls
+    back to None, meaning "unknown — don't restrict".
+    """
+    try:
+        conv = pcre_to_ecma2020(argument)
+        return extract_relevant_codepoints(conv.pattern)
+    except Exception:
+        return None
 
 
 def _op_streq(var_expr: str, argument: str, negated: bool) -> str:
@@ -474,7 +514,12 @@ def is_supported_operator(operator: str) -> bool:
 # Public API
 # ---------------------------------------------------------------------------
 
-def rule_to_smt(rule: SecRule) -> SmtFormula:
+_UNSET = object()  # sentinel: "no override given" vs. explicit relevant=None
+
+
+def rule_to_smt(
+    rule: SecRule, relevant: Optional[set[int]] = _UNSET  # type: ignore[assignment]
+) -> SmtFormula:
     """Convert a single SecRule to an SmtFormula.
 
     Transformation actions (t:) are extracted and applied as SMT-LIB wrappers
@@ -486,6 +531,13 @@ def rule_to_smt(rule: SecRule) -> SmtFormula:
 
     Supported operators: @rx, @streq, @contains, @beginsWith, @endsWith,
     @within, @pm, @eq, @ge, @gt, @le, @lt (each with optional ``!`` negation).
+
+    *relevant*, if given, overrides the codepoint set used to trim transform
+    declarations (see :func:`transform_preamble`); this is used by
+    :func:`chain_to_smt` to share one chain-wide set across all links. When
+    omitted, an ``@rx`` rule computes it from its own pattern; any other
+    operator leaves it unrestricted (None), since transforms feeding e.g.
+    ``@streq``/``@contains`` are not (yet) analysed for relevance.
 
     Raises:
         UnsupportedOperatorError: if the operator is not supported, or (for
@@ -499,9 +551,16 @@ def rule_to_smt(rule: SecRule) -> SmtFormula:
             f"Rule {rule.rule_id}: operator '{rule.operator}' is not supported"
         )
 
+    if relevant is _UNSET:
+        relevant = (
+            _rx_relevant_codepoints(rule.operator_argument)
+            if op_name == "rx"
+            else None
+        )
+
     negated = rule.negated or op_negated
     transforms = effective_transforms(rule)
-    fun_decls, axioms = transform_preamble(transforms)
+    fun_decls, axioms = transform_preamble(transforms, relevant)
 
     declarations: list[str] = []
     assertions: list[str] = []
@@ -541,7 +600,29 @@ def chain_to_smt(chain: Sequence[SecRule]) -> SmtFormula:
         UnsupportedOperatorError: if any link's operator is not supported.
         UnsupportedTransformError: if any link uses an unknown transform.
     """
-    formulas = [rule_to_smt(rule) for rule in chain]
+    # A transform (e.g. t_urlDecode) shared by multiple links must get the
+    # exact same declaration text everywhere it's merged below, so every link
+    # is converted with one shared, chain-wide relevant-codepoints set: the
+    # union of every @rx link's own set, or None (unrestricted) as soon as
+    # any link can't contribute one (a non-@rx link, or an @rx pattern whose
+    # relevant codepoints couldn't be determined).
+    union: set[int] = set()
+    unrestricted = False
+    for rule in chain:
+        op_name, _ = _normalize_operator(rule.operator)
+        link_relevant = (
+            _rx_relevant_codepoints(rule.operator_argument)
+            if op_name == "rx"
+            else None
+        )
+        if link_relevant is None:
+            unrestricted = True
+            break
+        union |= link_relevant
+
+    chain_relevant: Optional[set[int]] = None if unrestricted else union
+
+    formulas = [rule_to_smt(rule, relevant=chain_relevant) for rule in chain]
 
     declarations = _merge_unique([], [])
     fun_declarations: list[str] = []
