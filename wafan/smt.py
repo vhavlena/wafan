@@ -475,6 +475,33 @@ def _rx_relevant_codepoints(argument: str) -> Optional[set[int]]:
         return None
 
 
+def _rule_relevant_codepoints(rule: SecRule) -> Optional[set[int]]:
+    """Return the codepoints relevant to *rule*'s own operator, or None if
+    unknown/not applicable.
+
+    Only ``@rx`` rules contribute a computed set (see
+    :func:`_rx_relevant_codepoints`); every other operator is unrestricted.
+    """
+    op_name, _ = _normalize_operator(rule.operator)
+    return _rx_relevant_codepoints(rule.operator_argument) if op_name == "rx" else None
+
+
+def _rules_relevant_codepoints(rules: Sequence[SecRule]) -> Optional[set[int]]:
+    """Return the union of :func:`_rule_relevant_codepoints` over *rules*.
+
+    None (unrestricted) as soon as any rule's own set is unknown — a
+    non-``@rx`` rule, or an ``@rx`` pattern whose relevant codepoints could
+    not be determined.
+    """
+    union: set[int] = set()
+    for rule in rules:
+        relevant = _rule_relevant_codepoints(rule)
+        if relevant is None:
+            return None
+        union |= relevant
+    return union
+
+
 def _op_streq(var_expr: str, argument: str, negated: bool) -> str:
     atom = f'(= {var_expr} "{_escape_smt_string(argument)}")'
     return _wrap_negated(atom, negated)
@@ -680,24 +707,9 @@ def chain_to_smt(chain: Sequence[SecRule]) -> SmtFormula:
     # A transform (e.g. t_urlDecode) shared by multiple links must get the
     # exact same declaration text everywhere it's merged below, so every link
     # is converted with one shared, chain-wide relevant-codepoints set: the
-    # union of every @rx link's own set, or None (unrestricted) as soon as
-    # any link can't contribute one (a non-@rx link, or an @rx pattern whose
-    # relevant codepoints couldn't be determined).
-    union: set[int] = set()
-    unrestricted = False
-    for rule in chain:
-        op_name, _ = _normalize_operator(rule.operator)
-        link_relevant = (
-            _rx_relevant_codepoints(rule.operator_argument)
-            if op_name == "rx"
-            else None
-        )
-        if link_relevant is None:
-            unrestricted = True
-            break
-        union |= link_relevant
-
-    chain_relevant: Optional[set[int]] = None if unrestricted else union
+    # union of every link's own set (see _rules_relevant_codepoints), or None
+    # (unrestricted) as soon as any link can't contribute one.
+    chain_relevant = _rules_relevant_codepoints(chain)
 
     # Likewise, whether a transform is safe to restrict at all must be decided
     # across every link's transform list at once: a transform that is the

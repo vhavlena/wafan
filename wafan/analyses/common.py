@@ -5,7 +5,17 @@ from __future__ import annotations
 from typing import Sequence
 
 from ..parser import SecRule
-from ..smt import _OPERATORS, _normalize_operator, is_supported_operator, UnsupportedOperatorError
+from ..smt import (
+    _merge_unique,
+    _normalize_operator,
+    _OPERATORS,
+    _restrictable_transform_keys,
+    _rules_relevant_codepoints,
+    effective_transforms,
+    is_supported_operator,
+    transform_preamble,
+    UnsupportedOperatorError,
+)
 
 _SMT_SEP = "  " + "-" * 62
 
@@ -66,6 +76,39 @@ def _operator_assertion(rule: SecRule, var_expr: str) -> str:
         )
     negated = rule.negated or op_negated
     return builder(var_expr, rule.operator_argument, negated)
+
+
+def _joint_transform_preamble(
+    rules_a: Sequence[SecRule], rules_b: Sequence[SecRule]
+) -> tuple[list[str], list[str]]:
+    """Return ``(fun_declarations, axioms)`` for two rule/chain sides being
+    merged into one pairwise SMT-LIB2 script (intersection or subsumption).
+
+    A transform shared by both sides (e.g. ``t_urlDecode``) is one global SMT
+    symbol, so it must get exactly one declaration across the merged script.
+    Restricting that declaration to a codepoint set is only sound if it
+    covers what *either* side needs, so *rules_a* and *rules_b* are analysed
+    together: the relevant-codepoint set is the union of both sides' own sets
+    (or None/unrestricted as soon as either side's is unknown), and a
+    transform is only restricted if it is safe to restrict across every rule
+    of both sides combined (see ``wafan.smt._restrictable_transform_keys``).
+    """
+    relevant_a = _rules_relevant_codepoints(rules_a)
+    relevant_b = _rules_relevant_codepoints(rules_b)
+    joint_relevant = (
+        None if relevant_a is None or relevant_b is None else relevant_a | relevant_b
+    )
+
+    transform_lists = [effective_transforms(r) for r in (*rules_a, *rules_b)]
+    joint_restrictable = _restrictable_transform_keys(transform_lists)
+
+    fun_decls: list[str] = []
+    axioms: list[str] = []
+    for transforms in transform_lists:
+        fd, ax = transform_preamble(transforms, joint_relevant, joint_restrictable)
+        fun_decls = _merge_unique(fun_decls, fd)
+        axioms = _merge_unique(axioms, ax)
+    return fun_decls, axioms
 
 
 def _variable_names(rule: SecRule) -> frozenset[str]:

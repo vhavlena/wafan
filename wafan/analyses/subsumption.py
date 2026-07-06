@@ -21,11 +21,11 @@ from ..smt import (
     chain_to_smt,
     effective_transforms,
     is_supported_operator,
-    transform_preamble,
 )
 from .common import (
     _all_supported,
     _chain_label,
+    _joint_transform_preamble,
     _operator_assertion,
     _print_smt_block,
     _rule_label,
@@ -55,10 +55,7 @@ def subsumption_smt2(rule1: SecRule, rule2: SecRule) -> str:
     transforms1 = effective_transforms(rule1)
     transforms2 = effective_transforms(rule2)
 
-    fd1, ax1 = transform_preamble(transforms1)
-    fd2, ax2 = transform_preamble(transforms2)
-    fun_decls = _merge_unique(fd1, fd2)
-    axioms    = _merge_unique(ax1, ax2)
+    fun_decls, axioms = _joint_transform_preamble([rule1], [rule2])
 
     var_expr1 = apply_transforms_smt("x", transforms1)
     var_expr2 = apply_transforms_smt("x", transforms2)
@@ -97,7 +94,13 @@ def chain_subsumption_smt2(
     same request.
 
     *f1*/*f2* may be precomputed chain_to_smt() results (e.g. shared across
-    multiple pairwise comparisons); if omitted, they are computed here.
+    multiple pairwise comparisons); if omitted, they are computed here. Their
+    ``fun_declarations``/``axioms`` are not reused directly (each chain may
+    have restricted a shared transform to its own, different codepoint set),
+    only their ``declarations``/``assertion``, which don't depend on that
+    restriction; the function preamble is always recomputed jointly for the
+    pair (see ``_joint_transform_preamble``) so that a transform shared by
+    both chains gets exactly one, consistent declaration.
 
     Raises UnsupportedTransformError if any link uses an unknown transform.
     """
@@ -105,8 +108,7 @@ def chain_subsumption_smt2(
     f2 = f2 if f2 is not None else chain_to_smt(chain2)
 
     declarations = _merge_unique(f1.declarations, f2.declarations)
-    fun_decls = _merge_unique(f1.fun_declarations, f2.fun_declarations)
-    axioms = _merge_unique(f1.axioms, f2.axioms)
+    fun_decls, axioms = _joint_transform_preamble(chain1, chain2)
 
     lines = [
         f"(set-logic {SMT_LOGIC})",
