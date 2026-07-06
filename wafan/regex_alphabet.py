@@ -20,7 +20,16 @@ walks the resulting AST, collecting every codepoint the pattern can match:
 * ``.`` (``ANY``) contributes every Unicode codepoint except ``\\n`` (0x0A),
   or literally every codepoint (including ``\\n``) under the ``DOTALL`` flag
   (``(?s)``, global or scoped via ``(?s:...)``) — matching what ``.``
-  actually matches at runtime.
+  actually matches at runtime;
+* both branches of a conditional group (``(?(id)yes|no)`` / ``GROUPREF_EXISTS``)
+  are walked, since either can execute depending on runtime match state.
+
+Because predefined classes are only approximated by a handful of boundary
+codepoints, :func:`extract_relevant_codepoints` is *not* safe for callers
+that need a complete/exact set (e.g. to decide that some codepoint can never
+matter and its handling may be dropped). Such callers should use
+:func:`extract_relevant_codepoints_precise` instead, which returns ``None``
+whenever the pattern uses a predefined class anywhere.
 """
 
 from __future__ import annotations
@@ -32,7 +41,7 @@ except ImportError:  # Python < 3.11: internals live in top-level modules.
     import sre_constants as _sre
     import sre_parse as _sre_parse
 
-__all__ = ["extract_relevant_codepoints"]
+__all__ = ["extract_relevant_codepoints", "extract_relevant_codepoints_precise"]
 
 _UNICODE_MAX = 0x10FFFF  # highest valid Unicode codepoint (inclusive)
 
@@ -88,22 +97,46 @@ def extract_relevant_codepoints(pattern: str, flags: int = 0) -> set[int]:
     See module docstring for exactly what is collected. Constructs with no
     fixed codepoint (anchors, backreferences) are ignored.
     """
-    codepoints: set[int] = set()
-    parsed = _sre_parse.parse(pattern, flags)
-    ignorecase = bool(parsed.state.flags & _sre.SRE_FLAG_IGNORECASE)
-    dotall = bool(parsed.state.flags & _sre.SRE_FLAG_DOTALL)
-    _walk_subpattern(parsed, codepoints, ignorecase, dotall)
+    codepoints, _approximate = _extract(pattern, flags)
     return codepoints
 
 
+def extract_relevant_codepoints_precise(
+    pattern: str, flags: int = 0
+) -> "set[int] | None":
+    """Like :func:`extract_relevant_codepoints`, but ``None`` if imprecise.
+
+    Predefined classes (``\\d``, ``\\w``, ``\\s`` and their negations, standalone
+    or inside a character class) are only approximated by a handful of
+    boundary codepoints — a real but out-of-set codepoint (e.g. ``'b'`` for
+    ``\\w``) can still match the pattern. Callers that need a *complete* set
+    (e.g. to conclude some codepoint can never affect the match) must treat
+    that case as "unknown" rather than use the approximation, hence ``None``.
+    """
+    codepoints, approximate = _extract(pattern, flags)
+    return None if approximate else codepoints
+
+
+def _extract(pattern: str, flags: int) -> "tuple[set[int], bool]":
+    codepoints: set[int] = set()
+    approximate = [False]
+    parsed = _sre_parse.parse(pattern, flags)
+    ignorecase = bool(parsed.state.flags & _sre.SRE_FLAG_IGNORECASE)
+    dotall = bool(parsed.state.flags & _sre.SRE_FLAG_DOTALL)
+    _walk_subpattern(parsed, codepoints, ignorecase, dotall, approximate)
+    return codepoints, approximate[0]
+
+
 def _walk_subpattern(
-    subpattern, codepoints: set[int], ignorecase: bool, dotall: bool
+    subpattern, codepoints: set[int], ignorecase: bool, dotall: bool, approximate: list
 ) -> None:
     for op, av in subpattern.data:
-        _walk_node(op, av, codepoints, ignorecase, dotall)
+        _walk_node(op, av, codepoints, ignorecase, dotall, approximate)
 
 
-def _walk_node(op, av, codepoints: set[int], ignorecase: bool, dotall: bool) -> None:
+def _walk_node(
+    op, av, codepoints: set[int], ignorecase: bool, dotall: bool, approximate: list
+) -> None:
     if op == _sre.LITERAL:
         codepoints.update(_case_variants(av) if ignorecase else {av})
 
@@ -114,6 +147,7 @@ def _walk_node(op, av, codepoints: set[int], ignorecase: bool, dotall: bool) -> 
         codepoints.update(_full_unicode() - excluded)
 
     elif op == _sre.CATEGORY:
+        approximate[0] = True
         codepoints.update(_CATEGORY_CODEPOINTS.get(av, ()))
 
     elif op == _sre.ANY:
@@ -123,7 +157,7 @@ def _walk_node(op, av, codepoints: set[int], ignorecase: bool, dotall: bool) -> 
         )
 
     elif op == _sre.IN:
-        explicit, negated = _expand_class_items(av, ignorecase)
+        explicit, negated = _expand_class_items(av, ignorecase, approximate)
         if negated:
             codepoints.update(_full_unicode() - explicit)
         else:
@@ -132,7 +166,7 @@ def _walk_node(op, av, codepoints: set[int], ignorecase: bool, dotall: bool) -> 
     elif op == _sre.BRANCH:
         _, alternatives = av
         for alt in alternatives:
-            _walk_subpattern(alt, codepoints, ignorecase, dotall)
+            _walk_subpattern(alt, codepoints, ignorecase, dotall, approximate)
 
     elif op == _sre.SUBPATTERN:
         # (group, add_flags, del_flags, subpattern) — add_flags/del_flags
@@ -147,19 +181,32 @@ def _walk_node(op, av, codepoints: set[int], ignorecase: bool, dotall: bool) -> 
             (dotall or bool(add_flags & _sre.SRE_FLAG_DOTALL))
             and not bool(del_flags & _sre.SRE_FLAG_DOTALL)
         )
-        _walk_subpattern(subpattern, codepoints, scoped_ignorecase, scoped_dotall)
+        _walk_subpattern(
+            subpattern, codepoints, scoped_ignorecase, scoped_dotall, approximate
+        )
 
     elif op in _SUBPATTERN_OPS:
         # ASSERT/ASSERT_NOT: (direction, subpattern)
         # MAX_REPEAT/MIN_REPEAT: (min, max, subpattern)
         subpattern = av[-1]
-        _walk_subpattern(subpattern, codepoints, ignorecase, dotall)
+        _walk_subpattern(subpattern, codepoints, ignorecase, dotall, approximate)
 
-    # AT, GROUPREF, GROUPREF_EXISTS and similar opcodes carry no fixed
-    # codepoint information and are intentionally ignored.
+    elif op == _sre.GROUPREF_EXISTS:
+        # (group, yes_subpattern, no_subpattern) — `(?(id)yes|no)`. Either
+        # branch can execute depending on runtime match state, so both
+        # contribute; `no_subpattern` is None when there is no "no" branch.
+        _, yes_subpattern, no_subpattern = av
+        _walk_subpattern(yes_subpattern, codepoints, ignorecase, dotall, approximate)
+        if no_subpattern is not None:
+            _walk_subpattern(no_subpattern, codepoints, ignorecase, dotall, approximate)
+
+    # AT, GROUPREF and similar opcodes carry no fixed codepoint information
+    # and are intentionally ignored.
 
 
-def _expand_class_items(items, ignorecase: bool) -> tuple[set[int], bool]:
+def _expand_class_items(
+    items, ignorecase: bool, approximate: list
+) -> "tuple[set[int], bool]":
     """Expand the item list of an ``IN`` node (a character class body).
 
     Returns ``(explicit_codepoints, negated)`` where *explicit_codepoints* is
@@ -183,5 +230,6 @@ def _expand_class_items(items, ignorecase: bool) -> tuple[set[int], bool]:
             else:
                 explicit.update(range(lo, hi + 1))
         elif item_op == _sre.CATEGORY:
+            approximate[0] = True
             explicit.update(_CATEGORY_CODEPOINTS.get(item_av, ()))
     return explicit, negated

@@ -180,6 +180,3 @@ def html_entity_decode_fun_decl(relevant: "set[int] | None" = None) -> str:
         body = f'(str.replace_all {body} "&{name}" "{_smt_char_literal(val)}")'
 
     return f"(define-fun t_htmlEntityDecode ((s String)) String {body})"
-
-
-HTML_ENTITY_DECODE_FUN_DECL = html_entity_decode_fun_decl()

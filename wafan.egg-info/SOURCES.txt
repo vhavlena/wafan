@@ -5,11 +5,13 @@ tests/test_cli.py
 tests/test_default_action.py
 tests/test_e2e.py
 tests/test_parser.py
+tests/test_regex_alphabet.py
 tests/test_smt.py
 tests/test_solver_setup.py
 wafan/__init__.py
 wafan/__main__.py
 wafan/parser.py
+wafan/regex_alphabet.py
 wafan/regex_conv.py
 wafan/smt.py
 wafan/solver_setup.py

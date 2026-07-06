@@ -109,6 +109,3 @@ def url_decode_fun_decl(relevant: "set[int] | None" = None) -> str:
         f"(define-fun t_urlDecode ((s String)) String "
         f"{_url_decode_body('s', relevant)})"
     )
-
-
-URL_DECODE_FUN_DECL = url_decode_fun_decl()

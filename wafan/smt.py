@@ -55,7 +55,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
 from .parser import SecRule, SecRuleAction, SecRuleVariable
-from .regex_alphabet import extract_relevant_codepoints
+from .regex_alphabet import extract_relevant_codepoints_precise
 from .regex_conv import UnsupportedPatternError, pcre_to_ecma2020
 from .transforms.html_entity_decode import html_entity_decode_fun_decl
 from .transforms.url_decode import url_decode_fun_decl
@@ -332,17 +332,27 @@ def transform_preamble(
     ``htmlEntityDecode``) use it to skip passes for codepoints that cannot
     affect the match outcome. ``relevant=None`` keeps the full, unrestricted
     declaration.
+
+    *relevant* is only sound for the *last* transform in *transforms*: its
+    output feeds the operator directly, so a codepoint outside *relevant*
+    truly cannot affect the match. Every earlier transform's output instead
+    feeds another transform (e.g. ``uppercase``, or a further decode) that
+    can change codepoints before the match, so restricting it against the
+    *final* pattern's alphabet could drop a pass whose output only becomes
+    relevant after that later transform runs. Earlier transforms therefore
+    always get the full, unrestricted declaration.
     """
     seen: set[str] = set()
     fun_decls: list[str] = []
     axioms: list[str] = []
+    last_index = len(transforms) - 1
 
-    for t in transforms:
+    for i, t in enumerate(transforms):
         key = t.lower()
         defn = _TRANSFORMS.get(key)
         if defn is None:
             raise UnsupportedTransformError(f"Transform '{t}' is not supported")
-        decl = defn.build_fun_decl(relevant)
+        decl = defn.build_fun_decl(relevant if i == last_index else None)
         if decl and key not in seen:
             seen.add(key)
             fun_decls.append(decl)
@@ -396,14 +406,16 @@ def _rx_relevant_codepoints(argument: str) -> Optional[set[int]]:
 
     The pattern is converted to ECMA2020 first (resolving POSIX classes,
     ``\\Q...\\E`` blocks, etc. into plain Python-``re``-compatible syntax) and
-    then walked by :func:`extract_relevant_codepoints`. Any failure along the
+    then walked by :func:`extract_relevant_codepoints_precise`, which returns
+    None itself if the pattern uses a predefined class (``\\d``/``\\w``/``\\s``)
+    whose codepoints can only be approximated. Any other failure along the
     way (an unsupported PCRE construct, or a converted pattern the Python
-    ``re`` parser still can't parse, e.g. leftover ECMA-only escapes) falls
-    back to None, meaning "unknown — don't restrict".
+    ``re`` parser still can't parse, e.g. leftover ECMA-only escapes) also
+    falls back to None, meaning "unknown — don't restrict".
     """
     try:
         conv = pcre_to_ecma2020(argument)
-        return extract_relevant_codepoints(conv.pattern)
+        return extract_relevant_codepoints_precise(conv.pattern)
     except Exception:
         return None
 
