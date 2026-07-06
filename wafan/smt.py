@@ -59,6 +59,7 @@ from .regex_alphabet import extract_relevant_codepoints
 from .regex_conv import UnsupportedPatternError, pcre_to_ecma2020
 from .transforms.html_entity_decode import html_entity_decode_fun_decl
 from .transforms.url_decode import url_decode_fun_decl
+from .transforms.url_decode_uni import url_decode_uni_fun_decl
 
 
 SMT_LOGIC = "QF_SLIA"
@@ -185,10 +186,8 @@ _TRANSFORMS: dict[str, _TransformDef] = {
     # --- uninterpreted functions ---
     "urldecode":         _TransformDef(smt_fn="t_urlDecode",
                                        fun_decl_builder=url_decode_fun_decl),
-    "urldecodeuni":      _uninterpreted("t_urlDecodeUni",
-                             _len_le("t_urlDecodeUni"),
-                             _empty_fixed("t_urlDecodeUni"),
-                         ),
+    "urldecodeuni":      _TransformDef(smt_fn="t_urlDecodeUni",
+                                       fun_decl_builder=url_decode_uni_fun_decl),
     "htmlentitydecode":  _TransformDef(smt_fn="t_htmlEntityDecode",
                                         fun_decl_builder=html_entity_decode_fun_decl),
     "removewhitespace":  _uninterpreted("t_removeWhitespace",   *_REMOVE_WS_AXIOMS),

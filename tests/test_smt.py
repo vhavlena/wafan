@@ -396,7 +396,6 @@ class TestNumericOperators:
 # ---------------------------------------------------------------------------
 
 UNINTERPRETED = [
-    "urlDecodeUni",
     "removeWhitespace", "compressWhitespace", "removeNulls",
     "trim", "trimLeft", "trimRight",
     "normalizePath", "normalizePathWin",
@@ -517,6 +516,27 @@ class TestTransformPreamble:
         pct41_re = '(str.to_re "4") (str.to_re "1")'
         assert decl.index(pct41_re) < pos_25
 
+    def test_urldecodeuni_define_fun_no_axioms(self):
+        # Unrestricted urlDecodeUni enumerates ~65k passes and is impractical
+        # to build in a unit test, so always pass a small `relevant` set.
+        fun_decls, axioms = transform_preamble(["urlDecodeUni"], relevant={0x41, 0x20})
+        assert len(fun_decls) == 1
+        assert fun_decls[0].startswith("(define-fun t_urlDecodeUni ((s String)) String")
+        assert axioms == []
+
+    def test_urldecodeuni_relevant_restricts_passes(self):
+        fun_decls, _ = transform_preamble(["urlDecodeUni"], relevant={0x41})
+        decl = fun_decls[0]
+        assert '"\\u{41}"' in decl
+        assert '"\\u{42}"' not in decl
+
+    def test_urldecodeuni_relevant_restricts_fullwidth_pass(self):
+        # Full-width 'A' (U+FF21) decodes to ASCII 'A' (0x41).
+        with_a = transform_preamble(["urlDecodeUni"], relevant={0x41})[0][0]
+        without_a = transform_preamble(["urlDecodeUni"], relevant={0x42})[0][0]
+        assert '"\\u{ff21}"' in with_a
+        assert '"\\u{ff21}"' not in without_a
+
     def test_unknown_raises(self):
         with pytest.raises(UnsupportedTransformError):
             transform_preamble(["__unknown__"])
@@ -592,6 +612,18 @@ class TestSmtFormulaWithPreamble:
         assert f.fun_declarations[0].startswith("(define-fun t_htmlEntityDecode")
         assert f.axioms == []
         assert "(t_htmlEntityDecode BODY)" in f.assertion
+
+    def test_urldecodeuni_restricted_to_rx_pattern_codepoints(self):
+        # rule_to_smt derives `relevant` from the rule's own @rx pattern, so
+        # a narrow pattern like "A" keeps the urlDecodeUni declaration small
+        # instead of enumerating all ~65k codepoints.
+        rule = make_rule(var_name="BODY", pattern="A", transforms=["urlDecodeUni"])
+        f = rule_to_smt(rule)
+        assert len(f.fun_declarations) == 1
+        decl = f.fun_declarations[0]
+        assert decl.startswith("(define-fun t_urlDecodeUni")
+        assert '"\\u{41}"' in decl
+        assert '"\\u{42}"' not in decl
 
     @pytest.mark.parametrize("t", UNINTERPRETED)
     def test_all_uninterpreted_produce_well_formed_smt2(self, t):
