@@ -52,6 +52,7 @@ Transforms not listed above raise UnsupportedTransformError.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Callable, Optional, Sequence
 
 from .parser import SecRule, SecRuleAction, SecRuleVariable
@@ -315,8 +316,42 @@ def apply_transforms_smt(var_expr: str, transforms: Sequence[str]) -> str:
     return expr
 
 
+def _restrictable_transform_keys(
+    transform_lists: Sequence[Sequence[str]],
+) -> set[str]:
+    """Return transform keys safe to restrict via *relevant* across *transform_lists*.
+
+    A transform's ``(define-fun …)`` declaration is one global SMT symbol
+    shared by every occurrence of that transform, in this rule or any other
+    rule it is merged with (see :func:`chain_to_smt`). Restricting its
+    declaration to a codepoint set is only sound if *every* occurrence of the
+    transform is the last transform in its own list — i.e. its output always
+    feeds the operator directly and never another transform, and it is never
+    merged alongside an occurrence that needs the full, unrestricted
+    definition. A transform is therefore disqualified (kept unrestricted) if
+    it appears more than once in any single list, or anywhere but the last
+    position.
+    """
+    seen: set[str] = set()
+    disqualified: set[str] = set()
+    for transforms in transform_lists:
+        last_index = len(transforms) - 1
+        counts: dict[str, int] = {}
+        for t in transforms:
+            key = t.lower()
+            counts[key] = counts.get(key, 0) + 1
+        for i, t in enumerate(transforms):
+            key = t.lower()
+            seen.add(key)
+            if not (i == last_index and counts[key] == 1):
+                disqualified.add(key)
+    return seen - disqualified
+
+
 def transform_preamble(
-    transforms: Sequence[str], relevant: Optional[set[int]] = None
+    transforms: Sequence[str],
+    relevant: Optional[set[int]] = None,
+    restrictable: Optional[set[str]] = None,
 ) -> tuple[list[str], list[str]]:
     """Return ``(fun_declarations, axioms)`` required by *transforms*.
 
@@ -341,23 +376,35 @@ def transform_preamble(
     *final* pattern's alphabet could drop a pass whose output only becomes
     relevant after that later transform runs. Earlier transforms therefore
     always get the full, unrestricted declaration.
+
+    *restrictable*, if given, further limits which transform keys may use
+    *relevant* even when they are the last transform in *transforms* — see
+    :func:`_restrictable_transform_keys`. This is required whenever the
+    result may be merged with declarations built from other transform lists
+    (e.g. other links of the same chain): a transform's single global
+    declaration must not vary depending on which list produced it.
     """
-    seen: set[str] = set()
     fun_decls: list[str] = []
     axioms: list[str] = []
     last_index = len(transforms) - 1
+    decls_by_key: dict[str, str] = {}
+    order: list[str] = []
 
     for i, t in enumerate(transforms):
         key = t.lower()
         defn = _TRANSFORMS.get(key)
         if defn is None:
             raise UnsupportedTransformError(f"Transform '{t}' is not supported")
-        decl = defn.build_fun_decl(relevant if i == last_index else None)
-        if decl and key not in seen:
-            seen.add(key)
-            fun_decls.append(decl)
+        if key in decls_by_key:
+            continue
+        is_last = i == last_index and (restrictable is None or key in restrictable)
+        decl = defn.build_fun_decl(relevant if is_last else None)
+        if decl:
+            decls_by_key[key] = decl
+            order.append(key)
             axioms.extend(defn.axioms)
 
+    fun_decls = [decls_by_key[key] for key in order]
     return fun_decls, axioms
 
 
@@ -396,8 +443,16 @@ class UnsupportedOperatorError(Exception):
     """Raised when a SecRule operator cannot be converted to SMT."""
 
 
+@lru_cache(maxsize=1024)
+def _cached_pcre_to_ecma2020(argument: str):
+    """Cache :func:`pcre_to_ecma2020` per rule, since it is invoked twice per
+    ``@rx`` rule/link — once to build the assertion, once to compute the
+    relevant codepoints — with identical input each time."""
+    return pcre_to_ecma2020(argument)
+
+
 def _op_rx(var_expr: str, argument: str, negated: bool) -> str:
-    conv = pcre_to_ecma2020(argument)
+    conv = _cached_pcre_to_ecma2020(argument)
     return _rx_assertion(var_expr, conv.pattern, negated)
 
 
@@ -414,7 +469,7 @@ def _rx_relevant_codepoints(argument: str) -> Optional[set[int]]:
     falls back to None, meaning "unknown — don't restrict".
     """
     try:
-        conv = pcre_to_ecma2020(argument)
+        conv = _cached_pcre_to_ecma2020(argument)
         return extract_relevant_codepoints_precise(conv.pattern)
     except Exception:
         return None
@@ -529,7 +584,9 @@ _UNSET = object()  # sentinel: "no override given" vs. explicit relevant=None
 
 
 def rule_to_smt(
-    rule: SecRule, relevant: Optional[set[int]] = _UNSET  # type: ignore[assignment]
+    rule: SecRule,
+    relevant: Optional[set[int]] = _UNSET,  # type: ignore[assignment]
+    restrictable: Optional[set[str]] = _UNSET,  # type: ignore[assignment]
 ) -> SmtFormula:
     """Convert a single SecRule to an SmtFormula.
 
@@ -549,6 +606,13 @@ def rule_to_smt(
     omitted, an ``@rx`` rule computes it from its own pattern; any other
     operator leaves it unrestricted (None), since transforms feeding e.g.
     ``@streq``/``@contains`` are not (yet) analysed for relevance.
+
+    *restrictable*, if given, overrides which transform keys are allowed to
+    use *relevant* (see :func:`_restrictable_transform_keys`); this is used by
+    :func:`chain_to_smt` to pass a chain-wide computation, since the same
+    transform may be safe to restrict in this rule alone but not once merged
+    with other links. When omitted, it is computed from this rule's own
+    transforms only.
 
     Raises:
         UnsupportedOperatorError: if the operator is not supported, or (for
@@ -571,7 +635,9 @@ def rule_to_smt(
 
     negated = rule.negated or op_negated
     transforms = effective_transforms(rule)
-    fun_decls, axioms = transform_preamble(transforms, relevant)
+    if restrictable is _UNSET:
+        restrictable = _restrictable_transform_keys([transforms])
+    fun_decls, axioms = transform_preamble(transforms, relevant, restrictable)
 
     declarations: list[str] = []
     assertions: list[str] = []
@@ -633,7 +699,18 @@ def chain_to_smt(chain: Sequence[SecRule]) -> SmtFormula:
 
     chain_relevant: Optional[set[int]] = None if unrestricted else union
 
-    formulas = [rule_to_smt(rule, relevant=chain_relevant) for rule in chain]
+    # Likewise, whether a transform is safe to restrict at all must be decided
+    # across every link's transform list at once: a transform that is the
+    # last transform in one link but not in another must use its full,
+    # unrestricted declaration in both, since they share the same SMT symbol.
+    chain_restrictable = _restrictable_transform_keys(
+        [effective_transforms(rule) for rule in chain]
+    )
+
+    formulas = [
+        rule_to_smt(rule, relevant=chain_relevant, restrictable=chain_restrictable)
+        for rule in chain
+    ]
 
     declarations = _merge_unique([], [])
     fun_declarations: list[str] = []

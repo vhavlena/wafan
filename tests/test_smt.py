@@ -7,6 +7,7 @@ from wafan.parser import parse_file, parse_rx_rules, SecRule, SecRuleVariable, S
 from wafan.smt import (
     rule_to_smt,
     rules_to_smt,
+    chain_to_smt,
     extract_transforms,
     apply_transforms_smt,
     transform_preamble,
@@ -541,6 +542,35 @@ class TestTransformPreamble:
         with pytest.raises(UnsupportedTransformError):
             transform_preamble(["__unknown__"])
 
+    def test_repeated_transform_not_last_keeps_full_declaration(self):
+        # "urlDecode" appears twice: once not-last (its output feeds the
+        # second urlDecode), once last. Since both occurrences share the same
+        # SMT symbol, restricting the last one to `relevant` would silently
+        # narrow behaviour needed by the earlier (non-last) occurrence too, so
+        # neither may be restricted — the full declaration must be returned.
+        fun_decls, _ = transform_preamble(
+            ["urlDecode", "urlDecode"], relevant={0x41}
+        )
+        assert len(fun_decls) == 1
+        assert fun_decls[0].count("str.replace_re_all") == 256
+
+    def test_restrictable_excludes_key_from_restriction(self):
+        # Even though "urlDecode" is the last (only) transform here, passing
+        # restrictable=set() (as chain_to_smt does when a transform is unsafe
+        # to restrict across links) must force the full declaration.
+        fun_decls, _ = transform_preamble(
+            ["urlDecode"], relevant={0x41}, restrictable=set()
+        )
+        assert fun_decls[0].count("str.replace_re_all") == 256
+
+    def test_restrictable_none_keeps_prior_behaviour(self):
+        # Default restrictable=None must behave exactly as before this
+        # parameter existed: the last transform is restricted.
+        fun_decls, _ = transform_preamble(["urlDecode"], relevant={0x41})
+        decl = fun_decls[0]
+        assert '"\\u{41}"' in decl
+        assert '"\\u{42}"' not in decl
+
     # Specific axiom content checks
     def test_removewhitespace_no_space_axiom(self):
         _, axioms = transform_preamble(["removeWhitespace"])
@@ -651,3 +681,38 @@ class TestRulesToSmt:
             assert "(declare-const" in smt2
             assert "(assert" in smt2
             assert "(check-sat)" in smt2
+
+
+class TestChainToSmt:
+    def test_shared_transform_gets_single_consistent_declaration(self):
+        # Link 1 uses "urlDecode" as a non-last transform (its output feeds
+        # "uppercase"), so it needs the full, unrestricted declaration. Link
+        # 2 uses "urlDecode" alone, where it would normally be eligible for
+        # restriction to the link's own narrow @rx pattern. Since both links
+        # share the same "t_urlDecode" SMT symbol, the merged formula must
+        # declare it exactly once, with the full (safe) body — never two
+        # conflicting declarations of the same function name.
+        link1 = make_rule(rule_id="1", pattern="XYZ", transforms=["urlDecode", "uppercase"])
+        link2 = make_rule(rule_id="1", pattern="A", transforms=["urlDecode"])
+        formula = chain_to_smt([link1, link2])
+
+        url_decode_decls = [
+            d for d in formula.fun_declarations if d.startswith("(define-fun t_urlDecode ")
+        ]
+        assert len(url_decode_decls) == 1
+        # Full declaration: every %XX pass (0-255) must be present, not just
+        # the ones relevant to link2's narrow pattern.
+        assert url_decode_decls[0].count("str.replace_re_all") == 256
+
+    def test_transform_last_in_every_link_still_restricted(self):
+        # When a transform is genuinely the last transform in every link that
+        # uses it, restriction is still safe and should still happen.
+        link1 = make_rule(rule_id="1", pattern="A", transforms=["urlDecode"])
+        link2 = make_rule(rule_id="1", pattern="B", transforms=["urlDecode"])
+        formula = chain_to_smt([link1, link2])
+
+        url_decode_decls = [
+            d for d in formula.fun_declarations if d.startswith("(define-fun t_urlDecode ")
+        ]
+        assert len(url_decode_decls) == 1
+        assert url_decode_decls[0].count("str.replace_re_all") < 256
