@@ -538,6 +538,21 @@ class TestTransformPreamble:
         assert '"\\u{ff21}"' in with_a
         assert '"\\u{ff21}"' not in without_a
 
+    def test_repeated_identical_call_hits_declaration_cache(self):
+        # Building a transform's declaration (especially the unrestricted
+        # urlDecodeUni body) is expensive; repeated calls with the exact same
+        # (transform, relevant) pair — e.g. one per pairwise intersection /
+        # subsumption comparison sharing the same transform — must reuse the
+        # cached result instead of rebuilding it every time.
+        from wafan.smt import _cached_build_fun_decl
+
+        _cached_build_fun_decl.cache_clear()
+        d1 = transform_preamble(["urlDecode"], relevant={0x41})[0][0]
+        hits_before = _cached_build_fun_decl.cache_info().hits
+        d2 = transform_preamble(["urlDecode"], relevant={0x41})[0][0]
+        assert d1 == d2
+        assert _cached_build_fun_decl.cache_info().hits == hits_before + 1
+
     def test_unknown_raises(self):
         with pytest.raises(UnsupportedTransformError):
             transform_preamble(["__unknown__"])

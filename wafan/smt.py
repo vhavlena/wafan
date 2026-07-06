@@ -206,6 +206,23 @@ class UnsupportedTransformError(Exception):
     """Raised when a SecRule transformation is unknown to this module."""
 
 
+@lru_cache(maxsize=256)
+def _cached_build_fun_decl(key: str, relevant_frozen: "frozenset[int] | None") -> str:
+    """Cache :meth:`_TransformDef.build_fun_decl` per ``(key, relevant)``.
+
+    Building an unrestricted (``relevant=None``) declaration for a
+    codepoint-per-pass transform like ``urlDecodeUni`` is expensive (~15s,
+    ~13MB — see :mod:`wafan.transforms.url_decode_uni`), and is recomputed
+    identically every time a rule/chain can't contribute a restricted
+    codepoint set (e.g. pairwise intersection/subsumption checks over many
+    rules, each needing the same unrestricted declaration). Caching by the
+    exact ``(key, relevant)`` pair turns those repeated rebuilds into a single
+    build reused for the lifetime of the process.
+    """
+    relevant = None if relevant_frozen is None else set(relevant_frozen)
+    return _TRANSFORMS[key].build_fun_decl(relevant)
+
+
 # ---------------------------------------------------------------------------
 # SmtFormula
 # ---------------------------------------------------------------------------
@@ -398,7 +415,9 @@ def transform_preamble(
         if key in decls_by_key:
             continue
         is_last = i == last_index and (restrictable is None or key in restrictable)
-        decl = defn.build_fun_decl(relevant if is_last else None)
+        applied_relevant = relevant if is_last else None
+        relevant_frozen = None if applied_relevant is None else frozenset(applied_relevant)
+        decl = _cached_build_fun_decl(key, relevant_frozen)
         if decl:
             decls_by_key[key] = decl
             order.append(key)
