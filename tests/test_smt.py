@@ -544,14 +544,28 @@ class TestTransformPreamble:
         # (transform, relevant) pair — e.g. one per pairwise intersection /
         # subsumption comparison sharing the same transform — must reuse the
         # cached result instead of rebuilding it every time.
-        from wafan.smt import _cached_build_fun_decl
+        from wafan.smt import _cached_restricted_fun_decl
 
-        _cached_build_fun_decl.cache_clear()
+        _cached_restricted_fun_decl.cache_clear()
         d1 = transform_preamble(["urlDecode"], relevant={0x41})[0][0]
-        hits_before = _cached_build_fun_decl.cache_info().hits
+        hits_before = _cached_restricted_fun_decl.cache_info().hits
         d2 = transform_preamble(["urlDecode"], relevant={0x41})[0][0]
         assert d1 == d2
-        assert _cached_build_fun_decl.cache_info().hits == hits_before + 1
+        assert _cached_restricted_fun_decl.cache_info().hits == hits_before + 1
+
+    def test_repeated_unrestricted_call_hits_declaration_cache(self):
+        # The unrestricted (relevant=None) declaration is cached separately
+        # from restricted variants so it can't be evicted by the flood of
+        # distinct per-pair restricted requests (see
+        # _cached_unrestricted_fun_decl vs. _cached_restricted_fun_decl).
+        from wafan.smt import _cached_unrestricted_fun_decl
+
+        _cached_unrestricted_fun_decl.cache_clear()
+        d1 = transform_preamble(["urlDecode"])[0][0]
+        hits_before = _cached_unrestricted_fun_decl.cache_info().hits
+        d2 = transform_preamble(["urlDecode"])[0][0]
+        assert d1 == d2
+        assert _cached_unrestricted_fun_decl.cache_info().hits == hits_before + 1
 
     def test_unknown_raises(self):
         with pytest.raises(UnsupportedTransformError):

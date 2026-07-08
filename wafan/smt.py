@@ -206,21 +206,38 @@ class UnsupportedTransformError(Exception):
     """Raised when a SecRule transformation is unknown to this module."""
 
 
+@lru_cache(maxsize=None)
+def _cached_unrestricted_fun_decl(key: str) -> str:
+    """Cache the unrestricted (``relevant=None``) declaration for *key*.
+
+    Building it for a codepoint-per-pass transform like ``urlDecodeUni`` is
+    expensive (~15s, ~13MB — see :mod:`wafan.transforms.url_decode_uni`), and
+    is requested identically every time a rule/chain can't contribute a
+    restricted codepoint set. Kept in its own unbounded cache (there are only
+    a handful of transform keys) so it can never be evicted by the flood of
+    distinct per-pair restricted variants below.
+    """
+    return _TRANSFORMS[key].build_fun_decl(None)
+
+
 @lru_cache(maxsize=256)
-def _cached_build_fun_decl(key: str, relevant_frozen: "frozenset[int] | None") -> str:
+def _cached_restricted_fun_decl(key: str, relevant_frozen: "frozenset[int]") -> str:
     """Cache :meth:`_TransformDef.build_fun_decl` per ``(key, relevant)``.
 
-    Building an unrestricted (``relevant=None``) declaration for a
-    codepoint-per-pass transform like ``urlDecodeUni`` is expensive (~15s,
-    ~13MB — see :mod:`wafan.transforms.url_decode_uni`), and is recomputed
-    identically every time a rule/chain can't contribute a restricted
-    codepoint set (e.g. pairwise intersection/subsumption checks over many
-    rules, each needing the same unrestricted declaration). Caching by the
-    exact ``(key, relevant)`` pair turns those repeated rebuilds into a single
-    build reused for the lifetime of the process.
+    Pairwise intersection/subsumption checks over many rules each derive
+    their own joint codepoint set, so this cache sees a high-cardinality
+    stream of distinct keys; it is bounded (and thus subject to eviction)
+    separately from :func:`_cached_unrestricted_fun_decl` so that churn here
+    never evicts the far more valuable unrestricted entry.
     """
-    relevant = None if relevant_frozen is None else set(relevant_frozen)
-    return _TRANSFORMS[key].build_fun_decl(relevant)
+    return _TRANSFORMS[key].build_fun_decl(set(relevant_frozen))
+
+
+def _cached_build_fun_decl(key: str, relevant_frozen: "frozenset[int] | None") -> str:
+    """Cache :meth:`_TransformDef.build_fun_decl` per ``(key, relevant)``."""
+    if relevant_frozen is None:
+        return _cached_unrestricted_fun_decl(key)
+    return _cached_restricted_fun_decl(key, relevant_frozen)
 
 
 # ---------------------------------------------------------------------------
@@ -401,11 +418,9 @@ def transform_preamble(
     (e.g. other links of the same chain): a transform's single global
     declaration must not vary depending on which list produced it.
     """
-    fun_decls: list[str] = []
     axioms: list[str] = []
     last_index = len(transforms) - 1
     decls_by_key: dict[str, str] = {}
-    order: list[str] = []
 
     for i, t in enumerate(transforms):
         key = t.lower()
@@ -420,11 +435,9 @@ def transform_preamble(
         decl = _cached_build_fun_decl(key, relevant_frozen)
         if decl:
             decls_by_key[key] = decl
-            order.append(key)
             axioms.extend(defn.axioms)
 
-    fun_decls = [decls_by_key[key] for key in order]
-    return fun_decls, axioms
+    return list(decls_by_key.values()), axioms
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +488,8 @@ def _op_rx(var_expr: str, argument: str, negated: bool) -> str:
     return _rx_assertion(var_expr, conv.pattern, negated)
 
 
-def _rx_relevant_codepoints(argument: str) -> Optional[set[int]]:
+@lru_cache(maxsize=1024)
+def _rx_relevant_codepoints(argument: str) -> Optional[frozenset[int]]:
     """Return the codepoints an ``@rx`` *argument* can match, or None if unknown.
 
     The pattern is converted to ECMA2020 first (resolving POSIX classes,
@@ -486,15 +500,22 @@ def _rx_relevant_codepoints(argument: str) -> Optional[set[int]]:
     way (an unsupported PCRE construct, or a converted pattern the Python
     ``re`` parser still can't parse, e.g. leftover ECMA-only escapes) also
     falls back to None, meaning "unknown — don't restrict".
+
+    Cached per *argument*: the AST walk in
+    :func:`~wafan.regex_alphabet.extract_relevant_codepoints_precise` is pure
+    but not free, and is otherwise recomputed once per rule for every
+    pairwise intersection/subsumption comparison the rule participates in
+    (see :func:`wafan.analyses.common._joint_transform_preamble`).
     """
     try:
         conv = _cached_pcre_to_ecma2020(argument)
-        return extract_relevant_codepoints_precise(conv.pattern)
+        codepoints = extract_relevant_codepoints_precise(conv.pattern)
     except Exception:
         return None
+    return None if codepoints is None else frozenset(codepoints)
 
 
-def _rule_relevant_codepoints(rule: SecRule) -> Optional[set[int]]:
+def _rule_relevant_codepoints(rule: SecRule) -> Optional[frozenset[int]]:
     """Return the codepoints relevant to *rule*'s own operator, or None if
     unknown/not applicable.
 
