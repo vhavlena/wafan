@@ -8,7 +8,7 @@ simultaneously.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 from ..parser import SecRule, group_chains
 from ..smt import (
@@ -132,6 +132,9 @@ class IntersectionResult:
     rule2: SecRule
     result: SolverResult
     skipped: bool = False
+    skip_reason: str = ""
+    elapsed_sec: float = 0.0
+    error: str = ""
 
     @property
     def has_intersection(self) -> bool:
@@ -146,6 +149,9 @@ class ChainIntersectionResult:
     chain2: list[SecRule]
     result: SolverResult
     skipped: bool = False
+    skip_reason: str = ""
+    elapsed_sec: float = 0.0
+    error: str = ""
 
     @property
     def has_intersection(self) -> bool:
@@ -172,14 +178,14 @@ class IntersectionChecker:
         if not rules_share_variable(rule1, rule2):
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (no shared variable)")
-            return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN, skipped=True)
+            return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN, skipped=True, skip_reason="no shared variable")
 
         try:
             smt2 = intersection_smt2(rule1, rule2)
         except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
-            return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN, skipped=True)
+            return IntersectionResult(rule1, rule2, SolverResult.UNKNOWN, skipped=True, skip_reason=str(exc))
 
         result = self._solver.solve(smt2)
         if self._verbosity >= 1:
@@ -191,7 +197,11 @@ class IntersectionChecker:
             print(f"{prefix}  [{outcome:<12}]")
         if self._verbosity >= 2:
             _print_smt_block(smt2)
-        return IntersectionResult(rule1, rule2, result)
+        return IntersectionResult(
+            rule1, rule2, result,
+            elapsed_sec=getattr(self._solver, "last_elapsed_sec", 0.0),
+            error=getattr(self._solver, "last_error_text", "") if result == SolverResult.UNKNOWN else "",
+        )
 
     def find_intersecting(self, rules: Sequence[SecRule]) -> list[IntersectionResult]:
         """Return all unordered pairs (R1, R2) whose intersection is non-empty.
@@ -239,19 +249,19 @@ class IntersectionChecker:
         if not _all_supported(chain1) or not _all_supported(chain2):
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported operator)")
-            return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True)
+            return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True, skip_reason="unsupported operator")
 
         if not chains_share_variable(chain1, chain2):
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (no shared variable)")
-            return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True)
+            return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True, skip_reason="no shared variable")
 
         try:
             smt2 = chain_intersection_smt2(chain1, chain2, f1, f2)
         except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
-            return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True)
+            return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True, skip_reason=str(exc))
 
         result = self._solver.solve(smt2)
         if self._verbosity >= 1:
@@ -263,17 +273,32 @@ class IntersectionChecker:
             print(f"{prefix}  [{outcome:<12}]")
         if self._verbosity >= 2:
             _print_smt_block(smt2)
-        return ChainIntersectionResult(chain1, chain2, result)
+        return ChainIntersectionResult(
+            chain1, chain2, result,
+            elapsed_sec=getattr(self._solver, "last_elapsed_sec", 0.0),
+            error=getattr(self._solver, "last_error_text", "") if result == SolverResult.UNKNOWN else "",
+        )
 
-    def find_intersecting_chains(self, rules: Sequence[SecRule]) -> list[ChainIntersectionResult]:
+    def find_intersecting_chains(
+        self,
+        rules: Sequence[SecRule],
+        include_skipped: bool = False,
+        on_result: "Callable[[ChainIntersectionResult], None] | None" = None,
+    ) -> list[ChainIntersectionResult]:
         """Return all unordered pairs of chains whose intersection is non-empty.
 
         Rules are grouped into chains via group_chains() (a non-chained rule
         forms a chain of its own); only chains whose every link is @rx /
-        !@rx are considered. Each unordered pair is checked once; pairs
-        skipped due to disjoint variables or unsupported transforms are
-        excluded, but pairs where the solver itself returns UNKNOWN (e.g.
-        timeout) are kept with that result.
+        !@rx are considered. Each unordered pair is checked once; by
+        default, pairs skipped due to disjoint variables or unsupported
+        transforms are excluded, but pairs where the solver itself returns
+        UNKNOWN (e.g. timeout) are kept with that result. Pass
+        ``include_skipped=True`` to get every checked pair back, including
+        skipped ones (with ``skipped=True`` and ``skip_reason`` set).
+
+        *on_result*, if given, is called with each ChainIntersectionResult
+        (including skipped ones) as soon as it is computed, before the
+        method returns — so a caller can stream/persist partial progress.
         """
         chains = group_chains(list(rules))
         n = len(chains)
@@ -291,7 +316,9 @@ class IntersectionChecker:
         for i, c1 in enumerate(chains):
             for j, c2 in enumerate(chains[i + 1:], start=i + 1):
                 res = self.check_chain_pair(c1, c2, formulas[i], formulas[j])
-                if not res.skipped:
+                if on_result is not None:
+                    on_result(res)
+                if include_skipped or not res.skipped:
                     results.append(res)
 
         return results

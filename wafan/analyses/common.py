@@ -62,6 +62,34 @@ def _all_supported(chain: Sequence[SecRule]) -> bool:
     return all(is_supported_operator(r.operator) for r in chain)
 
 
+def chain_support_status(chain: Sequence[SecRule]) -> str:
+    """Classify why a chain can or cannot be turned into an SMT query.
+
+    Returns one of ``"ok"``, ``"unsupported_operator"``,
+    ``"unsupported_transform"`` or ``"unsupported_pattern"``. Used for
+    reporting/statistics purposes (e.g. the ``--json`` summary), independent
+    of any particular pairwise analysis.
+    """
+    if not _all_supported(chain):
+        return "unsupported_operator"
+    from ..regex_conv import UnsupportedPatternError
+    from ..smt import UnsupportedOperatorError, UnsupportedTransformError, chain_to_smt
+
+    try:
+        chain_to_smt(chain)
+    except UnsupportedTransformError:
+        return "unsupported_transform"
+    except UnsupportedPatternError:
+        return "unsupported_pattern"
+    except UnsupportedOperatorError:
+        # is_supported_operator() only checks the operator *name*; numeric
+        # operators (@eq/@ge/...) can still fail deep in chain_to_smt() if
+        # their argument isn't a literal integer (e.g. a ModSecurity
+        # macro like %{tx.sampling_percentage}).
+        return "unsupported_operator"
+    return "ok"
+
+
 def _operator_assertion(rule: SecRule, var_expr: str) -> str:
     """Return the SMT-LIB2 assertion for *rule*'s operator applied to *var_expr*.
 

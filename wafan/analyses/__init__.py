@@ -27,6 +27,7 @@ from .common import (
     _rule_label,
     _SMT_SEP,
     _variable_names,
+    chain_support_status,
     chains_share_variable,
     rules_share_variable,
 )
@@ -80,4 +81,5 @@ __all__ = [
     "chain_witness_smt2",
     "rules_share_variable",
     "chains_share_variable",
+    "chain_support_status",
 ]
