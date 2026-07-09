@@ -35,6 +35,8 @@ class SecRule:
     lineno: int
     phase: str = "2"
     inherited_actions: list[SecRuleAction] = None  # type: ignore[assignment]
+    source_path: Path | None = None  # conf file this rule was parsed from, for
+    # resolving file-based operator arguments (e.g. @pmFromFile) relative to it
 
     def __post_init__(self) -> None:
         if self.inherited_actions is None:
@@ -83,18 +85,23 @@ def _parse_action_string(spec: str) -> list[SecRuleAction]:
     return actions
 
 
-def _to_secrule(raw: dict[str, Any]) -> SecRule:
+def _to_secrule(raw: dict[str, Any], source_path: Path | None = None) -> SecRule:
     actions = [_parse_action(a) for a in raw.get("actions", [])]
+    # ModSecurity defaults to @rx when a rule's operator is omitted (a bare
+    # regex pattern, e.g. `SecRule FILES "\.php$"`); msc_pyparser reports this
+    # case as an empty operator string rather than filling in "@rx" itself.
+    operator = raw.get("operator", "") or "@rx"
     return SecRule(
         rule_id=_extract_rule_id(raw.get("actions", [])),
         variables=[_parse_variable(v) for v in raw.get("variables", [])],
-        operator=raw.get("operator", ""),
+        operator=operator,
         operator_argument=raw.get("operator_argument", ""),
         negated=raw.get("operator_negated", False),
         actions=actions,
         chained=raw.get("chained", False),
         lineno=raw.get("lineno", 0),
         phase=_extract_phase(actions),
+        source_path=source_path,
     )
 
 
@@ -166,7 +173,8 @@ def parse_file(path: str | Path) -> list[SecRule]:
     ``t:`` actions. ``SecRuleUpdateTargetById`` directives are applied to the
     matching rules after parsing.
     """
-    source = Path(path).read_text()
+    conf_path = Path(path)
+    source = conf_path.read_text()
     parser = msc_pyparser.MSCParser()
     parser.parser.parse(source, lexer=msc_pyparser.MSCLexer().lexer)
 
@@ -177,7 +185,7 @@ def parse_file(path: str | Path) -> list[SecRule]:
     for entry in parser.configlines:
         entry_type = entry.get("type")
         if entry_type == "SecRule":
-            rule = _to_secrule(entry)
+            rule = _to_secrule(entry, source_path=conf_path)
             rule.inherited_actions = list(default_actions.get(rule.phase, []))
             rules.append(rule)
         elif entry_type == "SecDefaultAction":

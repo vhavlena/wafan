@@ -163,7 +163,7 @@ def run_one(
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--input", type=Path, required=True, help="File listing one .conf path per line.")
-    p.add_argument("--analysis", choices=["subsumption", "intersection", "witness"], default="subsumption")
+    p.add_argument("--analysis", choices=["subsumption", "intersection", "contradiction", "witness"], default="subsumption")
     p.add_argument("--timeout", type=int, default=30, help="Per-SMT-query timeout in seconds, forwarded to wafan (default: 30).")
     p.add_argument("--process-timeout", type=int, default=600, help="Wall-clock budget per file in seconds; the wafan subprocess is killed if exceeded (default: 600).")
     p.add_argument("--solver", default=None, help="Forwarded to wafan --solver.")

@@ -231,6 +231,8 @@ class IntersectionChecker:
         chain2: Sequence[SecRule],
         f1: SmtFormula | None = None,
         f2: SmtFormula | None = None,
+        supported1: bool | None = None,
+        supported2: bool | None = None,
     ) -> ChainIntersectionResult:
         """Check if there is an input that triggers both chain1 and chain2.
 
@@ -240,13 +242,18 @@ class IntersectionChecker:
 
         *f1*/*f2* may be precomputed chain_to_smt() results for chain1/chain2
         (see find_intersecting_chains), avoiding recomputation across pairs.
+        *supported1*/*supported2* may be precomputed _all_supported(chain1/2)
+        results for the same reason (each chain is otherwise re-scanned once
+        per pair it appears in instead of once overall).
         """
         chain1, chain2 = list(chain1), list(chain2)
         lhs = _chain_label(chain1)
         rhs = _chain_label(chain2)
         prefix = f"  {lhs}  ∩  {rhs}"
 
-        if not _all_supported(chain1) or not _all_supported(chain2):
+        supported1 = _all_supported(chain1) if supported1 is None else supported1
+        supported2 = _all_supported(chain2) if supported2 is None else supported2
+        if not supported1 or not supported2:
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported operator)")
             return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True, skip_reason="unsupported operator")
@@ -306,16 +313,17 @@ class IntersectionChecker:
             print(f"Chain intersection analysis: {n} chains, {n * (n - 1) // 2} unordered pairs\n")
         results: list[ChainIntersectionResult] = []
 
+        supported: list[bool] = [_all_supported(chain) for chain in chains]
         formulas: list[SmtFormula | None] = []
-        for chain in chains:
+        for chain, chain_supported in zip(chains, supported):
             try:
-                formulas.append(chain_to_smt(chain) if _all_supported(chain) else None)
+                formulas.append(chain_to_smt(chain) if chain_supported else None)
             except (UnsupportedTransformError, UnsupportedOperatorError):
                 formulas.append(None)
 
         for i, c1 in enumerate(chains):
             for j, c2 in enumerate(chains[i + 1:], start=i + 1):
-                res = self.check_chain_pair(c1, c2, formulas[i], formulas[j])
+                res = self.check_chain_pair(c1, c2, formulas[i], formulas[j], supported[i], supported[j])
                 if on_result is not None:
                     on_result(res)
                 if include_skipped or not res.skipped:

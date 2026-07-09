@@ -15,6 +15,7 @@ from wafan.smt import (
     SMT_LOGIC,
     UnsupportedOperatorError,
     UnsupportedTransformError,
+    is_supported_operator,
 )
 
 CONF = Path(__file__).parent / "data" / "subsumption.conf"
@@ -31,6 +32,7 @@ def make_rule(
     negated=False,
     operator="@rx",
     transforms: list[str] | None = None,
+    source_path: Path | None = None,
 ) -> SecRule:
     actions = [make_action("t", t) for t in (transforms or [])]
     return SecRule(
@@ -42,6 +44,7 @@ def make_rule(
         actions=actions,
         chained=False,
         lineno=1,
+        source_path=source_path,
     )
 
 
@@ -199,9 +202,12 @@ class TestRxRuleToSmt:
         with pytest.raises(UnsupportedOperatorError, match="not supported"):
             rule_to_smt(rule)
 
-    def test_backslash_in_pattern_escaped(self):
+    def test_backslash_in_pattern_passed_through_unescaped(self):
+        # SMT-LIB2 string literals have no backslash-escape convention (a
+        # backslash is a literal character), so the pattern's backslash must
+        # reach re.from_ecma2020 unchanged for it to keep its regex meaning.
         f = rule_to_smt(make_rule(pattern=r"[a-z]:\inetpub"))
-        assert "\\\\" in f.assertion
+        assert r"[a-z]:\inetpub" in f.assertion
 
     def test_multiple_variables_uses_or(self):
         rule = SecRule(
@@ -241,7 +247,7 @@ class TestRxRuleToSmt:
             chained=False,
             lineno=1,
         )
-        assert "REQUEST_HEADERS__User_Agent" in rule_to_smt(rule).declarations[0]
+        assert "REQUEST_HEADERS__User_x2d_Agent" in rule_to_smt(rule).declarations[0]
 
     def test_rule_id_preserved(self):
         assert rule_to_smt(make_rule(rule_id="954100")).rule_id == "954100"
@@ -366,6 +372,81 @@ class TestPmOperator:
     def test_multiple_values_uses_or(self):
         f = rule_to_smt(make_rule(var_name="ARGS", pattern="foo bar", operator="@pm"))
         assert f.assertion == '(or (str.contains ARGS "foo") (str.contains ARGS "bar"))'
+
+
+class TestPmFromFileOperator:
+    def _make_data_file(self, tmp_path: Path, content: str, name="phrases.data") -> Path:
+        data_file = tmp_path / name
+        data_file.write_text(content)
+        return data_file
+
+    @pytest.mark.parametrize("operator", ["@pmFromFile", "@pmf"])
+    def test_reads_phrases_from_file(self, tmp_path, operator):
+        self._make_data_file(tmp_path, "foo\nbar\n")
+        conf = tmp_path / "rules.conf"
+        rule = make_rule(
+            var_name="ARGS",
+            pattern="phrases.data",
+            operator=operator,
+            source_path=conf,
+        )
+        f = rule_to_smt(rule)
+        assert f.assertion == '(or (str.contains ARGS "foo") (str.contains ARGS "bar"))'
+
+    def test_skips_blank_and_comment_lines(self, tmp_path):
+        self._make_data_file(tmp_path, "# a comment\n\nevil\n  \n# another\ndanger\n")
+        conf = tmp_path / "rules.conf"
+        rule = make_rule(
+            var_name="ARGS", pattern="phrases.data", operator="@pmFromFile", source_path=conf
+        )
+        f = rule_to_smt(rule)
+        assert f.assertion == '(or (str.contains ARGS "evil") (str.contains ARGS "danger"))'
+
+    def test_phrase_may_contain_spaces(self, tmp_path):
+        self._make_data_file(tmp_path, "hello world\n")
+        conf = tmp_path / "rules.conf"
+        rule = make_rule(
+            var_name="ARGS", pattern="phrases.data", operator="@pmFromFile", source_path=conf
+        )
+        f = rule_to_smt(rule)
+        assert f.assertion == '(str.contains ARGS "hello world")'
+
+    def test_path_resolved_relative_to_conf_file(self, tmp_path):
+        subdir = tmp_path / "sub"
+        subdir.mkdir()
+        self._make_data_file(subdir, "evil\n")
+        conf = subdir / "rules.conf"
+        rule = make_rule(
+            var_name="ARGS", pattern="phrases.data", operator="@pmFromFile", source_path=conf
+        )
+        f = rule_to_smt(rule)
+        assert f.assertion == '(str.contains ARGS "evil")'
+
+    def test_negated(self, tmp_path):
+        self._make_data_file(tmp_path, "foo\n")
+        conf = tmp_path / "rules.conf"
+        rule = make_rule(
+            var_name="ARGS",
+            pattern="phrases.data",
+            operator="@pmFromFile",
+            negated=True,
+            source_path=conf,
+        )
+        f = rule_to_smt(rule)
+        assert f.assertion == '(not (str.contains ARGS "foo"))'
+
+    def test_missing_file_raises(self, tmp_path):
+        conf = tmp_path / "rules.conf"
+        rule = make_rule(
+            var_name="ARGS", pattern="missing.data", operator="@pmFromFile", source_path=conf
+        )
+        with pytest.raises(UnsupportedOperatorError):
+            rule_to_smt(rule)
+
+    def test_is_supported_operator(self):
+        assert is_supported_operator("@pmFromFile")
+        assert is_supported_operator("@pmf")
+        assert is_supported_operator("!@pmFromFile")
 
 
 class TestNumericOperators:

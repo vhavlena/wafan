@@ -7,21 +7,34 @@ from typing import Sequence
 from ..parser import SecRule
 from ..smt import (
     _merge_unique,
-    _normalize_operator,
-    _OPERATORS,
+    _operator_builder,
     _restrictable_transform_keys,
     _rules_relevant_codepoints,
     effective_transforms,
     is_supported_operator,
     transform_preamble,
-    UnsupportedOperatorError,
 )
+from .solver import SolverResult
 
 _SMT_SEP = "  " + "-" * 62
 
 
 def _print_smt_block(smt2: str) -> None:
     print(f"  SMT-LIB2:\n{_SMT_SEP}\n{smt2}\n{_SMT_SEP}", flush=True)
+
+
+_INTERSECTION_OUTCOME_LABELS = {
+    SolverResult.SAT: "intersecting",
+    SolverResult.UNSAT: "disjoint",
+    SolverResult.UNKNOWN: "unknown",
+}
+
+
+def intersection_outcome_label(result: SolverResult) -> str:
+    """Human-readable outcome label for a SAT/UNSAT/UNKNOWN solver result in an
+    intersection-shaped analysis (intersection, contradiction): SAT is a
+    non-empty intersection ("intersecting"), UNSAT is disjoint."""
+    return _INTERSECTION_OUTCOME_LABELS[result]
 
 
 def _rule_label(rule: SecRule, pat_width: int = 35) -> str:
@@ -70,24 +83,38 @@ def chain_support_status(chain: Sequence[SecRule]) -> str:
     reporting/statistics purposes (e.g. the ``--json`` summary), independent
     of any particular pairwise analysis.
     """
-    if not _all_supported(chain):
-        return "unsupported_operator"
+    return chain_support_detail(chain)[0]
+
+
+def chain_support_detail(chain: Sequence[SecRule]) -> tuple[str, str]:
+    """Like chain_support_status(), but also return *why*: which operator,
+    transform or pattern construct is unsupported, and on which rule.
+
+    Returns ``(status, detail)`` where ``detail`` is a human-readable
+    explanation naming the offending construct (empty string for ``"ok"``).
+    """
+    unsupported_ops = sorted({
+        f"rule {r.rule_id}: '{r.operator}'" for r in chain if not is_supported_operator(r.operator)
+    })
+    if unsupported_ops:
+        return "unsupported_operator", f"operator not supported: {'; '.join(unsupported_ops)}"
+
     from ..regex_conv import UnsupportedPatternError
     from ..smt import UnsupportedOperatorError, UnsupportedTransformError, chain_to_smt
 
     try:
         chain_to_smt(chain)
-    except UnsupportedTransformError:
-        return "unsupported_transform"
-    except UnsupportedPatternError:
-        return "unsupported_pattern"
-    except UnsupportedOperatorError:
+    except UnsupportedTransformError as exc:
+        return "unsupported_transform", str(exc)
+    except UnsupportedPatternError as exc:
+        return "unsupported_pattern", str(exc)
+    except UnsupportedOperatorError as exc:
         # is_supported_operator() only checks the operator *name*; numeric
         # operators (@eq/@ge/...) can still fail deep in chain_to_smt() if
         # their argument isn't a literal integer (e.g. a ModSecurity
         # macro like %{tx.sampling_percentage}).
-        return "unsupported_operator"
-    return "ok"
+        return "unsupported_operator", str(exc)
+    return "ok", ""
 
 
 def _operator_assertion(rule: SecRule, var_expr: str) -> str:
@@ -96,14 +123,7 @@ def _operator_assertion(rule: SecRule, var_expr: str) -> str:
     Raises UnsupportedOperatorError if the rule's operator is not supported
     (or, for numeric operators, its argument is not an integer).
     """
-    op_name, op_negated = _normalize_operator(rule.operator)
-    builder = _OPERATORS.get(op_name)
-    if builder is None:
-        raise UnsupportedOperatorError(
-            f"Rule {rule.rule_id}: operator '{rule.operator}' is not supported"
-        )
-    negated = rule.negated or op_negated
-    return builder(var_expr, rule.operator_argument, negated)
+    return _operator_builder(rule)(var_expr)
 
 
 def _joint_transform_preamble(
@@ -158,3 +178,41 @@ def _chain_variable_names(chain: Sequence[SecRule]) -> frozenset[str]:
 def chains_share_variable(chain1: Sequence[SecRule], chain2: Sequence[SecRule]) -> bool:
     """True if any link of chain1 and any link of chain2 target a common variable."""
     return bool(_chain_variable_names(chain1) & _chain_variable_names(chain2))
+
+
+_DENY_ACTIONS = frozenset({"deny", "drop", "block"})
+_ALLOW_ACTIONS = frozenset({"allow"})
+
+
+def chain_disposition(chain: Sequence[SecRule]) -> str:
+    """Classify a chain's disruptive action as ``"deny"``, ``"allow"`` or ``"unknown"``.
+
+    Scans every link's own actions first (a chain's disruptive action is
+    conventionally placed on its first link, but any link may carry one),
+    then falls back to each link's inherited actions (from
+    ``SecDefaultAction``) if none of the rule's own actions are conclusive.
+
+    ``pass`` is deliberately not treated as ``"allow"``: it is ModSecurity's
+    no-op/continue default (often used purely for flow control, e.g.
+    ``skipAfter``), not an explicit decision to accept the request. Chains
+    whose only disruptive-adjacent action is ``pass`` are ``"unknown"`` so
+    they aren't paired against a real ``deny`` and flagged as a contradiction.
+    """
+    for link in chain:
+        for action in link.actions:
+            if action.name in _DENY_ACTIONS:
+                return "deny"
+            if action.name in _ALLOW_ACTIONS:
+                return "allow"
+    for link in chain:
+        for action in link.inherited_actions:
+            if action.name in _DENY_ACTIONS:
+                return "deny"
+            if action.name in _ALLOW_ACTIONS:
+                return "allow"
+    return "unknown"
+
+
+def rule_disposition(rule: SecRule) -> str:
+    """Classify a single rule's disruptive action; see chain_disposition()."""
+    return chain_disposition([rule])

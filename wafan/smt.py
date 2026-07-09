@@ -9,6 +9,11 @@ Supported operators (see _OPERATORS / is_supported_operator):
   @endsWith    – suffix match (str.suffixof)
   @within      – input is a substring of one of a space-separated list of values
   @pm          – any of a space-separated list of phrases is a substring of the input
+  @pmFromFile  – like @pm, but phrases are read one-per-line from a file (alias
+                 @pmf); '#'-prefixed and blank lines are skipped, matching
+                 ModSecurity's .data file format. Relative paths are resolved
+                 against the directory of the .conf file the rule was parsed
+                 from (see SecRule.source_path / wafan.parser.parse_file).
   @eq/@ge/@gt/@le/@lt – numeric comparison of (str.to_int input) against an
                  integer argument; the argument must be a literal integer
                  (macro expansions and floats are not supported and raise
@@ -51,8 +56,10 @@ Transforms not listed above raise UnsupportedTransformError.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from .parser import SecRule, SecRuleAction, SecRuleVariable
@@ -445,16 +452,34 @@ def transform_preamble(
 # ---------------------------------------------------------------------------
 
 def _smt_var_name(variable: SecRuleVariable) -> str:
-    """Produce a sanitised SMT identifier for a ModSecurity variable."""
+    """Produce a sanitised SMT identifier for a ModSecurity variable.
+
+    ``variable.part`` may itself be a regex (e.g. ``ARGS:/jform\\[pass\\]/``),
+    which can contain characters like ``/[]\\`` that are not valid in an
+    unquoted SMT-LIB2 simple symbol. Anything outside ``[A-Za-z0-9_]`` is
+    replaced with its hex codepoint (e.g. ``[`` -> ``_x5b_``) rather than a
+    single ``_``, so two different variable specs that merely differ in
+    which non-alnum characters they contain (e.g. ``ARGS:a.b`` vs
+    ``ARGS:a_b``) can't collide onto the same SMT identifier.
+    """
     name = variable.name
     if variable.part:
         name = f"{name}__{variable.part}"
-    return name.replace("-", "_").replace(".", "_").replace(":", "_")
+    return re.sub(r"[^A-Za-z0-9_]", lambda m: f"_x{ord(m.group()):02x}_", name)
 
 
 def _escape_smt_string(pattern: str) -> str:
-    """Escape a regex pattern for embedding in an SMT-LIB2 string literal."""
-    return pattern.replace("\\", "\\\\").replace('"', '\\"')
+    """Escape a pattern for embedding in an SMT-LIB2 string literal.
+
+    SMT-LIB2 string literals have no backslash-escape convention — a
+    backslash is a literal character. The only special character is `"`,
+    which is escaped by doubling it (`""`), not by backslash-prefixing it.
+    Backslash-doubling here would corrupt every backslash-escaped regex
+    metacharacter (e.g. PCRE `\\.` would become `\\\\.`, which
+    re.from_ecma2020 parses as escaped-backslash + wildcard-dot instead of
+    a literal dot).
+    """
+    return pattern.replace('"', '""')
 
 
 def _rx_assertion(var_expr: str, pattern: str, negated: bool) -> str:
@@ -580,14 +605,66 @@ def _op_within(var_expr: str, argument: str, negated: bool) -> str:
     return _wrap_negated(_disjunction(atoms), negated)
 
 
+def _op_pm_phrases(var_expr: str, phrases: Sequence[str], negated: bool) -> str:
+    atoms = [
+        f'(str.contains {var_expr} "{_escape_smt_string(v)}")'
+        for v in phrases
+    ]
+    return _wrap_negated(_disjunction(atoms), negated)
+
+
 def _op_pm(var_expr: str, argument: str, negated: bool) -> str:
     # @pm: matches if any of the space-separated phrases is a substring of
     # var_expr.
-    atoms = [
-        f'(str.contains {var_expr} "{_escape_smt_string(v)}")'
-        for v in argument.split()
-    ]
-    return _wrap_negated(_disjunction(atoms), negated)
+    return _op_pm_phrases(var_expr, argument.split(), negated)
+
+
+# ---------------------------------------------------------------------------
+# @pmFromFile / @pmf
+# ---------------------------------------------------------------------------
+
+_PHRASE_FILE_OPERATORS = {"pmfromfile", "pmf"}
+
+
+@lru_cache(maxsize=128)
+def _read_phrase_file(path: str) -> tuple[str, ...]:
+    """Read a ModSecurity phrase-list ``.data`` file for ``@pmFromFile``.
+
+    One phrase per line; blank lines and lines starting with ``#`` are
+    comments and are skipped, mirroring ModSecurity's own ``.data`` file
+    format (see e.g. ``owasp-rules/*.data``). Unlike ``@pm``, phrases are not
+    further split on whitespace, since a line may itself contain spaces.
+    """
+    phrases = []
+    for line in Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        phrases.append(line)
+    return tuple(phrases)
+
+
+def _resolve_phrase_file_path(rule: SecRule) -> Path:
+    """Resolve a ``@pmFromFile`` argument to a filesystem path.
+
+    Relative arguments are resolved against the directory of the ``.conf``
+    file the rule was parsed from, matching ModSecurity's own resolution of
+    relative data-file paths.
+    """
+    path = Path(rule.operator_argument.strip())
+    if not path.is_absolute() and rule.source_path is not None:
+        path = rule.source_path.parent / path
+    return path
+
+
+def _op_pmfromfile_phrases(rule: SecRule) -> tuple[str, ...]:
+    path = _resolve_phrase_file_path(rule)
+    try:
+        return _read_phrase_file(str(path))
+    except (OSError, UnicodeDecodeError) as exc:
+        raise UnsupportedOperatorError(
+            f"Rule {rule.rule_id}: cannot read @pmFromFile file '{path}': {exc}"
+        ) from exc
 
 
 _NUMERIC_OPS = {"eq": "=", "ge": ">=", "gt": ">", "le": "<=", "lt": "<"}
@@ -640,7 +717,32 @@ def _normalize_operator(operator: str) -> tuple[str, bool]:
 def is_supported_operator(operator: str) -> bool:
     """True if *operator* (with optional leading ``!``/``@``) can be converted to SMT."""
     name, _ = _normalize_operator(operator)
-    return name in _OPERATORS
+    return name in _OPERATORS or name in _PHRASE_FILE_OPERATORS
+
+
+def _operator_builder(rule: SecRule) -> Callable[[str], str]:
+    """Return a function ``var_expr -> SMT-LIB2 assertion string`` for *rule*'s operator.
+
+    This is the single dispatch point for turning a rule's operator into an
+    assertion: both the chain path (:func:`rule_to_smt`) and the rule-pair
+    path (``_operator_assertion`` in ``analyses/common.py``) call this, so
+    ``@pmFromFile``/``@pmf`` (which need *rule* itself, not just its operator
+    argument, to resolve and read the phrase file) work identically in both.
+
+    Raises UnsupportedOperatorError if the operator is not supported (or, for
+    numeric operators, its argument is not an integer).
+    """
+    op_name, op_negated = _normalize_operator(rule.operator)
+    negated = rule.negated or op_negated
+    if op_name in _PHRASE_FILE_OPERATORS:
+        phrases = _op_pmfromfile_phrases(rule)
+        return lambda var_expr: _op_pm_phrases(var_expr, phrases, negated)
+    builder = _OPERATORS.get(op_name)
+    if builder is None:
+        raise UnsupportedOperatorError(
+            f"Rule {rule.rule_id}: operator '{rule.operator}' is not supported"
+        )
+    return lambda var_expr: builder(var_expr, rule.operator_argument, negated)
 
 
 # ---------------------------------------------------------------------------
@@ -665,7 +767,8 @@ def rule_to_smt(
     variables produce a disjunctive assertion.
 
     Supported operators: @rx, @streq, @contains, @beginsWith, @endsWith,
-    @within, @pm, @eq, @ge, @gt, @le, @lt (each with optional ``!`` negation).
+    @within, @pm, @pmFromFile (alias @pmf), @eq, @ge, @gt, @le, @lt (each
+    with optional ``!`` negation).
 
     *relevant*, if given, overrides the codepoint set used to trim transform
     declarations (see :func:`transform_preamble`); this is used by
@@ -686,12 +789,8 @@ def rule_to_smt(
             numeric operators) its argument is not an integer.
         UnsupportedTransformError: if a t: action is unknown.
     """
-    op_name, op_negated = _normalize_operator(rule.operator)
-    builder = _OPERATORS.get(op_name)
-    if builder is None:
-        raise UnsupportedOperatorError(
-            f"Rule {rule.rule_id}: operator '{rule.operator}' is not supported"
-        )
+    op_name, _op_negated = _normalize_operator(rule.operator)
+    assertion_fn = _operator_builder(rule)
 
     if relevant is _UNSET:
         relevant = (
@@ -700,7 +799,6 @@ def rule_to_smt(
             else None
         )
 
-    negated = rule.negated or op_negated
     transforms = effective_transforms(rule)
     if restrictable is _UNSET:
         restrictable = _restrictable_transform_keys([transforms])
@@ -716,7 +814,7 @@ def rule_to_smt(
             declarations.append(f"(declare-const {v} String)")
             seen.add(v)
         var_expr = apply_transforms_smt(v, transforms)
-        assertions.append(builder(var_expr, rule.operator_argument, negated))
+        assertions.append(assertion_fn(var_expr))
 
     assertion = assertions[0] if len(assertions) == 1 else "(or " + " ".join(assertions) + ")"
 

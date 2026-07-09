@@ -26,14 +26,21 @@ from wafan.analyses import (
     IntersectionChecker,
     intersection_smt2,
     rules_share_variable,
+    ContradictionResult,
+    ContradictionChecker,
+    contradiction_smt2,
+    rule_disposition,
+    chain_disposition,
     WitnessResult,
     WitnessChecker,
     witness_smt2,
     ChainSubsumptionResult,
     ChainIntersectionResult,
+    ChainContradictionResult,
     ChainWitnessResult,
     chain_subsumption_smt2,
     chain_intersection_smt2,
+    chain_contradiction_smt2,
     chain_witness_smt2,
     chains_share_variable,
     _parse_get_value_output,
@@ -790,6 +797,134 @@ class TestIntersectionE2E:
 
 
 # ---------------------------------------------------------------------------
+# rule_disposition / chain_disposition – unit tests
+# ---------------------------------------------------------------------------
+
+class TestDisposition:
+    def test_deny_action_is_deny(self):
+        r = make_rule()
+        r.actions.append(make_action("deny"))
+        assert rule_disposition(r) == "deny"
+
+    def test_drop_and_block_are_deny(self):
+        for name in ("drop", "block"):
+            r = make_rule()
+            r.actions.append(make_action(name))
+            assert rule_disposition(r) == "deny"
+
+    def test_allow_action_is_allow(self):
+        r = make_rule()
+        r.actions.append(make_action("allow"))
+        assert rule_disposition(r) == "allow"
+
+    def test_pass_action_is_unknown(self):
+        # "pass" is ModSecurity's no-op/continue default, not an explicit
+        # allow decision (e.g. paranoia-level skipAfter guards use it purely
+        # for flow control), so it must not be conflated with "allow".
+        r = make_rule()
+        r.actions.append(make_action("pass"))
+        assert rule_disposition(r) == "unknown"
+
+    def test_no_disruptive_action_is_unknown(self):
+        r = make_rule()
+        assert rule_disposition(r) == "unknown"
+
+    def test_own_action_takes_precedence_over_inherited(self):
+        r = make_rule()
+        r.actions.append(make_action("allow"))
+        r.inherited_actions.append(make_action("deny"))
+        assert rule_disposition(r) == "allow"
+
+    def test_inherited_action_used_as_fallback(self):
+        r = make_rule()
+        r.inherited_actions.append(make_action("deny"))
+        assert rule_disposition(r) == "deny"
+
+    def test_chain_disposition_checks_every_link(self):
+        r1 = make_rule(rule_id="1")
+        r2 = make_rule(rule_id="2")
+        r2.actions.append(make_action("deny"))
+        assert chain_disposition([r1, r2]) == "deny"
+
+
+# ---------------------------------------------------------------------------
+# ContradictionChecker.check_pair – unit tests
+# ---------------------------------------------------------------------------
+
+class TestContradictionCheckPair:
+    def test_intersecting_with_conflicting_actions_is_contradiction(self):
+        checker = ContradictionChecker(ConstantSolver(SolverResult.SAT))
+        r1 = make_rule(rule_id="1")
+        r1.actions.append(make_action("deny"))
+        r2 = make_rule(rule_id="2")
+        r2.actions.append(make_action("allow"))
+        res = checker.check_pair(r1, r2)
+        assert res.has_intersection
+        assert res.is_contradiction
+
+    def test_intersecting_with_same_action_is_not_contradiction(self):
+        checker = ContradictionChecker(ConstantSolver(SolverResult.SAT))
+        r1 = make_rule(rule_id="1")
+        r1.actions.append(make_action("deny"))
+        r2 = make_rule(rule_id="2")
+        r2.actions.append(make_action("deny"))
+        res = checker.check_pair(r1, r2)
+        assert res.has_intersection
+        assert not res.is_contradiction
+
+    def test_intersecting_with_unknown_disposition_is_not_contradiction(self):
+        checker = ContradictionChecker(ConstantSolver(SolverResult.SAT))
+        r1 = make_rule(rule_id="1")
+        r1.actions.append(make_action("deny"))
+        r2 = make_rule(rule_id="2")
+        res = checker.check_pair(r1, r2)
+        assert res.has_intersection
+        assert not res.is_contradiction
+
+    def test_disjoint_is_not_contradiction_even_with_conflicting_actions(self):
+        checker = ContradictionChecker(ConstantSolver(SolverResult.UNSAT))
+        r1 = make_rule(rule_id="1")
+        r1.actions.append(make_action("deny"))
+        r2 = make_rule(rule_id="2")
+        r2.actions.append(make_action("allow"))
+        res = checker.check_pair(r1, r2)
+        assert not res.has_intersection
+        assert not res.is_contradiction
+
+    def test_disjoint_variables_returns_unknown(self):
+        checker = ContradictionChecker(ConstantSolver(SolverResult.SAT))
+        r1 = make_rule(var_name="ARGS")
+        r2 = make_rule(var_name="RESPONSE_BODY")
+        assert checker.check_pair(r1, r2).result == SolverResult.UNKNOWN
+
+    def test_result_is_contradiction_result(self):
+        checker = ContradictionChecker(ConstantSolver(SolverResult.SAT))
+        assert isinstance(checker.check_pair(make_rule(), make_rule()), ContradictionResult)
+
+    def test_contradiction_smt2_matches_intersection_smt2(self):
+        r1, r2 = make_rule(rule_id="1", pattern="foo"), make_rule(rule_id="2", pattern="bar")
+        assert contradiction_smt2(r1, r2) == intersection_smt2(r1, r2)
+
+
+# ---------------------------------------------------------------------------
+# ContradictionChecker.find_contradicting – unit tests
+# ---------------------------------------------------------------------------
+
+class TestFindContradicting:
+    def test_only_conflicting_pair_flagged(self):
+        r1 = make_rule(rule_id="1")
+        r1.actions.append(make_action("deny"))
+        r2 = make_rule(rule_id="2")
+        r2.actions.append(make_action("deny"))
+        r3 = make_rule(rule_id="3")
+        r3.actions.append(make_action("allow"))
+        checker = ContradictionChecker(ConstantSolver(SolverResult.SAT))
+        results = checker.find_contradicting([r1, r2, r3])
+        contradicting = {frozenset([r.rule1.rule_id, r.rule2.rule_id]) for r in results if r.is_contradiction}
+        assert contradicting == {frozenset(["1", "3"]), frozenset(["2", "3"])}
+
+
+# ---------------------------------------------------------------------------
 # _parse_get_value_output – unit tests
 # ---------------------------------------------------------------------------
 
@@ -1252,6 +1387,43 @@ class TestIntersectionCheckerChainPair:
         results = checker.find_intersecting_chains(chain + other)
         assert len(results) == 1
         assert isinstance(results[0], ChainIntersectionResult)
+
+
+class TestContradictionCheckerChainPair:
+    def test_sat_with_conflicting_actions_is_contradiction(self):
+        checker = ContradictionChecker(ConstantSolver(SolverResult.SAT))
+        chain1 = [make_rule(rule_id="1")]
+        chain1[0].actions.append(make_action("deny"))
+        chain2 = [make_rule(rule_id="2")]
+        chain2[0].actions.append(make_action("allow"))
+        res = checker.check_chain_pair(chain1, chain2)
+        assert isinstance(res, ChainContradictionResult)
+        assert res.has_intersection
+        assert res.is_contradiction
+
+    def test_sat_with_same_action_is_not_contradiction(self):
+        checker = ContradictionChecker(ConstantSolver(SolverResult.SAT))
+        chain1 = [make_rule(rule_id="1")]
+        chain1[0].actions.append(make_action("deny"))
+        chain2 = [make_rule(rule_id="2")]
+        chain2[0].actions.append(make_action("deny"))
+        res = checker.check_chain_pair(chain1, chain2)
+        assert res.has_intersection
+        assert not res.is_contradiction
+
+    def test_find_contradicting_chains_groups_rules(self):
+        checker = ContradictionChecker(ConstantSolver(SolverResult.SAT))
+        chain = make_chain([
+            dict(rule_id="1", pattern="foo"),
+            dict(rule_id="", pattern="bar"),
+        ])
+        chain[0].actions.append(make_action("deny"))
+        other = [make_rule(rule_id="2", pattern="baz")]
+        other[0].actions.append(make_action("allow"))
+        results = checker.find_contradicting_chains(chain + other)
+        assert len(results) == 1
+        assert isinstance(results[0], ChainContradictionResult)
+        assert results[0].is_contradiction
 
 
 class TestWitnessCheckerChain:
