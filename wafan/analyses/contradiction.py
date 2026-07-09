@@ -14,25 +14,16 @@ from dataclasses import dataclass
 from typing import Callable, Sequence
 
 from ..parser import SecRule, group_chains
-from ..smt import (
-    SmtFormula,
-    UnsupportedOperatorError,
-    UnsupportedTransformError,
-    chain_to_smt,
-    is_supported_operator,
+from ..smt import SmtFormula, UnsupportedOperatorError, UnsupportedTransformError, chain_to_smt, is_supported_operator
+from .common import _all_supported, _chain_label, _print_smt_block, _rule_label, chain_disposition, intersection_outcome_label, rule_disposition
+from .intersection import (
+    ChainIntersectionResult,
+    IntersectionChecker,
+    IntersectionResult,
+    chain_intersection_smt2,
+    intersection_smt2,
 )
-from .common import (
-    _all_supported,
-    _chain_label,
-    _print_smt_block,
-    _rule_label,
-    chain_disposition,
-    chains_share_variable,
-    rule_disposition,
-    rules_share_variable,
-)
-from .intersection import chain_intersection_smt2, intersection_smt2
-from .solver import SolverBackend, SolverResult
+from .solver import SolverBackend
 
 # ---------------------------------------------------------------------------
 # Contradiction query generation (identical to intersection: the accept/deny
@@ -66,44 +57,42 @@ def chain_contradiction_smt2(
 
 @dataclass
 class ContradictionResult:
-    """Outcome of checking whether rule1 and rule2 intersect and contradict."""
+    """Outcome of checking whether rule1 and rule2 intersect and contradict.
 
-    rule1: SecRule
-    rule2: SecRule
-    result: SolverResult
-    skipped: bool = False
-    skip_reason: str = ""
-    elapsed_sec: float = 0.0
-    error: str = ""
+    Wraps the IntersectionResult of the identical SAT/UNSAT query
+    IntersectionChecker performs (rule1/rule2/result/skipped/skip_reason/
+    elapsed_sec/error/has_intersection all delegate to it via __getattr__)
+    and adds only the accept/deny disposition check.
+    """
 
-    @property
-    def has_intersection(self) -> bool:
-        return self.result == SolverResult.SAT
+    base: IntersectionResult
+
+    def __getattr__(self, name: str):
+        return getattr(self.base, name)
 
     @property
     def is_contradiction(self) -> bool:
-        return self.has_intersection and {rule_disposition(self.rule1), rule_disposition(self.rule2)} == {"allow", "deny"}
+        return self.base.has_intersection and {rule_disposition(self.base.rule1), rule_disposition(self.base.rule2)} == {"allow", "deny"}
 
 
 @dataclass
 class ChainContradictionResult:
-    """Outcome of checking whether chain1 and chain2 intersect and contradict."""
+    """Outcome of checking whether chain1 and chain2 intersect and contradict.
 
-    chain1: list[SecRule]
-    chain2: list[SecRule]
-    result: SolverResult
-    skipped: bool = False
-    skip_reason: str = ""
-    elapsed_sec: float = 0.0
-    error: str = ""
+    Wraps the ChainIntersectionResult of the identical SAT/UNSAT query
+    IntersectionChecker performs (chain1/chain2/result/skipped/skip_reason/
+    elapsed_sec/error/has_intersection all delegate to it via __getattr__)
+    and adds only the accept/deny disposition check.
+    """
 
-    @property
-    def has_intersection(self) -> bool:
-        return self.result == SolverResult.SAT
+    base: ChainIntersectionResult
+
+    def __getattr__(self, name: str):
+        return getattr(self.base, name)
 
     @property
     def is_contradiction(self) -> bool:
-        return self.has_intersection and {chain_disposition(self.chain1), chain_disposition(self.chain2)} == {"allow", "deny"}
+        return self.base.has_intersection and {chain_disposition(self.base.chain1), chain_disposition(self.base.chain2)} == {"allow", "deny"}
 
 
 class ContradictionChecker:
@@ -112,6 +101,16 @@ class ContradictionChecker:
     def __init__(self, solver: SolverBackend, verbosity: int = 0) -> None:
         self._solver = solver
         self._verbosity = verbosity
+        self._intersection = IntersectionChecker(solver, verbosity=0)
+
+    def _print_outcome(self, prefix: str, res: "ContradictionResult | ChainContradictionResult") -> None:
+        if self._verbosity < 1:
+            return
+        if res.skipped:
+            print(f"{prefix}  [{'skipped':<13}]  ({res.skip_reason})")
+        else:
+            outcome = "CONTRADICTION" if res.is_contradiction else intersection_outcome_label(res.result)
+            print(f"{prefix}  [{outcome:<13}]")
 
     def check_pair(self, rule1: SecRule, rule2: SecRule) -> ContradictionResult:
         """Check if there is an input that triggers both rule1 and rule2 while
@@ -120,37 +119,11 @@ class ContradictionChecker:
         Returns UNKNOWN if either rule uses an unsupported transform or if the
         rules target disjoint sets of variables.
         """
-        lhs = _rule_label(rule1)
-        rhs = _rule_label(rule2)
-        prefix = f"  {lhs}  ⨯  {rhs}"
-
-        if not rules_share_variable(rule1, rule2):
-            if self._verbosity >= 1:
-                print(f"{prefix}  [{'skipped':<13}]  (no shared variable)")
-            return ContradictionResult(rule1, rule2, SolverResult.UNKNOWN, skipped=True, skip_reason="no shared variable")
-
-        try:
-            smt2 = contradiction_smt2(rule1, rule2)
-        except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
-            if self._verbosity >= 1:
-                print(f"{prefix}  [{'skipped':<13}]  (unsupported transform: {exc})")
-            return ContradictionResult(rule1, rule2, SolverResult.UNKNOWN, skipped=True, skip_reason=str(exc))
-
-        result = self._solver.solve(smt2)
-        res = ContradictionResult(
-            rule1, rule2, result,
-            elapsed_sec=getattr(self._solver, "last_elapsed_sec", 0.0),
-            error=getattr(self._solver, "last_error_text", "") if result == SolverResult.UNKNOWN else "",
-        )
-        if self._verbosity >= 1:
-            outcome = "CONTRADICTION" if res.is_contradiction else {
-                SolverResult.SAT: "intersecting",
-                SolverResult.UNSAT: "disjoint",
-                SolverResult.UNKNOWN: "unknown",
-            }[result]
-            print(f"{prefix}  [{outcome:<13}]")
-        if self._verbosity >= 2:
-            _print_smt_block(smt2)
+        prefix = f"  {_rule_label(rule1)}  ⨯  {_rule_label(rule2)}"
+        res = ContradictionResult(self._intersection.check_pair(rule1, rule2))
+        self._print_outcome(prefix, res)
+        if self._verbosity >= 2 and not res.skipped:
+            _print_smt_block(contradiction_smt2(rule1, rule2))
         return res
 
     def find_contradicting(self, rules: Sequence[SecRule]) -> list[ContradictionResult]:
@@ -181,6 +154,8 @@ class ContradictionChecker:
         chain2: Sequence[SecRule],
         f1: SmtFormula | None = None,
         f2: SmtFormula | None = None,
+        supported1: bool | None = None,
+        supported2: bool | None = None,
     ) -> ChainContradictionResult:
         """Check if there is an input that triggers both chain1 and chain2 while
         the two chains disagree on whether to accept or deny it.
@@ -189,46 +164,19 @@ class ContradictionChecker:
         unsupported transform, or the chains target disjoint sets of
         variables.
 
-        *f1*/*f2* may be precomputed chain_to_smt() results for chain1/chain2
-        (see find_contradicting_chains), avoiding recomputation across pairs.
+        *f1*/*f2* may be precomputed chain_to_smt() results, and
+        *supported1*/*supported2* precomputed _all_supported() results, for
+        chain1/chain2 (see find_contradicting_chains), avoiding recomputation
+        across pairs.
         """
         chain1, chain2 = list(chain1), list(chain2)
-        lhs = _chain_label(chain1)
-        rhs = _chain_label(chain2)
-        prefix = f"  {lhs}  ⨯  {rhs}"
-
-        if not _all_supported(chain1) or not _all_supported(chain2):
-            if self._verbosity >= 1:
-                print(f"{prefix}  [{'skipped':<13}]  (unsupported operator)")
-            return ChainContradictionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True, skip_reason="unsupported operator")
-
-        if not chains_share_variable(chain1, chain2):
-            if self._verbosity >= 1:
-                print(f"{prefix}  [{'skipped':<13}]  (no shared variable)")
-            return ChainContradictionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True, skip_reason="no shared variable")
-
-        try:
-            smt2 = chain_contradiction_smt2(chain1, chain2, f1, f2)
-        except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
-            if self._verbosity >= 1:
-                print(f"{prefix}  [{'skipped':<13}]  (unsupported transform: {exc})")
-            return ChainContradictionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True, skip_reason=str(exc))
-
-        result = self._solver.solve(smt2)
+        prefix = f"  {_chain_label(chain1)}  ⨯  {_chain_label(chain2)}"
         res = ChainContradictionResult(
-            chain1, chain2, result,
-            elapsed_sec=getattr(self._solver, "last_elapsed_sec", 0.0),
-            error=getattr(self._solver, "last_error_text", "") if result == SolverResult.UNKNOWN else "",
+            self._intersection.check_chain_pair(chain1, chain2, f1, f2, supported1, supported2)
         )
-        if self._verbosity >= 1:
-            outcome = "CONTRADICTION" if res.is_contradiction else {
-                SolverResult.SAT: "intersecting",
-                SolverResult.UNSAT: "disjoint",
-                SolverResult.UNKNOWN: "unknown",
-            }[result]
-            print(f"{prefix}  [{outcome:<13}]")
-        if self._verbosity >= 2:
-            _print_smt_block(smt2)
+        self._print_outcome(prefix, res)
+        if self._verbosity >= 2 and not res.skipped:
+            _print_smt_block(chain_contradiction_smt2(chain1, chain2, f1, f2))
         return res
 
     def find_contradicting_chains(
@@ -258,16 +206,17 @@ class ContradictionChecker:
             print(f"Chain contradiction analysis: {n} chains, {n * (n - 1) // 2} unordered pairs\n")
         results: list[ChainContradictionResult] = []
 
+        supported: list[bool] = [_all_supported(chain) for chain in chains]
         formulas: list[SmtFormula | None] = []
-        for chain in chains:
+        for chain, chain_supported in zip(chains, supported):
             try:
-                formulas.append(chain_to_smt(chain) if _all_supported(chain) else None)
+                formulas.append(chain_to_smt(chain) if chain_supported else None)
             except (UnsupportedTransformError, UnsupportedOperatorError):
                 formulas.append(None)
 
         for i, c1 in enumerate(chains):
             for j, c2 in enumerate(chains[i + 1:], start=i + 1):
-                res = self.check_chain_pair(c1, c2, formulas[i], formulas[j])
+                res = self.check_chain_pair(c1, c2, formulas[i], formulas[j], supported[i], supported[j])
                 if on_result is not None:
                     on_result(res)
                 if include_skipped or not res.skipped:

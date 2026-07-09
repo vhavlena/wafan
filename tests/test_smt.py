@@ -247,7 +247,7 @@ class TestRxRuleToSmt:
             chained=False,
             lineno=1,
         )
-        assert "REQUEST_HEADERS__User_Agent" in rule_to_smt(rule).declarations[0]
+        assert "REQUEST_HEADERS__User_x2d_Agent" in rule_to_smt(rule).declarations[0]
 
     def test_rule_id_preserved(self):
         assert rule_to_smt(make_rule(rule_id="954100")).rule_id == "954100"

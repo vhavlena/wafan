@@ -7,21 +7,34 @@ from typing import Sequence
 from ..parser import SecRule
 from ..smt import (
     _merge_unique,
-    _normalize_operator,
-    _OPERATORS,
+    _operator_builder,
     _restrictable_transform_keys,
     _rules_relevant_codepoints,
     effective_transforms,
     is_supported_operator,
     transform_preamble,
-    UnsupportedOperatorError,
 )
+from .solver import SolverResult
 
 _SMT_SEP = "  " + "-" * 62
 
 
 def _print_smt_block(smt2: str) -> None:
     print(f"  SMT-LIB2:\n{_SMT_SEP}\n{smt2}\n{_SMT_SEP}", flush=True)
+
+
+_INTERSECTION_OUTCOME_LABELS = {
+    SolverResult.SAT: "intersecting",
+    SolverResult.UNSAT: "disjoint",
+    SolverResult.UNKNOWN: "unknown",
+}
+
+
+def intersection_outcome_label(result: SolverResult) -> str:
+    """Human-readable outcome label for a SAT/UNSAT/UNKNOWN solver result in an
+    intersection-shaped analysis (intersection, contradiction): SAT is a
+    non-empty intersection ("intersecting"), UNSAT is disjoint."""
+    return _INTERSECTION_OUTCOME_LABELS[result]
 
 
 def _rule_label(rule: SecRule, pat_width: int = 35) -> str:
@@ -110,14 +123,7 @@ def _operator_assertion(rule: SecRule, var_expr: str) -> str:
     Raises UnsupportedOperatorError if the rule's operator is not supported
     (or, for numeric operators, its argument is not an integer).
     """
-    op_name, op_negated = _normalize_operator(rule.operator)
-    builder = _OPERATORS.get(op_name)
-    if builder is None:
-        raise UnsupportedOperatorError(
-            f"Rule {rule.rule_id}: operator '{rule.operator}' is not supported"
-        )
-    negated = rule.negated or op_negated
-    return builder(var_expr, rule.operator_argument, negated)
+    return _operator_builder(rule)(var_expr)
 
 
 def _joint_transform_preamble(

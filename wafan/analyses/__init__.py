@@ -35,6 +35,7 @@ from .common import (
     chain_support_detail,
     chain_support_status,
     chains_share_variable,
+    intersection_outcome_label,
     rule_disposition,
     rules_share_variable,
 )
@@ -104,4 +105,5 @@ __all__ = [
     "chain_support_detail",
     "rule_disposition",
     "chain_disposition",
+    "intersection_outcome_label",
 ]

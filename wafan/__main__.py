@@ -16,6 +16,7 @@ from .analyses import (
     WitnessChecker,
     chain_disposition,
     chain_support_detail,
+    intersection_outcome_label,
     _chain_label,
 )
 from .parser import group_chains, parse_file
@@ -232,11 +233,7 @@ def _run_subsumption(conf: Path, solver: SubprocessSolver, verbosity: int = 0, a
 
 
 def _intersection_pair_json(res) -> dict:
-    outcome = {
-        SolverResult.SAT: "intersecting",
-        SolverResult.UNSAT: "disjoint",
-        SolverResult.UNKNOWN: "unknown",
-    }[res.result]
+    outcome = intersection_outcome_label(res.result)
     return {
         "chain1": _chain_ids(res.chain1),
         "chain2": _chain_ids(res.chain2),
@@ -309,11 +306,7 @@ def _run_intersection(conf: Path, solver: SubprocessSolver, verbosity: int = 0, 
 
 
 def _contradiction_pair_json(res) -> dict:
-    outcome = {
-        SolverResult.SAT: "intersecting",
-        SolverResult.UNSAT: "disjoint",
-        SolverResult.UNKNOWN: "unknown",
-    }[res.result]
+    outcome = intersection_outcome_label(res.result)
     return {
         "chain1": _chain_ids(res.chain1),
         "chain2": _chain_ids(res.chain2),

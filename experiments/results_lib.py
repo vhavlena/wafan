@@ -88,10 +88,14 @@ _RESULT_TO_OUTCOME = {
 
 def _classify_pair(rec: dict, analysis: str) -> str:
     if rec.get("skipped"):
-        # The reason (unsupported construct, or no shared variable) is
-        # already broken out per-chain in unsupported_details(); pair
-        # outcomes just need a single "skipped" bucket.
-        return "skipped"
+        # "no shared variable" is a pair-level fact with no chain-level
+        # equivalent (unlike unsupported operators/transforms, which are
+        # also broken out per-chain in unsupported_details()), so it gets
+        # its own bucket instead of being collapsed into a generic
+        # "skipped" that would hide it.
+        if rec.get("skip_reason") == "no shared variable":
+            return "skipped: no shared variable"
+        return "skipped: unsupported"
     err = rec.get("error") or ""
     if "timed out" in err:
         return "solver timeout"

@@ -457,12 +457,15 @@ def _smt_var_name(variable: SecRuleVariable) -> str:
     ``variable.part`` may itself be a regex (e.g. ``ARGS:/jform\\[pass\\]/``),
     which can contain characters like ``/[]\\`` that are not valid in an
     unquoted SMT-LIB2 simple symbol. Anything outside ``[A-Za-z0-9_]`` is
-    replaced with ``_`` so the identifier always parses.
+    replaced with its hex codepoint (e.g. ``[`` -> ``_x5b_``) rather than a
+    single ``_``, so two different variable specs that merely differ in
+    which non-alnum characters they contain (e.g. ``ARGS:a.b`` vs
+    ``ARGS:a_b``) can't collide onto the same SMT identifier.
     """
     name = variable.name
     if variable.part:
         name = f"{name}__{variable.part}"
-    return re.sub(r"[^A-Za-z0-9_]", "_", name)
+    return re.sub(r"[^A-Za-z0-9_]", lambda m: f"_x{ord(m.group()):02x}_", name)
 
 
 def _escape_smt_string(pattern: str) -> str:
@@ -658,7 +661,7 @@ def _op_pmfromfile_phrases(rule: SecRule) -> tuple[str, ...]:
     path = _resolve_phrase_file_path(rule)
     try:
         return _read_phrase_file(str(path))
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise UnsupportedOperatorError(
             f"Rule {rule.rule_id}: cannot read @pmFromFile file '{path}': {exc}"
         ) from exc
@@ -717,6 +720,31 @@ def is_supported_operator(operator: str) -> bool:
     return name in _OPERATORS or name in _PHRASE_FILE_OPERATORS
 
 
+def _operator_builder(rule: SecRule) -> Callable[[str], str]:
+    """Return a function ``var_expr -> SMT-LIB2 assertion string`` for *rule*'s operator.
+
+    This is the single dispatch point for turning a rule's operator into an
+    assertion: both the chain path (:func:`rule_to_smt`) and the rule-pair
+    path (``_operator_assertion`` in ``analyses/common.py``) call this, so
+    ``@pmFromFile``/``@pmf`` (which need *rule* itself, not just its operator
+    argument, to resolve and read the phrase file) work identically in both.
+
+    Raises UnsupportedOperatorError if the operator is not supported (or, for
+    numeric operators, its argument is not an integer).
+    """
+    op_name, op_negated = _normalize_operator(rule.operator)
+    negated = rule.negated or op_negated
+    if op_name in _PHRASE_FILE_OPERATORS:
+        phrases = _op_pmfromfile_phrases(rule)
+        return lambda var_expr: _op_pm_phrases(var_expr, phrases, negated)
+    builder = _OPERATORS.get(op_name)
+    if builder is None:
+        raise UnsupportedOperatorError(
+            f"Rule {rule.rule_id}: operator '{rule.operator}' is not supported"
+        )
+    return lambda var_expr: builder(var_expr, rule.operator_argument, negated)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -761,18 +789,8 @@ def rule_to_smt(
             numeric operators) its argument is not an integer.
         UnsupportedTransformError: if a t: action is unknown.
     """
-    op_name, op_negated = _normalize_operator(rule.operator)
-    if op_name in _PHRASE_FILE_OPERATORS:
-        phrases = _op_pmfromfile_phrases(rule)
-        builder = lambda var_expr, argument, negated: _op_pm_phrases(
-            var_expr, phrases, negated
-        )
-    else:
-        builder = _OPERATORS.get(op_name)
-        if builder is None:
-            raise UnsupportedOperatorError(
-                f"Rule {rule.rule_id}: operator '{rule.operator}' is not supported"
-            )
+    op_name, _op_negated = _normalize_operator(rule.operator)
+    assertion_fn = _operator_builder(rule)
 
     if relevant is _UNSET:
         relevant = (
@@ -781,7 +799,6 @@ def rule_to_smt(
             else None
         )
 
-    negated = rule.negated or op_negated
     transforms = effective_transforms(rule)
     if restrictable is _UNSET:
         restrictable = _restrictable_transform_keys([transforms])
@@ -797,7 +814,7 @@ def rule_to_smt(
             declarations.append(f"(declare-const {v} String)")
             seen.add(v)
         var_expr = apply_transforms_smt(v, transforms)
-        assertions.append(builder(var_expr, rule.operator_argument, negated))
+        assertions.append(assertion_fn(var_expr))
 
     assertion = assertions[0] if len(assertions) == 1 else "(or " + " ".join(assertions) + ")"
 
