@@ -10,6 +10,7 @@ WAF rule sets grow large quickly, and subtle interactions between rules are hard
 
 - **Subsumption** — Is every request that triggers rule A also guaranteed to trigger rule B? If so, rule A is redundant given rule B (everything A blocks, B already blocks).
 - **Intersection** — Is there any request that triggers both rules at the same time? Overlapping rules may indicate redundancy or conflicting actions.
+- **Contradiction** — Like intersection, but does it also matter: is there a shared request where one rule accepts (`allow`/`pass`) and the other denies (`deny`/`drop`/`block`)? This flags genuine conflicts, not just harmless overlap.
 - **Witness** — What is a concrete example request that triggers each rule? This lets you verify a rule behaves as intended and generate test cases.
 
 The tool parses the rule file, translates each rule's matching conditions into a logical formula, and asks an SMT solver to find a proof or a counterexample. Results are printed directly to the terminal.
@@ -47,7 +48,7 @@ wafan [options] <conf>
 | Argument | Default | Description |
 |---|---|---|
 | `conf` | *(required)* | Path to the ModSecurity `.conf` file to analyse |
-| `--analysis` | `subsumption` | Which analysis to run: `subsumption`, `intersection`, or `witness` |
+| `--analysis` | `subsumption` | Which analysis to run: `subsumption`, `intersection`, `contradiction`, or `witness` |
 | `--solver PATH` | *(auto)* | Path to the SMT solver binary. Falls back to the `WAFAN_Z3_PATH` environment variable, then an auto-downloaded `z3-noodler` build, then `z3` on `PATH`. |
 | `--no-auto-solver` | off | Disable the automatic `z3-noodler` download; use `--solver`/`WAFAN_Z3_PATH`/`z3` instead |
 | `--solver-args ARGS` | *(none)* | Extra space-separated flags forwarded to the solver |
@@ -99,6 +100,24 @@ Intersecting pairs  (4 found)
   ...
 
 2 pair(s) checked and found disjoint.
+```
+
+### Contradiction
+
+Like intersection, but with an extra check: it only flags a pair if the two rules also disagree on what to do with the shared input — one rule's actions accept it (`allow`/`pass`) while the other's deny it (`deny`/`drop`/`block`). This surfaces genuine conflicts between rules rather than mere harmless overlap.
+
+```bash
+wafan rules/my-rules.conf --solver z3-noodler --analysis contradiction
+```
+
+Example output:
+```
+Contradicting pairs  (1 found)
+
+  ARGS @rx select  [id:1100]  [deny]
+    ⨯  ARGS @rx .+  [id:1450]  [allow]
+
+3 intersecting pair(s) with no action conflict, 2 disjoint pair(s) checked.
 ```
 
 ### Witness
