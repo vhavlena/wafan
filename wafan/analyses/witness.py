@@ -7,7 +7,7 @@ chains of @rx SecRules.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 from ..parser import SecRule, group_chains
 from ..smt import (
@@ -76,6 +76,10 @@ class WitnessResult:
     rule: SecRule
     result: SolverResult
     model: dict[str, str] | None = None
+    skipped: bool = False
+    skip_reason: str = ""
+    elapsed_sec: float = 0.0
+    error: str = ""
 
     @property
     def has_witness(self) -> bool:
@@ -101,6 +105,10 @@ class ChainWitnessResult:
     chain: list[SecRule]
     result: SolverResult
     model: dict[str, str] | None = None
+    skipped: bool = False
+    skip_reason: str = ""
+    elapsed_sec: float = 0.0
+    error: str = ""
 
     @property
     def has_witness(self) -> bool:
@@ -135,14 +143,14 @@ class WitnessChecker:
         if not is_supported_operator(rule.operator):
             if self._verbosity >= 1:
                 print(f"  {label}  [{'skipped':<13}]  (unsupported operator)")
-            return WitnessResult(rule, SolverResult.UNKNOWN)
+            return WitnessResult(rule, SolverResult.UNKNOWN, skipped=True, skip_reason="unsupported operator")
 
         try:
             smt2 = witness_smt2(rule)
         except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"  {label}  [{'skipped':<13}]  (unsupported transform: {exc})")
-            return WitnessResult(rule, SolverResult.UNKNOWN)
+            return WitnessResult(rule, SolverResult.UNKNOWN, skipped=True, skip_reason=str(exc))
 
         result, model = self._solver.solve_with_model(smt2)
 
@@ -156,7 +164,11 @@ class WitnessChecker:
         if self._verbosity >= 2:
             _print_smt_block(smt2)
 
-        return WitnessResult(rule, result, model)
+        return WitnessResult(
+            rule, result, model,
+            elapsed_sec=getattr(self._solver, "last_elapsed_sec", 0.0),
+            error=getattr(self._solver, "last_error_text", "") if result == SolverResult.UNKNOWN else "",
+        )
 
     def find_witnesses(self, rules: Sequence[SecRule]) -> list[WitnessResult]:
         """Return WitnessResults for all @rx / !@rx rules.
@@ -181,14 +193,14 @@ class WitnessChecker:
         if not _all_supported(chain):
             if self._verbosity >= 1:
                 print(f"  {label}  [{'skipped':<13}]  (unsupported operator)")
-            return ChainWitnessResult(chain, SolverResult.UNKNOWN)
+            return ChainWitnessResult(chain, SolverResult.UNKNOWN, skipped=True, skip_reason="unsupported operator")
 
         try:
             smt2 = chain_witness_smt2(chain)
         except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"  {label}  [{'skipped':<13}]  (unsupported transform: {exc})")
-            return ChainWitnessResult(chain, SolverResult.UNKNOWN)
+            return ChainWitnessResult(chain, SolverResult.UNKNOWN, skipped=True, skip_reason=str(exc))
 
         result, model = self._solver.solve_with_model(smt2)
 
@@ -202,17 +214,35 @@ class WitnessChecker:
         if self._verbosity >= 2:
             _print_smt_block(smt2)
 
-        return ChainWitnessResult(chain, result, model)
+        return ChainWitnessResult(
+            chain, result, model,
+            elapsed_sec=getattr(self._solver, "last_elapsed_sec", 0.0),
+            error=getattr(self._solver, "last_error_text", "") if result == SolverResult.UNKNOWN else "",
+        )
 
-    def find_chain_witnesses(self, rules: Sequence[SecRule]) -> list[ChainWitnessResult]:
+    def find_chain_witnesses(
+        self,
+        rules: Sequence[SecRule],
+        on_result: "Callable[[ChainWitnessResult], None] | None" = None,
+    ) -> list[ChainWitnessResult]:
         """Return ChainWitnessResults for all chains of @rx / !@rx rules.
 
         Rules are grouped into chains via group_chains() (a non-chained rule
         forms a chain of its own). Chains where the solver returns UNKNOWN
         are included so callers can distinguish unsatisfiable chains from
         solver failures.
+
+        *on_result*, if given, is called with each ChainWitnessResult as
+        soon as it is computed, before the method returns — so a caller can
+        stream/persist partial progress.
         """
         chains = group_chains(list(rules))
         if self._verbosity >= 1:
             print(f"Chain witness analysis: {len(chains)} chains\n")
-        return [self.check_chain(c) for c in chains]
+        results: list[ChainWitnessResult] = []
+        for chain in chains:
+            res = self.check_chain(chain)
+            if on_result is not None:
+                on_result(res)
+            results.append(res)
+        return results

@@ -8,7 +8,7 @@ input triggering rule1 also triggers rule2).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 from ..parser import SecRule, group_chains
 from ..smt import (
@@ -136,6 +136,9 @@ class SubsumptionResult:
     rule2: SecRule
     result: SolverResult
     skipped: bool = False
+    skip_reason: str = ""
+    elapsed_sec: float = 0.0
+    error: str = ""
 
     @property
     def is_subsumed(self) -> bool:
@@ -150,6 +153,9 @@ class ChainSubsumptionResult:
     chain2: list[SecRule]
     result: SolverResult
     skipped: bool = False
+    skip_reason: str = ""
+    elapsed_sec: float = 0.0
+    error: str = ""
 
     @property
     def is_subsumed(self) -> bool:
@@ -176,14 +182,14 @@ class SubsumptionChecker:
         if not rules_share_variable(rule1, rule2):
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (no shared variable)")
-            return SubsumptionResult(rule1, rule2, SolverResult.UNKNOWN, skipped=True)
+            return SubsumptionResult(rule1, rule2, SolverResult.UNKNOWN, skipped=True, skip_reason="no shared variable")
 
         try:
             smt2 = subsumption_smt2(rule1, rule2)
         except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
-            return SubsumptionResult(rule1, rule2, SolverResult.UNKNOWN, skipped=True)
+            return SubsumptionResult(rule1, rule2, SolverResult.UNKNOWN, skipped=True, skip_reason=str(exc))
 
         result = self._solver.solve(smt2)
         if self._verbosity >= 1:
@@ -195,7 +201,11 @@ class SubsumptionChecker:
             print(f"{prefix}  [{outcome:<12}]")
         if self._verbosity >= 2:
             _print_smt_block(smt2)
-        return SubsumptionResult(rule1, rule2, result)
+        return SubsumptionResult(
+            rule1, rule2, result,
+            elapsed_sec=getattr(self._solver, "last_elapsed_sec", 0.0),
+            error=getattr(self._solver, "last_error_text", "") if result == SolverResult.UNKNOWN else "",
+        )
 
     def find_subsumed(self, rules: Sequence[SecRule]) -> list[SubsumptionResult]:
         """Return all ordered pairs (R1, R2) where R1 is subsumed by R2.
@@ -245,19 +255,19 @@ class SubsumptionChecker:
         if not _all_supported(chain1) or not _all_supported(chain2):
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported operator)")
-            return ChainSubsumptionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True)
+            return ChainSubsumptionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True, skip_reason="unsupported operator")
 
         if not chains_share_variable(chain1, chain2):
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (no shared variable)")
-            return ChainSubsumptionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True)
+            return ChainSubsumptionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True, skip_reason="no shared variable")
 
         try:
             smt2 = chain_subsumption_smt2(chain1, chain2, f1, f2)
         except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
-            return ChainSubsumptionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True)
+            return ChainSubsumptionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True, skip_reason=str(exc))
 
         result = self._solver.solve(smt2)
         if self._verbosity >= 1:
@@ -269,17 +279,34 @@ class SubsumptionChecker:
             print(f"{prefix}  [{outcome:<12}]")
         if self._verbosity >= 2:
             _print_smt_block(smt2)
-        return ChainSubsumptionResult(chain1, chain2, result)
+        return ChainSubsumptionResult(
+            chain1, chain2, result,
+            elapsed_sec=getattr(self._solver, "last_elapsed_sec", 0.0),
+            error=getattr(self._solver, "last_error_text", "") if result == SolverResult.UNKNOWN else "",
+        )
 
-    def find_subsumed_chains(self, rules: Sequence[SecRule]) -> list[ChainSubsumptionResult]:
+    def find_subsumed_chains(
+        self,
+        rules: Sequence[SecRule],
+        include_skipped: bool = False,
+        on_result: "Callable[[ChainSubsumptionResult], None] | None" = None,
+    ) -> list[ChainSubsumptionResult]:
         """Return all ordered pairs of chains where chain1 is subsumed by chain2.
 
         Rules are grouped into chains via group_chains() (a non-chained rule
         forms a chain of its own); only chains whose every link is @rx /
         !@rx are considered. All ordered pairs of distinct chains are
-        checked; pairs skipped due to disjoint variables or unsupported
-        transforms are excluded, but pairs where the solver itself returns
-        UNKNOWN (e.g. timeout) are kept with that result.
+        checked; by default, pairs skipped due to disjoint variables or
+        unsupported transforms are excluded, but pairs where the solver
+        itself returns UNKNOWN (e.g. timeout) are kept with that result. Pass
+        ``include_skipped=True`` to get every checked pair back, including
+        skipped ones (with ``skipped=True`` and ``skip_reason`` set) — e.g.
+        for a detailed machine-readable report.
+
+        *on_result*, if given, is called with each ChainSubsumptionResult
+        (including skipped ones) as soon as it is computed, before the
+        method returns — so a caller can stream/persist partial progress
+        (e.g. to survive being killed partway through a large ruleset).
         """
         chains = group_chains(list(rules))
         n = len(chains)
@@ -299,7 +326,9 @@ class SubsumptionChecker:
                 if i == j:
                     continue
                 res = self.check_chain_pair(c1, c2, formulas[i], formulas[j])
-                if not res.skipped:
+                if on_result is not None:
+                    on_result(res)
+                if include_skipped or not res.skipped:
                     results.append(res)
 
         return results
