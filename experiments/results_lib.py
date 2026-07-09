@@ -120,6 +120,26 @@ def pair_outcome_counts(reports: dict[str, dict]) -> pd.DataFrame:
     return counts.rename_axis(columns=None).reset_index()
 
 
+def violating_pairs(reports: dict[str, dict]) -> pd.DataFrame:
+    """One row per pair record classified as "violates" (the analysis's
+    flagged finding: contradicting rules, intersecting rules, or a subsumed
+    chain) — which rule chains and conf file, for drilling into specifics."""
+    rows = []
+    for rep, analysis, conf, rec in _all_records(reports, "pair"):
+        if _classify_pair(rec, analysis) != "violates":
+            continue
+        row = {
+            "report": rep, "analysis": analysis, "conf": conf,
+            "label": rec.get("label"), "result": rec.get("result"),
+            "chain1": rec.get("chain1"), "chain2": rec.get("chain2"),
+        }
+        if analysis == "contradiction":
+            row["disposition1"] = rec.get("disposition1")
+            row["disposition2"] = rec.get("disposition2")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def pair_records_for(reports: dict[str, dict], path: str, conf: str) -> pd.DataFrame:
     """Full pair/chain record table for a single (report, conf) pair."""
     entry = next(f for f in reports[path]["files"] if f["conf"] == conf)

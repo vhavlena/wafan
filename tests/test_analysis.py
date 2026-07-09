@@ -817,10 +817,13 @@ class TestDisposition:
         r.actions.append(make_action("allow"))
         assert rule_disposition(r) == "allow"
 
-    def test_pass_action_is_allow(self):
+    def test_pass_action_is_unknown(self):
+        # "pass" is ModSecurity's no-op/continue default, not an explicit
+        # allow decision (e.g. paranoia-level skipAfter guards use it purely
+        # for flow control), so it must not be conflated with "allow".
         r = make_rule()
         r.actions.append(make_action("pass"))
-        assert rule_disposition(r) == "allow"
+        assert rule_disposition(r) == "unknown"
 
     def test_no_disruptive_action_is_unknown(self):
         r = make_rule()

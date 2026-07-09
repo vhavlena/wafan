@@ -175,7 +175,7 @@ def chains_share_variable(chain1: Sequence[SecRule], chain2: Sequence[SecRule]) 
 
 
 _DENY_ACTIONS = frozenset({"deny", "drop", "block"})
-_ALLOW_ACTIONS = frozenset({"allow", "pass"})
+_ALLOW_ACTIONS = frozenset({"allow"})
 
 
 def chain_disposition(chain: Sequence[SecRule]) -> str:
@@ -185,6 +185,12 @@ def chain_disposition(chain: Sequence[SecRule]) -> str:
     conventionally placed on its first link, but any link may carry one),
     then falls back to each link's inherited actions (from
     ``SecDefaultAction``) if none of the rule's own actions are conclusive.
+
+    ``pass`` is deliberately not treated as ``"allow"``: it is ModSecurity's
+    no-op/continue default (often used purely for flow control, e.g.
+    ``skipAfter``), not an explicit decision to accept the request. Chains
+    whose only disruptive-adjacent action is ``pass`` are ``"unknown"`` so
+    they aren't paired against a real ``deny`` and flagged as a contradiction.
     """
     for link in chain:
         for action in link.actions:
