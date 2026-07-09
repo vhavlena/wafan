@@ -23,6 +23,7 @@ wafan.egg-info/requires.txt
 wafan.egg-info/top_level.txt
 wafan/analyses/__init__.py
 wafan/analyses/common.py
+wafan/analyses/contradiction.py
 wafan/analyses/intersection.py
 wafan/analyses/solver.py
 wafan/analyses/subsumption.py

@@ -10,6 +10,10 @@ Implemented analyses:
   there exists at least one input that triggers both rules (or chains)
   simultaneously.
 
+  ContradictionChecker – like IntersectionChecker, but additionally requires
+  the two rules (or chains) to disagree on the disruptive action taken for
+  that shared input (one accepts it, the other denies it).
+
   WitnessChecker – finds concrete inputs (models) that trigger a rule or
   chain of rules.
 
@@ -27,8 +31,11 @@ from .common import (
     _rule_label,
     _SMT_SEP,
     _variable_names,
+    chain_disposition,
+    chain_support_detail,
     chain_support_status,
     chains_share_variable,
+    rule_disposition,
     rules_share_variable,
 )
 from .solver import (
@@ -52,6 +59,13 @@ from .intersection import (
     chain_intersection_smt2,
     intersection_smt2,
 )
+from .contradiction import (
+    ChainContradictionResult,
+    ContradictionChecker,
+    ContradictionResult,
+    chain_contradiction_smt2,
+    contradiction_smt2,
+)
 from .witness import (
     ChainWitnessResult,
     WitnessChecker,
@@ -74,6 +88,11 @@ __all__ = [
     "IntersectionChecker",
     "intersection_smt2",
     "chain_intersection_smt2",
+    "ContradictionResult",
+    "ChainContradictionResult",
+    "ContradictionChecker",
+    "contradiction_smt2",
+    "chain_contradiction_smt2",
     "WitnessResult",
     "ChainWitnessResult",
     "WitnessChecker",
@@ -82,4 +101,7 @@ __all__ = [
     "rules_share_variable",
     "chains_share_variable",
     "chain_support_status",
+    "chain_support_detail",
+    "rule_disposition",
+    "chain_disposition",
 ]

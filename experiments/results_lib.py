@@ -43,9 +43,9 @@ def file_summary(reports: dict[str, dict]) -> pd.DataFrame:
 
 def aggregate_stats(files_df: pd.DataFrame) -> pd.DataFrame:
     """Per-report sums of the numeric summary counters (pairs, chains, solver stats)."""
-    num_cols = ["pairs_checked", "pairs_disjoint", "pairs_intersecting", "pairs_unknown",
-                "chains_total", "chains_highlighted", "solver_timeouts", "solver_errors",
-                "unsupported_operator", "unsupported_pattern", "unsupported_transform"]
+    num_cols = ["pairs_checked", "pairs_disjoint", "pairs_intersecting", "pairs_contradicting",
+                "pairs_unknown", "chains_total", "chains_highlighted", "solver_timeouts",
+                "solver_errors", "unsupported_operator", "unsupported_pattern", "unsupported_transform"]
     cols = [c for c in num_cols if c in files_df.columns]
     return files_df.groupby("report")[cols].sum()
 
@@ -55,44 +55,69 @@ def _all_records(reports: dict[str, dict], kind: str):
         for f in r["files"]:
             for rec in f.get("records", []):
                 if rec["kind"] == kind:
-                    yield os.path.basename(p), f["conf"], rec
+                    yield os.path.basename(p), r["analysis"], f["conf"], rec
 
 
 def chain_status_counts(reports: dict[str, dict]) -> pd.DataFrame:
     """Chain-record status counts per report (ok / unsupported_transform / unsupported_operator / ...)."""
     rows = [{"report": rep, "status": rec.get("status") or "unknown"}
-            for rep, _conf, rec in _all_records(reports, "chain")]
+            for rep, _analysis, _conf, rec in _all_records(reports, "chain")]
     if not rows:
         return pd.DataFrame()
     return pd.crosstab(pd.DataFrame(rows)["report"], pd.DataFrame(rows)["status"])
 
 
 def unsupported_details(reports: dict[str, dict]) -> pd.DataFrame:
-    """One row per chain record whose status is not ok, with its label (which feature triggered it)."""
-    rows = [{"report": rep, "conf": conf, "status": rec["status"], "label": rec["label"]}
-            for rep, conf, rec in _all_records(reports, "chain") if rec.get("status") not in (None, "ok")]
+    """One row per chain record whose status is not ok: which feature (status),
+    concretely what's unsupported (detail — e.g. which transform/operator and
+    rule id), and its label."""
+    rows = [{"report": rep, "conf": conf, "status": rec["status"],
+              "detail": rec.get("detail") or "", "label": rec["label"]}
+            for rep, _analysis, conf, rec in _all_records(reports, "chain") if rec.get("status") not in (None, "ok")]
     return pd.DataFrame(rows)
 
 
-def _classify_pair(rec: dict) -> str:
+# Per-analysis mapping from the raw solver "result" to whether that pair is
+# the analysis's highlighted finding ("violates") or a clean pair ("ok").
+# "unknown" (solver returned unknown but didn't error/time out) passes through.
+_RESULT_TO_OUTCOME = {
+    "intersection": {"intersecting": "violates", "disjoint": "ok"},
+    "subsumption": {"subsumed": "violates", "not_subsumed": "ok"},
+}
+
+
+def _classify_pair(rec: dict, analysis: str) -> str:
     if rec.get("skipped"):
-        return "skipped: " + (rec.get("skip_reason") or "unknown reason")
+        # The reason (unsupported construct, or no shared variable) is
+        # already broken out per-chain in unsupported_details(); pair
+        # outcomes just need a single "skipped" bucket.
+        return "skipped"
     err = rec.get("error") or ""
     if "timed out" in err:
         return "solver timeout"
     if err:
         return "solver error"
-    return rec.get("result", "unknown")
+    if analysis == "contradiction":
+        # "disjoint" vs "intersecting" isn't the question contradiction asks:
+        # an intersecting pair with matching disposition is still fine. Only
+        # pairs with an actual accept/deny conflict are a real violation.
+        return "violates" if rec.get("contradiction") else "ok"
+    result = rec.get("result", "unknown")
+    return _RESULT_TO_OUTCOME.get(analysis, {}).get(result, result)
 
 
 def pair_outcome_counts(reports: dict[str, dict]) -> pd.DataFrame:
-    """Pair-record outcome counts per report: disjoint/intersecting/skipped reasons/solver timeouts/errors."""
-    rows = [{"report": rep, "outcome": _classify_pair(rec)}
-            for rep, _conf, rec in _all_records(reports, "pair")]
+    """Pair-record outcome counts per (report, analysis): outcome vocabulary
+    depends on the analysis (contradiction: violates/ok; intersection:
+    disjoint/intersecting; subsumption: subsumed/not_subsumed), plus shared
+    skipped/solver-timeout/solver-error buckets."""
+    rows = [{"report": rep, "analysis": analysis, "outcome": _classify_pair(rec, analysis)}
+            for rep, analysis, _conf, rec in _all_records(reports, "pair")]
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
-    return pd.crosstab(df["report"], df["outcome"])
+    counts = pd.crosstab([df["report"], df["analysis"]], df["outcome"])
+    return counts.rename_axis(columns=None).reset_index()
 
 
 def pair_records_for(reports: dict[str, dict], path: str, conf: str) -> pd.DataFrame:

@@ -12,8 +12,10 @@ from .analyses import (
     SubprocessSolver,
     SubsumptionChecker,
     IntersectionChecker,
+    ContradictionChecker,
     WitnessChecker,
-    chain_support_status,
+    chain_disposition,
+    chain_support_detail,
     _chain_label,
 )
 from .parser import group_chains, parse_file
@@ -50,10 +52,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--analysis",
-        choices=["subsumption", "intersection", "witness"],
+        choices=["subsumption", "intersection", "contradiction", "witness"],
         default="subsumption",
         help="Analysis to run (default: subsumption). "
-             "'witness' finds a concrete input satisfying each rule.",
+             "'witness' finds a concrete input satisfying each rule. "
+             "'contradiction' is like 'intersection' but additionally requires "
+             "the two rules to disagree on accepting/denying the shared input.",
     )
     p.add_argument(
         "--timeout",
@@ -112,9 +116,11 @@ def _chain_ids(chain) -> list:
 def _chain_details(rules: list, emit=None) -> list[dict]:
     """Classify every chain in *rules* by why it can/can't reach the solver.
 
-    Returns one entry per chain: its rule ids, human-readable label, and a
+    Returns one entry per chain: its rule ids, human-readable label, a
     ``status`` of ``ok`` / ``unsupported_operator`` / ``unsupported_transform``
-    / ``unsupported_pattern``. Used for the ``--json`` output so that rule
+    / ``unsupported_pattern``, and a ``detail`` string naming the concrete
+    unsupported construct (e.g. which transform or operator, and on which
+    rule id; empty for ``"ok"``). Used for the ``--json`` output so that rule
     files containing constructs wafan can't model are reported explicitly —
     with which concrete rules are affected — rather than silently dropped
     from the pairwise analysis.
@@ -127,10 +133,12 @@ def _chain_details(rules: list, emit=None) -> list[dict]:
     chains = group_chains(rules)
     details = []
     for chain in chains:
+        status, detail = chain_support_detail(chain)
         entry = {
             "rule_ids": _chain_ids(chain),
             "label": _chain_label(chain, pat_width=50),
-            "status": chain_support_status(chain),
+            "status": status,
+            "detail": detail,
         }
         details.append(entry)
         if emit is not None:
@@ -300,6 +308,91 @@ def _run_intersection(conf: Path, solver: SubprocessSolver, verbosity: int = 0, 
     return 0
 
 
+def _contradiction_pair_json(res) -> dict:
+    outcome = {
+        SolverResult.SAT: "intersecting",
+        SolverResult.UNSAT: "disjoint",
+        SolverResult.UNKNOWN: "unknown",
+    }[res.result]
+    return {
+        "chain1": _chain_ids(res.chain1),
+        "chain2": _chain_ids(res.chain2),
+        "label": f"{_chain_label(res.chain1, pat_width=50)}  ⨯  {_chain_label(res.chain2, pat_width=50)}",
+        "result": outcome,
+        "contradiction": res.is_contradiction,
+        "disposition1": chain_disposition(res.chain1),
+        "disposition2": chain_disposition(res.chain2),
+        "skipped": res.skipped,
+        "skip_reason": res.skip_reason,
+        "elapsed_sec": round(res.elapsed_sec, 3),
+        "error": res.error,
+    }
+
+
+def _run_contradiction(conf: Path, solver: SubprocessSolver, verbosity: int = 0, as_json: bool = False) -> int:
+    start = time.monotonic()
+    rules = parse_file(conf)
+    if verbosity >= 1 and not as_json:
+        print(f"Loaded {len(rules)} rules from {conf}")
+    chain_details = _chain_details(rules, emit=_print_json if as_json else None)
+    support = _chain_support_stats(chain_details)
+    checker = ContradictionChecker(solver, verbosity=0 if as_json else verbosity)
+
+    on_result = (
+        (lambda res: _print_json({"kind": "pair", **_contradiction_pair_json(res)}))
+        if as_json else None
+    )
+    results = checker.find_contradicting_chains(rules, include_skipped=as_json, on_result=on_result)
+
+    checked = [r for r in results if not r.skipped]
+    contradicting = [r for r in checked if r.is_contradiction]
+    intersecting = [r for r in checked if r.result == SolverResult.SAT and not r.is_contradiction]
+    disjoint = [r for r in checked if r.result == SolverResult.UNSAT]
+    unknown = [r for r in checked if r.result == SolverResult.UNKNOWN]
+
+    if as_json:
+        highlighted = set()
+        for res in contradicting:
+            highlighted.add(res.chain1[0].rule_id)
+            highlighted.add(res.chain2[0].rule_id)
+        _print_json({
+            "kind": "summary",
+            "conf": str(conf),
+            "analysis": "contradiction",
+            "rules_total": len(rules),
+            "elapsed_sec": round(time.monotonic() - start, 3),
+            **support,
+            "pairs_checked": len(checked),
+            "pairs_succeeded": len(contradicting) + len(intersecting) + len(disjoint),
+            "pairs_contradicting": len(contradicting),
+            "pairs_intersecting": len(intersecting),
+            "pairs_disjoint": len(disjoint),
+            "pairs_unknown": len(unknown),
+            "chains_highlighted": len(highlighted),
+            "solver_queries": solver.query_count,
+            "solver_timeouts": solver.timeout_count,
+            "solver_errors": solver.error_count,
+        })
+        return 0
+
+    if verbosity >= 1:
+        print(f"\n{_SEP}")
+    if not contradicting:
+        print("No contradicting rule pairs found.")
+    else:
+        print(f"Contradicting pairs  ({len(contradicting)} found)\n")
+        for res in contradicting:
+            print(f"  {_chain_label(res.chain1, pat_width=50)}  [{chain_disposition(res.chain1)}]")
+            print(f"    ⨯  {_chain_label(res.chain2, pat_width=50)}  [{chain_disposition(res.chain2)}]")
+        print(
+            f"\n{len(intersecting)} intersecting pair(s) with no action conflict, "
+            f"{len(disjoint)} disjoint pair(s) checked."
+        )
+    if unknown:
+        print(f"{len(unknown)} pair(s) returned unknown (solver timeout or unknown result).")
+    return 0
+
+
 def _witness_result_json(res) -> dict:
     outcome = {
         SolverResult.SAT: "sat",
@@ -402,6 +495,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_subsumption(args.conf, solver, verbosity=verbosity, as_json=args.json)
     if args.analysis == "intersection":
         return _run_intersection(args.conf, solver, verbosity=verbosity, as_json=args.json)
+    if args.analysis == "contradiction":
+        return _run_contradiction(args.conf, solver, verbosity=verbosity, as_json=args.json)
     if args.analysis == "witness":
         return _run_witness(args.conf, solver, verbosity=verbosity, as_json=args.json)
 

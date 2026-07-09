@@ -52,6 +52,10 @@ class TestArgumentParser:
         args = _build_parser().parse_args([str(REAL_CONF), "--analysis", "intersection"])
         assert args.analysis == "intersection"
 
+    def test_analysis_contradiction(self):
+        args = _build_parser().parse_args([str(REAL_CONF), "--analysis", "contradiction"])
+        assert args.analysis == "contradiction"
+
     def test_invalid_analysis_rejected(self):
         with pytest.raises(SystemExit):
             _build_parser().parse_args([str(REAL_CONF), "--analysis", "unknown"])

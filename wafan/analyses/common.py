@@ -70,24 +70,38 @@ def chain_support_status(chain: Sequence[SecRule]) -> str:
     reporting/statistics purposes (e.g. the ``--json`` summary), independent
     of any particular pairwise analysis.
     """
-    if not _all_supported(chain):
-        return "unsupported_operator"
+    return chain_support_detail(chain)[0]
+
+
+def chain_support_detail(chain: Sequence[SecRule]) -> tuple[str, str]:
+    """Like chain_support_status(), but also return *why*: which operator,
+    transform or pattern construct is unsupported, and on which rule.
+
+    Returns ``(status, detail)`` where ``detail`` is a human-readable
+    explanation naming the offending construct (empty string for ``"ok"``).
+    """
+    unsupported_ops = sorted({
+        f"rule {r.rule_id}: '{r.operator}'" for r in chain if not is_supported_operator(r.operator)
+    })
+    if unsupported_ops:
+        return "unsupported_operator", f"operator not supported: {'; '.join(unsupported_ops)}"
+
     from ..regex_conv import UnsupportedPatternError
     from ..smt import UnsupportedOperatorError, UnsupportedTransformError, chain_to_smt
 
     try:
         chain_to_smt(chain)
-    except UnsupportedTransformError:
-        return "unsupported_transform"
-    except UnsupportedPatternError:
-        return "unsupported_pattern"
-    except UnsupportedOperatorError:
+    except UnsupportedTransformError as exc:
+        return "unsupported_transform", str(exc)
+    except UnsupportedPatternError as exc:
+        return "unsupported_pattern", str(exc)
+    except UnsupportedOperatorError as exc:
         # is_supported_operator() only checks the operator *name*; numeric
         # operators (@eq/@ge/...) can still fail deep in chain_to_smt() if
         # their argument isn't a literal integer (e.g. a ModSecurity
         # macro like %{tx.sampling_percentage}).
-        return "unsupported_operator"
-    return "ok"
+        return "unsupported_operator", str(exc)
+    return "ok", ""
 
 
 def _operator_assertion(rule: SecRule, var_expr: str) -> str:
@@ -158,3 +172,35 @@ def _chain_variable_names(chain: Sequence[SecRule]) -> frozenset[str]:
 def chains_share_variable(chain1: Sequence[SecRule], chain2: Sequence[SecRule]) -> bool:
     """True if any link of chain1 and any link of chain2 target a common variable."""
     return bool(_chain_variable_names(chain1) & _chain_variable_names(chain2))
+
+
+_DENY_ACTIONS = frozenset({"deny", "drop", "block"})
+_ALLOW_ACTIONS = frozenset({"allow", "pass"})
+
+
+def chain_disposition(chain: Sequence[SecRule]) -> str:
+    """Classify a chain's disruptive action as ``"deny"``, ``"allow"`` or ``"unknown"``.
+
+    Scans every link's own actions first (a chain's disruptive action is
+    conventionally placed on its first link, but any link may carry one),
+    then falls back to each link's inherited actions (from
+    ``SecDefaultAction``) if none of the rule's own actions are conclusive.
+    """
+    for link in chain:
+        for action in link.actions:
+            if action.name in _DENY_ACTIONS:
+                return "deny"
+            if action.name in _ALLOW_ACTIONS:
+                return "allow"
+    for link in chain:
+        for action in link.inherited_actions:
+            if action.name in _DENY_ACTIONS:
+                return "deny"
+            if action.name in _ALLOW_ACTIONS:
+                return "allow"
+    return "unknown"
+
+
+def rule_disposition(rule: SecRule) -> str:
+    """Classify a single rule's disruptive action; see chain_disposition()."""
+    return chain_disposition([rule])
