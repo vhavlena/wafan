@@ -9,6 +9,11 @@ Supported operators (see _OPERATORS / is_supported_operator):
   @endsWith    – suffix match (str.suffixof)
   @within      – input is a substring of one of a space-separated list of values
   @pm          – any of a space-separated list of phrases is a substring of the input
+  @pmFromFile  – like @pm, but phrases are read one-per-line from a file (alias
+                 @pmf); '#'-prefixed and blank lines are skipped, matching
+                 ModSecurity's .data file format. Relative paths are resolved
+                 against the directory of the .conf file the rule was parsed
+                 from (see SecRule.source_path / wafan.parser.parse_file).
   @eq/@ge/@gt/@le/@lt – numeric comparison of (str.to_int input) against an
                  integer argument; the argument must be a literal integer
                  (macro expansions and floats are not supported and raise
@@ -53,6 +58,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from .parser import SecRule, SecRuleAction, SecRuleVariable
@@ -580,14 +586,66 @@ def _op_within(var_expr: str, argument: str, negated: bool) -> str:
     return _wrap_negated(_disjunction(atoms), negated)
 
 
+def _op_pm_phrases(var_expr: str, phrases: Sequence[str], negated: bool) -> str:
+    atoms = [
+        f'(str.contains {var_expr} "{_escape_smt_string(v)}")'
+        for v in phrases
+    ]
+    return _wrap_negated(_disjunction(atoms), negated)
+
+
 def _op_pm(var_expr: str, argument: str, negated: bool) -> str:
     # @pm: matches if any of the space-separated phrases is a substring of
     # var_expr.
-    atoms = [
-        f'(str.contains {var_expr} "{_escape_smt_string(v)}")'
-        for v in argument.split()
-    ]
-    return _wrap_negated(_disjunction(atoms), negated)
+    return _op_pm_phrases(var_expr, argument.split(), negated)
+
+
+# ---------------------------------------------------------------------------
+# @pmFromFile / @pmf
+# ---------------------------------------------------------------------------
+
+_PHRASE_FILE_OPERATORS = {"pmfromfile", "pmf"}
+
+
+@lru_cache(maxsize=128)
+def _read_phrase_file(path: str) -> tuple[str, ...]:
+    """Read a ModSecurity phrase-list ``.data`` file for ``@pmFromFile``.
+
+    One phrase per line; blank lines and lines starting with ``#`` are
+    comments and are skipped, mirroring ModSecurity's own ``.data`` file
+    format (see e.g. ``owasp-rules/*.data``). Unlike ``@pm``, phrases are not
+    further split on whitespace, since a line may itself contain spaces.
+    """
+    phrases = []
+    for line in Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        phrases.append(line)
+    return tuple(phrases)
+
+
+def _resolve_phrase_file_path(rule: SecRule) -> Path:
+    """Resolve a ``@pmFromFile`` argument to a filesystem path.
+
+    Relative arguments are resolved against the directory of the ``.conf``
+    file the rule was parsed from, matching ModSecurity's own resolution of
+    relative data-file paths.
+    """
+    path = Path(rule.operator_argument.strip())
+    if not path.is_absolute() and rule.source_path is not None:
+        path = rule.source_path.parent / path
+    return path
+
+
+def _op_pmfromfile_phrases(rule: SecRule) -> tuple[str, ...]:
+    path = _resolve_phrase_file_path(rule)
+    try:
+        return _read_phrase_file(str(path))
+    except OSError as exc:
+        raise UnsupportedOperatorError(
+            f"Rule {rule.rule_id}: cannot read @pmFromFile file '{path}': {exc}"
+        ) from exc
 
 
 _NUMERIC_OPS = {"eq": "=", "ge": ">=", "gt": ">", "le": "<=", "lt": "<"}
@@ -640,7 +698,7 @@ def _normalize_operator(operator: str) -> tuple[str, bool]:
 def is_supported_operator(operator: str) -> bool:
     """True if *operator* (with optional leading ``!``/``@``) can be converted to SMT."""
     name, _ = _normalize_operator(operator)
-    return name in _OPERATORS
+    return name in _OPERATORS or name in _PHRASE_FILE_OPERATORS
 
 
 # ---------------------------------------------------------------------------
@@ -665,7 +723,8 @@ def rule_to_smt(
     variables produce a disjunctive assertion.
 
     Supported operators: @rx, @streq, @contains, @beginsWith, @endsWith,
-    @within, @pm, @eq, @ge, @gt, @le, @lt (each with optional ``!`` negation).
+    @within, @pm, @pmFromFile (alias @pmf), @eq, @ge, @gt, @le, @lt (each
+    with optional ``!`` negation).
 
     *relevant*, if given, overrides the codepoint set used to trim transform
     declarations (see :func:`transform_preamble`); this is used by
@@ -687,11 +746,17 @@ def rule_to_smt(
         UnsupportedTransformError: if a t: action is unknown.
     """
     op_name, op_negated = _normalize_operator(rule.operator)
-    builder = _OPERATORS.get(op_name)
-    if builder is None:
-        raise UnsupportedOperatorError(
-            f"Rule {rule.rule_id}: operator '{rule.operator}' is not supported"
+    if op_name in _PHRASE_FILE_OPERATORS:
+        phrases = _op_pmfromfile_phrases(rule)
+        builder = lambda var_expr, argument, negated: _op_pm_phrases(
+            var_expr, phrases, negated
         )
+    else:
+        builder = _OPERATORS.get(op_name)
+        if builder is None:
+            raise UnsupportedOperatorError(
+                f"Rule {rule.rule_id}: operator '{rule.operator}' is not supported"
+            )
 
     if relevant is _UNSET:
         relevant = (
