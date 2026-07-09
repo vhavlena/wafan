@@ -87,10 +87,14 @@ def _parse_action_string(spec: str) -> list[SecRuleAction]:
 
 def _to_secrule(raw: dict[str, Any], source_path: Path | None = None) -> SecRule:
     actions = [_parse_action(a) for a in raw.get("actions", [])]
+    # ModSecurity defaults to @rx when a rule's operator is omitted (a bare
+    # regex pattern, e.g. `SecRule FILES "\.php$"`); msc_pyparser reports this
+    # case as an empty operator string rather than filling in "@rx" itself.
+    operator = raw.get("operator", "") or "@rx"
     return SecRule(
         rule_id=_extract_rule_id(raw.get("actions", [])),
         variables=[_parse_variable(v) for v in raw.get("variables", [])],
-        operator=raw.get("operator", ""),
+        operator=operator,
         operator_argument=raw.get("operator_argument", ""),
         negated=raw.get("operator_negated", False),
         actions=actions,

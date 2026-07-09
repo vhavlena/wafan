@@ -56,6 +56,7 @@ Transforms not listed above raise UnsupportedTransformError.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -451,11 +452,17 @@ def transform_preamble(
 # ---------------------------------------------------------------------------
 
 def _smt_var_name(variable: SecRuleVariable) -> str:
-    """Produce a sanitised SMT identifier for a ModSecurity variable."""
+    """Produce a sanitised SMT identifier for a ModSecurity variable.
+
+    ``variable.part`` may itself be a regex (e.g. ``ARGS:/jform\\[pass\\]/``),
+    which can contain characters like ``/[]\\`` that are not valid in an
+    unquoted SMT-LIB2 simple symbol. Anything outside ``[A-Za-z0-9_]`` is
+    replaced with ``_`` so the identifier always parses.
+    """
     name = variable.name
     if variable.part:
         name = f"{name}__{variable.part}"
-    return name.replace("-", "_").replace(".", "_").replace(":", "_")
+    return re.sub(r"[^A-Za-z0-9_]", "_", name)
 
 
 def _escape_smt_string(pattern: str) -> str:
