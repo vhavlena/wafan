@@ -7,6 +7,7 @@ from wafan.parser import parse_file, parse_rx_rules, SecRule, SecRuleVariable, S
 from wafan.smt import (
     rule_to_smt,
     rules_to_smt,
+    chain_to_smt,
     extract_transforms,
     apply_transforms_smt,
     transform_preamble,
@@ -396,7 +397,6 @@ class TestNumericOperators:
 # ---------------------------------------------------------------------------
 
 UNINTERPRETED = [
-    "urlDecodeUni",
     "removeWhitespace", "compressWhitespace", "removeNulls",
     "trim", "trimLeft", "trimRight",
     "normalizePath", "normalizePathWin",
@@ -517,9 +517,88 @@ class TestTransformPreamble:
         pct41_re = '(str.to_re "4") (str.to_re "1")'
         assert decl.index(pct41_re) < pos_25
 
+    def test_urldecodeuni_define_fun_no_axioms(self):
+        # Unrestricted urlDecodeUni enumerates ~65k passes and is impractical
+        # to build in a unit test, so always pass a small `relevant` set.
+        fun_decls, axioms = transform_preamble(["urlDecodeUni"], relevant={0x41, 0x20})
+        assert len(fun_decls) == 1
+        assert fun_decls[0].startswith("(define-fun t_urlDecodeUni ((s String)) String")
+        assert axioms == []
+
+    def test_urldecodeuni_relevant_restricts_passes(self):
+        fun_decls, _ = transform_preamble(["urlDecodeUni"], relevant={0x41})
+        decl = fun_decls[0]
+        assert '"\\u{41}"' in decl
+        assert '"\\u{42}"' not in decl
+
+    def test_urldecodeuni_relevant_restricts_fullwidth_pass(self):
+        # Full-width 'A' (U+FF21) decodes to ASCII 'A' (0x41).
+        with_a = transform_preamble(["urlDecodeUni"], relevant={0x41})[0][0]
+        without_a = transform_preamble(["urlDecodeUni"], relevant={0x42})[0][0]
+        assert '"\\u{ff21}"' in with_a
+        assert '"\\u{ff21}"' not in without_a
+
+    def test_repeated_identical_call_hits_declaration_cache(self):
+        # Building a transform's declaration (especially the unrestricted
+        # urlDecodeUni body) is expensive; repeated calls with the exact same
+        # (transform, relevant) pair — e.g. one per pairwise intersection /
+        # subsumption comparison sharing the same transform — must reuse the
+        # cached result instead of rebuilding it every time.
+        from wafan.smt import _cached_restricted_fun_decl
+
+        _cached_restricted_fun_decl.cache_clear()
+        d1 = transform_preamble(["urlDecode"], relevant={0x41})[0][0]
+        hits_before = _cached_restricted_fun_decl.cache_info().hits
+        d2 = transform_preamble(["urlDecode"], relevant={0x41})[0][0]
+        assert d1 == d2
+        assert _cached_restricted_fun_decl.cache_info().hits == hits_before + 1
+
+    def test_repeated_unrestricted_call_hits_declaration_cache(self):
+        # The unrestricted (relevant=None) declaration is cached separately
+        # from restricted variants so it can't be evicted by the flood of
+        # distinct per-pair restricted requests (see
+        # _cached_unrestricted_fun_decl vs. _cached_restricted_fun_decl).
+        from wafan.smt import _cached_unrestricted_fun_decl
+
+        _cached_unrestricted_fun_decl.cache_clear()
+        d1 = transform_preamble(["urlDecode"])[0][0]
+        hits_before = _cached_unrestricted_fun_decl.cache_info().hits
+        d2 = transform_preamble(["urlDecode"])[0][0]
+        assert d1 == d2
+        assert _cached_unrestricted_fun_decl.cache_info().hits == hits_before + 1
+
     def test_unknown_raises(self):
         with pytest.raises(UnsupportedTransformError):
             transform_preamble(["__unknown__"])
+
+    def test_repeated_transform_not_last_keeps_full_declaration(self):
+        # "urlDecode" appears twice: once not-last (its output feeds the
+        # second urlDecode), once last. Since both occurrences share the same
+        # SMT symbol, restricting the last one to `relevant` would silently
+        # narrow behaviour needed by the earlier (non-last) occurrence too, so
+        # neither may be restricted — the full declaration must be returned.
+        fun_decls, _ = transform_preamble(
+            ["urlDecode", "urlDecode"], relevant={0x41}
+        )
+        assert len(fun_decls) == 1
+        assert fun_decls[0].count("str.replace_re_all") == 256
+
+    def test_restrictable_excludes_key_from_restriction(self):
+        # Even though "urlDecode" is the last (only) transform here, passing
+        # restrictable=set() (as chain_to_smt does when a transform is unsafe
+        # to restrict across links) must force the full declaration.
+        fun_decls, _ = transform_preamble(
+            ["urlDecode"], relevant={0x41}, restrictable=set()
+        )
+        assert fun_decls[0].count("str.replace_re_all") == 256
+
+    def test_restrictable_none_keeps_prior_behaviour(self):
+        # Default restrictable=None must behave exactly as before this
+        # parameter existed: the last transform is restricted.
+        fun_decls, _ = transform_preamble(["urlDecode"], relevant={0x41})
+        decl = fun_decls[0]
+        assert '"\\u{41}"' in decl
+        assert '"\\u{42}"' not in decl
 
     # Specific axiom content checks
     def test_removewhitespace_no_space_axiom(self):
@@ -593,6 +672,18 @@ class TestSmtFormulaWithPreamble:
         assert f.axioms == []
         assert "(t_htmlEntityDecode BODY)" in f.assertion
 
+    def test_urldecodeuni_restricted_to_rx_pattern_codepoints(self):
+        # rule_to_smt derives `relevant` from the rule's own @rx pattern, so
+        # a narrow pattern like "A" keeps the urlDecodeUni declaration small
+        # instead of enumerating all ~65k codepoints.
+        rule = make_rule(var_name="BODY", pattern="A", transforms=["urlDecodeUni"])
+        f = rule_to_smt(rule)
+        assert len(f.fun_declarations) == 1
+        decl = f.fun_declarations[0]
+        assert decl.startswith("(define-fun t_urlDecodeUni")
+        assert '"\\u{41}"' in decl
+        assert '"\\u{42}"' not in decl
+
     @pytest.mark.parametrize("t", UNINTERPRETED)
     def test_all_uninterpreted_produce_well_formed_smt2(self, t):
         rule = make_rule(var_name="BODY", pattern="test", transforms=[t])
@@ -619,3 +710,38 @@ class TestRulesToSmt:
             assert "(declare-const" in smt2
             assert "(assert" in smt2
             assert "(check-sat)" in smt2
+
+
+class TestChainToSmt:
+    def test_shared_transform_gets_single_consistent_declaration(self):
+        # Link 1 uses "urlDecode" as a non-last transform (its output feeds
+        # "uppercase"), so it needs the full, unrestricted declaration. Link
+        # 2 uses "urlDecode" alone, where it would normally be eligible for
+        # restriction to the link's own narrow @rx pattern. Since both links
+        # share the same "t_urlDecode" SMT symbol, the merged formula must
+        # declare it exactly once, with the full (safe) body — never two
+        # conflicting declarations of the same function name.
+        link1 = make_rule(rule_id="1", pattern="XYZ", transforms=["urlDecode", "uppercase"])
+        link2 = make_rule(rule_id="1", pattern="A", transforms=["urlDecode"])
+        formula = chain_to_smt([link1, link2])
+
+        url_decode_decls = [
+            d for d in formula.fun_declarations if d.startswith("(define-fun t_urlDecode ")
+        ]
+        assert len(url_decode_decls) == 1
+        # Full declaration: every %XX pass (0-255) must be present, not just
+        # the ones relevant to link2's narrow pattern.
+        assert url_decode_decls[0].count("str.replace_re_all") == 256
+
+    def test_transform_last_in_every_link_still_restricted(self):
+        # When a transform is genuinely the last transform in every link that
+        # uses it, restriction is still safe and should still happen.
+        link1 = make_rule(rule_id="1", pattern="A", transforms=["urlDecode"])
+        link2 = make_rule(rule_id="1", pattern="B", transforms=["urlDecode"])
+        formula = chain_to_smt([link1, link2])
+
+        url_decode_decls = [
+            d for d in formula.fun_declarations if d.startswith("(define-fun t_urlDecode ")
+        ]
+        assert len(url_decode_decls) == 1
+        assert url_decode_decls[0].count("str.replace_re_all") < 256

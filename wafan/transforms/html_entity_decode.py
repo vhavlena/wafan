@@ -45,6 +45,13 @@ Known limitations (documented, not modelled):
     decodes to '<', yielding '<;' instead of '&lt;'. A fully faithful
     single-pass scan requires a non-recursive string theory this z3 build
     does not provide.
+
+``html_entity_decode_fun_decl`` accepts an optional ``relevant`` set of
+codepoints (see :mod:`wafan.regex_alphabet`): when given, a pass is only
+emitted if the byte value it decodes to is a member of it. Passes are
+otherwise emitted in the same relative order as the unrestricted case, so
+the pass-ordering rules above still apply to whatever subset is retained.
+``relevant=None`` (the default) keeps every byte, i.e. today's behaviour.
 """
 
 from __future__ import annotations
@@ -96,24 +103,37 @@ def _bytes_amp_last() -> list[int]:
     return [v for v in range(256) if v != 0x26] + [0x26]
 
 
-def html_entity_decode_fun_decl() -> str:
-    """Return the (define-fun t_htmlEntityDecode ...) SMT-LIB2 declaration."""
+def html_entity_decode_fun_decl(relevant: "set[int] | None" = None) -> str:
+    """Return the (define-fun t_htmlEntityDecode ...) SMT-LIB2 declaration.
+
+    If *relevant* is given, only emit a pass whose decoded byte value is a
+    member of it (see module docstring).
+    """
     body = "s"
+
+    def _keep(v: int) -> bool:
+        return relevant is None or v in relevant
 
     # --- Group 1: forms WITH trailing ';' ---
 
     # (a) Named entities WITH ';' — amp is last in _HTML_NAMED_ENTITIES
     for name, val in _HTML_NAMED_ENTITIES:
+        if not _keep(val):
+            continue
         body = f'(str.replace_all {body} "&{name};" "{_smt_char_literal(val)}")'
 
     # (b) Decimal numeric WITH ';': &#0?DEC;
     # The ';' terminator prevents prefix-overlap, so any order is correct.
     for v in _bytes_amp_last():
+        if not _keep(v):
+            continue
         body = (f'(str.replace_re_all {body} {_dec_entity_re(v, semi=True)}'
                 f' "{_smt_char_literal(v)}")')
 
     # (c) Hex numeric WITH ';': &#[xX]0?HH; — covers x/X and letter-case variants
     for v in _bytes_amp_last():
+        if not _keep(v):
+            continue
         body = (f'(str.replace_re_all {body} {_hex_entity_re(v, semi=True)}'
                 f' "{_smt_char_literal(v)}")')
 
@@ -132,6 +152,8 @@ def html_entity_decode_fun_decl() -> str:
         return (hi == 0, v == 0, v == 0x26)
 
     for v in sorted(range(256), key=_hex_nosemi_key):
+        if not _keep(v):
+            continue
         body = (f'(str.replace_re_all {body} {_hex_entity_re(v, semi=False)}'
                 f' "{_smt_char_literal(v)}")')
 
@@ -146,14 +168,15 @@ def html_entity_decode_fun_decl() -> str:
         return (-len(str(v)), v == 0, v == 0x26)
 
     for v in sorted(range(256), key=_dec_nosemi_key):
+        if not _keep(v):
+            continue
         body = (f'(str.replace_re_all {body} {_dec_entity_re(v, semi=False)}'
                 f' "{_smt_char_literal(v)}")')
 
     # (f) Named entities WITHOUT ';' — amp is last in _HTML_NAMED_ENTITIES
     for name, val in _HTML_NAMED_ENTITIES:
+        if not _keep(val):
+            continue
         body = f'(str.replace_all {body} "&{name}" "{_smt_char_literal(val)}")'
 
     return f"(define-fun t_htmlEntityDecode ((s String)) String {body})"
-
-
-HTML_ENTITY_DECODE_FUN_DECL = html_entity_decode_fun_decl()

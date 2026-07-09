@@ -34,6 +34,19 @@ Pass ordering
   are emitted as-is without re-scanning). This edge case is structurally
   identical to the '&amp;lt;' → '<;' limitation in htmlEntityDecode and is
   accepted as an unavoidable consequence of the multi-pass model.
+
+``url_decode_uni_fun_decl`` accepts an optional ``relevant`` set of codepoints
+(see :mod:`wafan.regex_alphabet`): when given, a pass is only emitted if the
+codepoint it decodes to (a byte 0-255 for '+'/'%XX', a BMP codepoint for
+'%uXXXX', or the target ASCII codepoint for the full-width mapping) is a
+member of it. Passes are otherwise emitted in the same relative order as the
+unrestricted case, so the pass-ordering rules above still apply to whatever
+subset is retained. ``relevant=None`` (the default) keeps every codepoint —
+the full ~65 887-pass, ~13 MB declaration, which takes ~15 s to build and is
+impractical for solving. Restricting to the codepoints an ``@rx`` pattern
+actually matches against typically keeps the retained set small, making the
+declaration practical to build and solve — this is what :func:`wafan.smt.rule_to_smt`
+does automatically for rules that use ``urlDecodeUni``.
 """
 
 from __future__ import annotations
@@ -61,11 +74,14 @@ def _percent_u_re(codepoint: int) -> str:
     return f'(re.++ (str.to_re "%") {_U_RE} {n1} {n2} {n3} {n4})'
 
 
-def url_decode_uni_fun_decl() -> str:
-    """Return the (define-fun t_urlDecodeUni ...) SMT-LIB2 declaration."""
+def url_decode_uni_fun_decl(relevant: "set[int] | None" = None) -> str:
+    """Return the (define-fun t_urlDecodeUni ...) SMT-LIB2 declaration.
+
+    See the module docstring for the meaning of *relevant*.
+    """
 
     # --- Group 1: standard urlDecode passes (shared with url_decode.py) ---
-    body = _url_decode_body("s")
+    body = _url_decode_body("s", relevant)
 
     # --- Group 2: IIS '%uXXXX' Unicode decoding ---
     # Runs after '%XX' so that '%u002541' → '%41' (not 'A'): '%u0025' decodes
@@ -76,26 +92,24 @@ def url_decode_uni_fun_decl() -> str:
     for cp in range(0x10000):
         if cp == 0x0025:
             continue
+        if relevant is not None and cp not in relevant:
+            continue
         body = (f'(str.replace_re_all {body} {_percent_u_re(cp)}'
                 f' "{_smt_char_unicode(cp)}")')
 
     # Last '%uXXXX' pass: U+0025 → '%'
-    body = (f'(str.replace_re_all {body} {_percent_u_re(0x0025)}'
-            f' "{_smt_char_unicode(0x0025)}")')
+    if relevant is None or 0x0025 in relevant:
+        body = (f'(str.replace_re_all {body} {_percent_u_re(0x0025)}'
+                f' "{_smt_char_unicode(0x0025)}")')
 
     # --- Group 3: full-width ASCII best-fit mapping ---
     # U+FF01–U+FF5E → U+0021–U+007E (94 characters)
     for i in range(_FULLWIDTH_LAST - _FULLWIDTH_FIRST + 1):
         fw      = _FULLWIDTH_FIRST + i
         ascii_cp = _ASCII_FIRST + i
+        if relevant is not None and ascii_cp not in relevant:
+            continue
         body = (f'(str.replace_all {body} "{_smt_char_unicode(fw)}"'
                 f' "{_smt_char_unicode(ascii_cp)}")')
 
     return f"(define-fun t_urlDecodeUni ((s String)) String {body})"
-
-
-# NOTE: Not computed at import time — calling url_decode_uni_fun_decl() takes
-# ~15 s and produces a ~13 MB declaration with 65 887 passes.  The resulting
-# SMT formula is too large for practical solver use; urlDecodeUni is therefore
-# kept as an uninterpreted function with axioms in smt.py.  This module exists
-# to demonstrate that the exact define-fun model is achievable in principle.

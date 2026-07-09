@@ -241,6 +241,18 @@ class TestSubsumptionSmt2:
         with pytest.raises(UnsupportedTransformError):
             subsumption_smt2(r1, r2)
 
+    def test_shared_transform_gets_single_declaration(self):
+        # Same concern as intersection_smt2: a shared transform restricted
+        # differently by each rule's own pattern must still collapse to one
+        # consistent declaration, sized to the union of both patterns.
+        r1 = make_rule(rule_id="1", pattern="A", transforms=["urlDecode"])
+        r2 = make_rule(rule_id="2", pattern="Z", transforms=["urlDecode"])
+        smt2 = subsumption_smt2(r1, r2)
+        decls = _re.findall(r"\(define-fun t_urlDecode .*", smt2)
+        assert len(decls) == 1
+        assert '"\\u{41}"' in decls[0]
+        assert '"\\u{5a}"' in decls[0]
+
 
 # ---------------------------------------------------------------------------
 # rules_share_variable
@@ -577,6 +589,20 @@ class TestIntersectionSmt2:
         r2 = make_rule(rule_id="22")
         smt2 = intersection_smt2(r1, r2)
         assert "11" in smt2 and "22" in smt2
+
+    def test_shared_transform_gets_single_declaration(self):
+        # Both rules restrict a shared transform (urlDecode) to their own
+        # narrow @rx pattern; the merged script must declare "t_urlDecode"
+        # exactly once, using the union of both patterns' codepoints, not two
+        # conflicting declarations for the same SMT symbol.
+        r1 = make_rule(rule_id="1", pattern="A", transforms=["urlDecode"])
+        r2 = make_rule(rule_id="2", pattern="Z", transforms=["urlDecode"])
+        smt2 = intersection_smt2(r1, r2)
+        decls = _re.findall(r"\(define-fun t_urlDecode .*", smt2)
+        assert len(decls) == 1
+        # Union: passes for both 'A' (0x41) and 'Z' (0x5a) must be present.
+        assert '"\\u{41}"' in decls[0]
+        assert '"\\u{5a}"' in decls[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1130,6 +1156,44 @@ class TestChainSubsumptionAndIntersectionSmt2:
         smt2 = chain_intersection_smt2(chain1, chain2)
         assert smt2.count("(declare-const ARGS String)") == 1
         assert "(declare-const REQUEST_HEADERS String)" in smt2
+
+    def test_intersection_shared_transform_gets_single_declaration(self):
+        # chain1 and chain2 each independently restrict "urlDecode" to their
+        # own @rx pattern's codepoints; merged, the query must declare
+        # "t_urlDecode" exactly once, sized to the union of both patterns —
+        # not two differently-restricted declarations of the same symbol.
+        chain1 = [make_rule(rule_id="1", pattern="A", transforms=["urlDecode"])]
+        chain2 = [make_rule(rule_id="2", pattern="Z", transforms=["urlDecode"])]
+        smt2 = chain_intersection_smt2(chain1, chain2)
+        decls = _re.findall(r"\(define-fun t_urlDecode .*", smt2)
+        assert len(decls) == 1
+        assert '"\\u{41}"' in decls[0]
+        assert '"\\u{5a}"' in decls[0]
+
+    def test_subsumption_shared_transform_gets_single_declaration(self):
+        chain1 = [make_rule(rule_id="1", pattern="A", transforms=["urlDecode"])]
+        chain2 = [make_rule(rule_id="2", pattern="Z", transforms=["urlDecode"])]
+        smt2 = chain_subsumption_smt2(chain1, chain2)
+        decls = _re.findall(r"\(define-fun t_urlDecode .*", smt2)
+        assert len(decls) == 1
+        assert '"\\u{41}"' in decls[0]
+        assert '"\\u{5a}"' in decls[0]
+
+    def test_precomputed_formulas_still_get_joint_restriction(self):
+        # The f1/f2 precomputed-formula fast path (used when reusing
+        # chain_to_smt results across many pairwise comparisons) must not
+        # bypass the joint restriction: each chain's own chain_to_smt() call
+        # restricts urlDecode to its own narrow pattern, but the pairwise
+        # query must still recompute a single, union-sized declaration.
+        chain1 = [make_rule(rule_id="1", pattern="A", transforms=["urlDecode"])]
+        chain2 = [make_rule(rule_id="2", pattern="Z", transforms=["urlDecode"])]
+        f1 = chain_to_smt(chain1)
+        f2 = chain_to_smt(chain2)
+        smt2 = chain_intersection_smt2(chain1, chain2, f1, f2)
+        decls = _re.findall(r"\(define-fun t_urlDecode .*", smt2)
+        assert len(decls) == 1
+        assert '"\\u{41}"' in decls[0]
+        assert '"\\u{5a}"' in decls[0]
 
 
 class TestSubsumptionCheckerChainPair:

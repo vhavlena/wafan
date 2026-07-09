@@ -52,12 +52,15 @@ Transforms not listed above raise UnsupportedTransformError.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Sequence
+from functools import lru_cache
+from typing import Callable, Optional, Sequence
 
 from .parser import SecRule, SecRuleAction, SecRuleVariable
+from .regex_alphabet import extract_relevant_codepoints_precise
 from .regex_conv import UnsupportedPatternError, pcre_to_ecma2020
-from .transforms.html_entity_decode import HTML_ENTITY_DECODE_FUN_DECL
-from .transforms.url_decode import URL_DECODE_FUN_DECL
+from .transforms.html_entity_decode import html_entity_decode_fun_decl
+from .transforms.url_decode import url_decode_fun_decl
+from .transforms.url_decode_uni import url_decode_uni_fun_decl
 
 
 SMT_LOGIC = "QF_SLIA"
@@ -73,9 +76,19 @@ class _TransformDef:
     smt_fn: str           # SMT function name, e.g. "str.lower"; empty = direct inline
     fun_decl: str = ""    # (declare-fun …) line; empty for built-in SMT functions
     axioms: tuple[str, ...] = ()
+    # For transforms whose (define-fun …) body enumerates one replace pass per
+    # relevant codepoint (urlDecode, htmlEntityDecode): a callable that builds
+    # the declaration, optionally restricted to a set of codepoints. None for
+    # transforms with a fixed (or no) declaration.
+    fun_decl_builder: Optional[Callable[[Optional[set[int]]], str]] = None
 
     def apply(self, expr: str) -> str:
         return f"({self.smt_fn} {expr})"
+
+    def build_fun_decl(self, relevant: Optional[set[int]]) -> str:
+        if self.fun_decl_builder is not None:
+            return self.fun_decl_builder(relevant)
+        return self.fun_decl
 
 
 def _uninterpreted(name: str, *axioms: str) -> _TransformDef:
@@ -173,13 +186,11 @@ _TRANSFORMS: dict[str, _TransformDef] = {
     "uppercase":  _TransformDef(smt_fn="str.to_upper"),
     # --- uninterpreted functions ---
     "urldecode":         _TransformDef(smt_fn="t_urlDecode",
-                                       fun_decl=URL_DECODE_FUN_DECL),
-    "urldecodeuni":      _uninterpreted("t_urlDecodeUni",
-                             _len_le("t_urlDecodeUni"),
-                             _empty_fixed("t_urlDecodeUni"),
-                         ),
+                                       fun_decl_builder=url_decode_fun_decl),
+    "urldecodeuni":      _TransformDef(smt_fn="t_urlDecodeUni",
+                                       fun_decl_builder=url_decode_uni_fun_decl),
     "htmlentitydecode":  _TransformDef(smt_fn="t_htmlEntityDecode",
-                                        fun_decl=HTML_ENTITY_DECODE_FUN_DECL),
+                                        fun_decl_builder=html_entity_decode_fun_decl),
     "removewhitespace":  _uninterpreted("t_removeWhitespace",   *_REMOVE_WS_AXIOMS),
     "compresswhitespace":_uninterpreted("t_compressWhitespace", *_COMPRESS_WS_AXIOMS),
     "removenulls":       _uninterpreted("t_removeNulls",        *_REMOVE_NULLS_AXIOMS),
@@ -193,6 +204,40 @@ _TRANSFORMS: dict[str, _TransformDef] = {
 
 class UnsupportedTransformError(Exception):
     """Raised when a SecRule transformation is unknown to this module."""
+
+
+@lru_cache(maxsize=None)
+def _cached_unrestricted_fun_decl(key: str) -> str:
+    """Cache the unrestricted (``relevant=None``) declaration for *key*.
+
+    Building it for a codepoint-per-pass transform like ``urlDecodeUni`` is
+    expensive (~15s, ~13MB — see :mod:`wafan.transforms.url_decode_uni`), and
+    is requested identically every time a rule/chain can't contribute a
+    restricted codepoint set. Kept in its own unbounded cache (there are only
+    a handful of transform keys) so it can never be evicted by the flood of
+    distinct per-pair restricted variants below.
+    """
+    return _TRANSFORMS[key].build_fun_decl(None)
+
+
+@lru_cache(maxsize=256)
+def _cached_restricted_fun_decl(key: str, relevant_frozen: "frozenset[int]") -> str:
+    """Cache :meth:`_TransformDef.build_fun_decl` per ``(key, relevant)``.
+
+    Pairwise intersection/subsumption checks over many rules each derive
+    their own joint codepoint set, so this cache sees a high-cardinality
+    stream of distinct keys; it is bounded (and thus subject to eviction)
+    separately from :func:`_cached_unrestricted_fun_decl` so that churn here
+    never evicts the far more valuable unrestricted entry.
+    """
+    return _TRANSFORMS[key].build_fun_decl(set(relevant_frozen))
+
+
+def _cached_build_fun_decl(key: str, relevant_frozen: "frozenset[int] | None") -> str:
+    """Cache :meth:`_TransformDef.build_fun_decl` per ``(key, relevant)``."""
+    if relevant_frozen is None:
+        return _cached_unrestricted_fun_decl(key)
+    return _cached_restricted_fun_decl(key, relevant_frozen)
 
 
 # ---------------------------------------------------------------------------
@@ -305,28 +350,94 @@ def apply_transforms_smt(var_expr: str, transforms: Sequence[str]) -> str:
     return expr
 
 
-def transform_preamble(transforms: Sequence[str]) -> tuple[list[str], list[str]]:
+def _restrictable_transform_keys(
+    transform_lists: Sequence[Sequence[str]],
+) -> set[str]:
+    """Return transform keys safe to restrict via *relevant* across *transform_lists*.
+
+    A transform's ``(define-fun …)`` declaration is one global SMT symbol
+    shared by every occurrence of that transform, in this rule or any other
+    rule it is merged with (see :func:`chain_to_smt`). Restricting its
+    declaration to a codepoint set is only sound if *every* occurrence of the
+    transform is the last transform in its own list — i.e. its output always
+    feeds the operator directly and never another transform, and it is never
+    merged alongside an occurrence that needs the full, unrestricted
+    definition. A transform is therefore disqualified (kept unrestricted) if
+    it appears more than once in any single list, or anywhere but the last
+    position.
+    """
+    seen: set[str] = set()
+    disqualified: set[str] = set()
+    for transforms in transform_lists:
+        last_index = len(transforms) - 1
+        counts: dict[str, int] = {}
+        for t in transforms:
+            key = t.lower()
+            counts[key] = counts.get(key, 0) + 1
+        for i, t in enumerate(transforms):
+            key = t.lower()
+            seen.add(key)
+            if not (i == last_index and counts[key] == 1):
+                disqualified.add(key)
+    return seen - disqualified
+
+
+def transform_preamble(
+    transforms: Sequence[str],
+    relevant: Optional[set[int]] = None,
+    restrictable: Optional[set[str]] = None,
+) -> tuple[list[str], list[str]]:
     """Return ``(fun_declarations, axioms)`` required by *transforms*.
 
     Only uninterpreted transforms contribute entries; direct SMT-LIB functions
     (e.g. ``str.to_lower``) need no declaration.  Duplicates are eliminated while
     preserving first-seen order.
-    """
-    seen: set[str] = set()
-    fun_decls: list[str] = []
-    axioms: list[str] = []
 
-    for t in transforms:
+    *relevant*, if given, is a set of codepoints (see
+    :func:`wafan.regex_alphabet.extract_relevant_codepoints`) that the
+    resulting string is actually checked against downstream (typically the
+    codepoints appearing in the rule's ``@rx`` pattern). Transforms whose
+    declaration enumerates one pass per codepoint (``urlDecode``,
+    ``htmlEntityDecode``) use it to skip passes for codepoints that cannot
+    affect the match outcome. ``relevant=None`` keeps the full, unrestricted
+    declaration.
+
+    *relevant* is only sound for the *last* transform in *transforms*: its
+    output feeds the operator directly, so a codepoint outside *relevant*
+    truly cannot affect the match. Every earlier transform's output instead
+    feeds another transform (e.g. ``uppercase``, or a further decode) that
+    can change codepoints before the match, so restricting it against the
+    *final* pattern's alphabet could drop a pass whose output only becomes
+    relevant after that later transform runs. Earlier transforms therefore
+    always get the full, unrestricted declaration.
+
+    *restrictable*, if given, further limits which transform keys may use
+    *relevant* even when they are the last transform in *transforms* — see
+    :func:`_restrictable_transform_keys`. This is required whenever the
+    result may be merged with declarations built from other transform lists
+    (e.g. other links of the same chain): a transform's single global
+    declaration must not vary depending on which list produced it.
+    """
+    axioms: list[str] = []
+    last_index = len(transforms) - 1
+    decls_by_key: dict[str, str] = {}
+
+    for i, t in enumerate(transforms):
         key = t.lower()
         defn = _TRANSFORMS.get(key)
         if defn is None:
             raise UnsupportedTransformError(f"Transform '{t}' is not supported")
-        if defn.fun_decl and key not in seen:
-            seen.add(key)
-            fun_decls.append(defn.fun_decl)
+        if key in decls_by_key:
+            continue
+        is_last = i == last_index and (restrictable is None or key in restrictable)
+        applied_relevant = relevant if is_last else None
+        relevant_frozen = None if applied_relevant is None else frozenset(applied_relevant)
+        decl = _cached_build_fun_decl(key, relevant_frozen)
+        if decl:
+            decls_by_key[key] = decl
             axioms.extend(defn.axioms)
 
-    return fun_decls, axioms
+    return list(decls_by_key.values()), axioms
 
 
 # ---------------------------------------------------------------------------
@@ -364,9 +475,71 @@ class UnsupportedOperatorError(Exception):
     """Raised when a SecRule operator cannot be converted to SMT."""
 
 
+@lru_cache(maxsize=1024)
+def _cached_pcre_to_ecma2020(argument: str):
+    """Cache :func:`pcre_to_ecma2020` per rule, since it is invoked twice per
+    ``@rx`` rule/link — once to build the assertion, once to compute the
+    relevant codepoints — with identical input each time."""
+    return pcre_to_ecma2020(argument)
+
+
 def _op_rx(var_expr: str, argument: str, negated: bool) -> str:
-    conv = pcre_to_ecma2020(argument)
+    conv = _cached_pcre_to_ecma2020(argument)
     return _rx_assertion(var_expr, conv.pattern, negated)
+
+
+@lru_cache(maxsize=1024)
+def _rx_relevant_codepoints(argument: str) -> Optional[frozenset[int]]:
+    """Return the codepoints an ``@rx`` *argument* can match, or None if unknown.
+
+    The pattern is converted to ECMA2020 first (resolving POSIX classes,
+    ``\\Q...\\E`` blocks, etc. into plain Python-``re``-compatible syntax) and
+    then walked by :func:`extract_relevant_codepoints_precise`, which returns
+    None itself if the pattern uses a predefined class (``\\d``/``\\w``/``\\s``)
+    whose codepoints can only be approximated. Any other failure along the
+    way (an unsupported PCRE construct, or a converted pattern the Python
+    ``re`` parser still can't parse, e.g. leftover ECMA-only escapes) also
+    falls back to None, meaning "unknown — don't restrict".
+
+    Cached per *argument*: the AST walk in
+    :func:`~wafan.regex_alphabet.extract_relevant_codepoints_precise` is pure
+    but not free, and is otherwise recomputed once per rule for every
+    pairwise intersection/subsumption comparison the rule participates in
+    (see :func:`wafan.analyses.common._joint_transform_preamble`).
+    """
+    try:
+        conv = _cached_pcre_to_ecma2020(argument)
+        codepoints = extract_relevant_codepoints_precise(conv.pattern)
+    except Exception:
+        return None
+    return None if codepoints is None else frozenset(codepoints)
+
+
+def _rule_relevant_codepoints(rule: SecRule) -> Optional[frozenset[int]]:
+    """Return the codepoints relevant to *rule*'s own operator, or None if
+    unknown/not applicable.
+
+    Only ``@rx`` rules contribute a computed set (see
+    :func:`_rx_relevant_codepoints`); every other operator is unrestricted.
+    """
+    op_name, _ = _normalize_operator(rule.operator)
+    return _rx_relevant_codepoints(rule.operator_argument) if op_name == "rx" else None
+
+
+def _rules_relevant_codepoints(rules: Sequence[SecRule]) -> Optional[set[int]]:
+    """Return the union of :func:`_rule_relevant_codepoints` over *rules*.
+
+    None (unrestricted) as soon as any rule's own set is unknown — a
+    non-``@rx`` rule, or an ``@rx`` pattern whose relevant codepoints could
+    not be determined.
+    """
+    union: set[int] = set()
+    for rule in rules:
+        relevant = _rule_relevant_codepoints(rule)
+        if relevant is None:
+            return None
+        union |= relevant
+    return union
 
 
 def _op_streq(var_expr: str, argument: str, negated: bool) -> str:
@@ -474,7 +647,14 @@ def is_supported_operator(operator: str) -> bool:
 # Public API
 # ---------------------------------------------------------------------------
 
-def rule_to_smt(rule: SecRule) -> SmtFormula:
+_UNSET = object()  # sentinel: "no override given" vs. explicit relevant=None
+
+
+def rule_to_smt(
+    rule: SecRule,
+    relevant: Optional[set[int]] = _UNSET,  # type: ignore[assignment]
+    restrictable: Optional[set[str]] = _UNSET,  # type: ignore[assignment]
+) -> SmtFormula:
     """Convert a single SecRule to an SmtFormula.
 
     Transformation actions (t:) are extracted and applied as SMT-LIB wrappers
@@ -486,6 +666,20 @@ def rule_to_smt(rule: SecRule) -> SmtFormula:
 
     Supported operators: @rx, @streq, @contains, @beginsWith, @endsWith,
     @within, @pm, @eq, @ge, @gt, @le, @lt (each with optional ``!`` negation).
+
+    *relevant*, if given, overrides the codepoint set used to trim transform
+    declarations (see :func:`transform_preamble`); this is used by
+    :func:`chain_to_smt` to share one chain-wide set across all links. When
+    omitted, an ``@rx`` rule computes it from its own pattern; any other
+    operator leaves it unrestricted (None), since transforms feeding e.g.
+    ``@streq``/``@contains`` are not (yet) analysed for relevance.
+
+    *restrictable*, if given, overrides which transform keys are allowed to
+    use *relevant* (see :func:`_restrictable_transform_keys`); this is used by
+    :func:`chain_to_smt` to pass a chain-wide computation, since the same
+    transform may be safe to restrict in this rule alone but not once merged
+    with other links. When omitted, it is computed from this rule's own
+    transforms only.
 
     Raises:
         UnsupportedOperatorError: if the operator is not supported, or (for
@@ -499,9 +693,18 @@ def rule_to_smt(rule: SecRule) -> SmtFormula:
             f"Rule {rule.rule_id}: operator '{rule.operator}' is not supported"
         )
 
+    if relevant is _UNSET:
+        relevant = (
+            _rx_relevant_codepoints(rule.operator_argument)
+            if op_name == "rx"
+            else None
+        )
+
     negated = rule.negated or op_negated
     transforms = effective_transforms(rule)
-    fun_decls, axioms = transform_preamble(transforms)
+    if restrictable is _UNSET:
+        restrictable = _restrictable_transform_keys([transforms])
+    fun_decls, axioms = transform_preamble(transforms, relevant, restrictable)
 
     declarations: list[str] = []
     assertions: list[str] = []
@@ -541,7 +744,25 @@ def chain_to_smt(chain: Sequence[SecRule]) -> SmtFormula:
         UnsupportedOperatorError: if any link's operator is not supported.
         UnsupportedTransformError: if any link uses an unknown transform.
     """
-    formulas = [rule_to_smt(rule) for rule in chain]
+    # A transform (e.g. t_urlDecode) shared by multiple links must get the
+    # exact same declaration text everywhere it's merged below, so every link
+    # is converted with one shared, chain-wide relevant-codepoints set: the
+    # union of every link's own set (see _rules_relevant_codepoints), or None
+    # (unrestricted) as soon as any link can't contribute one.
+    chain_relevant = _rules_relevant_codepoints(chain)
+
+    # Likewise, whether a transform is safe to restrict at all must be decided
+    # across every link's transform list at once: a transform that is the
+    # last transform in one link but not in another must use its full,
+    # unrestricted declaration in both, since they share the same SMT symbol.
+    chain_restrictable = _restrictable_transform_keys(
+        [effective_transforms(rule) for rule in chain]
+    )
+
+    formulas = [
+        rule_to_smt(rule, relevant=chain_relevant, restrictable=chain_restrictable)
+        for rule in chain
+    ]
 
     declarations = _merge_unique([], [])
     fun_declarations: list[str] = []
