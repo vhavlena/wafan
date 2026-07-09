@@ -459,8 +459,17 @@ def _smt_var_name(variable: SecRuleVariable) -> str:
 
 
 def _escape_smt_string(pattern: str) -> str:
-    """Escape a regex pattern for embedding in an SMT-LIB2 string literal."""
-    return pattern.replace("\\", "\\\\").replace('"', '\\"')
+    """Escape a pattern for embedding in an SMT-LIB2 string literal.
+
+    SMT-LIB2 string literals have no backslash-escape convention — a
+    backslash is a literal character. The only special character is `"`,
+    which is escaped by doubling it (`""`), not by backslash-prefixing it.
+    Backslash-doubling here would corrupt every backslash-escaped regex
+    metacharacter (e.g. PCRE `\\.` would become `\\\\.`, which
+    re.from_ecma2020 parses as escaped-backslash + wildcard-dot instead of
+    a literal dot).
+    """
+    return pattern.replace('"', '""')
 
 
 def _rx_assertion(var_expr: str, pattern: str, negated: bool) -> str:

@@ -202,9 +202,12 @@ class TestRxRuleToSmt:
         with pytest.raises(UnsupportedOperatorError, match="not supported"):
             rule_to_smt(rule)
 
-    def test_backslash_in_pattern_escaped(self):
+    def test_backslash_in_pattern_passed_through_unescaped(self):
+        # SMT-LIB2 string literals have no backslash-escape convention (a
+        # backslash is a literal character), so the pattern's backslash must
+        # reach re.from_ecma2020 unchanged for it to keep its regex meaning.
         f = rule_to_smt(make_rule(pattern=r"[a-z]:\inetpub"))
-        assert "\\\\" in f.assertion
+        assert r"[a-z]:\inetpub" in f.assertion
 
     def test_multiple_variables_uses_or(self):
         rule = SecRule(
