@@ -1,0 +1,328 @@
+"""Tests for the stateful SMT encoding (wafan.state).
+
+Solver-free: these check the *shape* of the generated encoding — sort
+inference, SSA versioning, initial state, slicing, and which constructs get
+abstracted. End-to-end verdicts are covered in test_reachability.py.
+"""
+
+from __future__ import annotations
+
+import textwrap
+
+import pytest
+
+from wafan.ruleset import Ruleset
+from wafan.state import (
+    INT,
+    STRING,
+    encode_ruleset,
+    infer_tx_sorts,
+    macro_key,
+)
+
+
+def encode(tmp_path, text: str, name: str = "rules.conf"):
+    path = tmp_path / name
+    path.write_text(textwrap.dedent(text).lstrip())
+    return encode_ruleset(path)
+
+
+def defs_of(encoding) -> str:
+    """All definition lines, joined — for substring assertions."""
+    return "\n".join(line for b in encoding.blocks for line in b.definitions)
+
+
+def decls_of(encoding) -> str:
+    return "\n".join(
+        line for b in encoding.blocks for line in b.declarations
+    ) + "\n" + "\n".join(encoding.globals)
+
+
+class TestMacroKey:
+    @pytest.mark.parametrize("text,expected", [
+        ("%{tx.foo}", ("tx", "foo")),
+        ("%{TX.FOO}", ("tx", "foo")),
+        (" %{tx.a_b} ", ("tx", "a_b")),
+    ])
+    def test_parses(self, text, expected):
+        assert macro_key(text) == expected
+
+    @pytest.mark.parametrize("text", ["5", "%{tx.foo}bar", "tx.foo", "%{MATCHED_VAR}"])
+    def test_rejects(self, text):
+        assert macro_key(text) is None
+
+
+# ---------------------------------------------------------------------------
+# Sort inference
+# ---------------------------------------------------------------------------
+
+class TestSortInference:
+    def _sorts(self, tmp_path, text):
+        path = tmp_path / "r.conf"
+        path.write_text(textwrap.dedent(text).lstrip())
+        return infer_tx_sorts(Ruleset.from_paths(path))
+
+    def test_integer_literal_is_int(self, tmp_path):
+        sorts = self._sorts(tmp_path, 'SecAction "id:1,phase:1,pass,setvar:tx.a=5"\n')
+        assert sorts[("tx", "a")] == INT
+
+    def test_increment_is_int(self, tmp_path):
+        sorts = self._sorts(tmp_path, 'SecAction "id:1,phase:1,pass,setvar:tx.a=+5"\n')
+        assert sorts[("tx", "a")] == INT
+
+    def test_text_value_is_string(self, tmp_path):
+        sorts = self._sorts(tmp_path, 'SecAction "id:1,phase:1,pass,setvar:\'tx.a=GET POST\'"\n')
+        assert sorts[("tx", "a")] == STRING
+
+    def test_copy_inherits_source_sort(self, tmp_path):
+        sorts = self._sorts(tmp_path, """
+            SecAction "id:1,phase:1,pass,setvar:tx.src=5"
+            SecAction "id:2,phase:1,pass,setvar:'tx.dst=%{tx.src}'"
+        """)
+        assert sorts[("tx", "dst")] == INT
+
+    def test_string_propagates_through_copy_chain(self, tmp_path):
+        sorts = self._sorts(tmp_path, """
+            SecAction "id:1,phase:1,pass,setvar:'tx.a=some text'"
+            SecAction "id:2,phase:1,pass,setvar:'tx.b=%{tx.a}'"
+            SecAction "id:3,phase:1,pass,setvar:'tx.c=%{tx.b}'"
+        """)
+        assert sorts[("tx", "b")] == STRING
+        assert sorts[("tx", "c")] == STRING
+
+    def test_mixed_writes_demote_to_string(self, tmp_path):
+        sorts = self._sorts(tmp_path, """
+            SecAction "id:1,phase:1,pass,setvar:tx.a=5"
+            SecAction "id:2,phase:1,pass,setvar:'tx.a=text'"
+        """)
+        assert sorts[("tx", "a")] == STRING
+
+
+# ---------------------------------------------------------------------------
+# SSA structure
+# ---------------------------------------------------------------------------
+
+class TestSSA:
+    def test_persistent_write_builds_on_unknown_initial_value(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,pass,setvar:ip.count=+1"
+        """)
+        body = defs_of(enc)
+        assert "(+ unknown_" in body
+
+    def test_write_is_guarded_by_its_directive_firing(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,pass,setvar:tx.hit=1"
+        """)
+        assert "(ite fire_0 1 0)" in defs_of(enc)
+
+    def test_increment_accumulates_from_previous_version(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,pass,setvar:tx.s=+5"
+            SecRule ARGS "@streq b" "id:2,phase:2,pass,setvar:tx.s=+3"
+        """)
+        body = defs_of(enc)
+        assert "(+ 0 5)" in body               # first write starts from the initial 0
+        assert "(+ v_tx_s_1 3)" in body        # second builds on the first version
+
+    def test_unset_zeroes_the_count(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecAction "id:1,phase:1,pass,setvar:tx.a=1"
+            SecAction "id:2,phase:1,pass,setvar:!tx.a"
+        """)
+        assert "(assert (= cnt_tx_a_2 (ite fire_1 0 cnt_tx_a_1)))" in defs_of(enc)
+
+    def test_unwritten_state_reads_as_absent(self, tmp_path):
+        """The core tier-3 property: TX starts empty, so a counter read of a
+        variable nothing writes is a literal 0, not a free variable."""
+        enc = encode(tmp_path, """
+            SecRule &TX:nobody_sets_this "@eq 0" "id:1,phase:2,pass"
+        """)
+        assert "(= 0 0)" in defs_of(enc)
+        assert ("tx", "nobody_sets_this") in enc.reads_before_write
+        assert ("tx", "nobody_sets_this") in enc.never_written()
+
+    def test_persistent_collection_does_not_start_empty(self, tmp_path):
+        """IP/SESSION/GLOBAL survive across requests, so their initial state is
+        unknown — assuming 0 would let wafan call a live rule dead."""
+        enc = encode(tmp_path, """
+            SecRule &IP:blocked "@eq 0" "id:1,phase:2,pass"
+        """)
+        body = defs_of(enc)
+        assert "(= 0 0)" not in body          # not pinned to the empty state
+        assert "unknown_" in body             # a free constant instead
+        assert any("(>= unknown_" in d for d in enc.global_definitions)
+
+    def test_transaction_collection_starts_empty(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule &TX:blocked "@eq 0" "id:1,phase:2,pass"
+        """)
+        assert "(= 0 0)" in defs_of(enc)
+
+    def test_reader_sees_the_version_current_at_its_position(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecAction "id:1,phase:1,pass,setvar:tx.a=1"
+            SecRule TX:a "@eq 1" "id:2,phase:1,pass"
+            SecAction "id:3,phase:1,pass,setvar:tx.a=2"
+            SecRule TX:a "@eq 2" "id:4,phase:1,pass"
+        """)
+        body = defs_of(enc)
+        assert "(assert (= match_1 (= v_tx_a_1 1)))" in body
+        assert "(assert (= match_3 (= v_tx_a_2 2)))" in body
+
+    def test_rule_reads_pre_state_of_its_own_setvar(self, tmp_path):
+        """A rule's operator sees the value *before* its own setvar runs."""
+        enc = encode(tmp_path, """
+            SecAction "id:1,phase:1,pass,setvar:tx.a=1"
+            SecRule TX:a "@eq 1" "id:2,phase:1,pass,setvar:tx.a=99"
+        """)
+        assert "(assert (= match_1 (= v_tx_a_1 1)))" in defs_of(enc)
+
+
+class TestMacroResolution:
+    def test_macro_operator_argument_resolves_to_state(self, tmp_path):
+        """The stateless encoder gives up here ("not an integer")."""
+        enc = encode(tmp_path, """
+            SecAction "id:1,phase:1,pass,setvar:tx.threshold=5"
+            SecRule TX:score "@ge %{tx.threshold}" "id:2,phase:1,pass"
+        """)
+        assert "v_tx_threshold_1" in defs_of(enc)
+        assert 1 not in enc.abstracted
+
+    def test_setvar_rhs_macro_resolves_to_state(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecAction "id:1,phase:1,pass,setvar:tx.src=7"
+            SecAction "id:2,phase:1,pass,setvar:'tx.dst=%{tx.src}'"
+        """)
+        assert "(ite fire_1 v_tx_src_1 0)" in defs_of(enc)
+
+    def test_unresolvable_macro_becomes_a_free_constant(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecAction "id:1,phase:1,pass,setvar:'tx.a=%{MATCHED_VAR}'"
+        """)
+        assert any("unknown_" in d for d in enc.globals)
+
+
+# ---------------------------------------------------------------------------
+# Abstraction
+# ---------------------------------------------------------------------------
+
+class TestAbstraction:
+    def test_unsupported_operator_is_abstracted_not_dropped(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS "@detectSQLi" "id:1,phase:2,pass"
+        """)
+        assert 0 in enc.abstracted
+        # The match term is declared but left free — never asserted equal to a
+        # condition — so the rule may still fire.
+        assert "(declare-const match_0 Bool)" in decls_of(enc)
+        assert "(= match_0 " not in defs_of(enc)
+        assert "(assert (= fire_0 match_0))" in defs_of(enc)
+
+    def test_abstraction_is_reported_as_a_caveat(self, tmp_path):
+        enc = encode(tmp_path, 'SecRule ARGS "@detectXSS" "id:1,phase:2,pass"\n')
+        assert any("abstracted" in c for c in enc.caveats())
+
+    def test_target_removal_reported(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecAction "id:1,phase:2,pass,ctl:ruleRemoveTargetById=900;ARGS:x"
+        """)
+        assert enc.target_removals == [0]
+        assert any("ruleRemoveTarget" in c for c in enc.caveats())
+
+    def test_negated_target_is_dropped_not_added(self, tmp_path):
+        """`!ARGS:x` excludes a member. With a single-representative model
+        there is nothing to subtract, so it must contribute no disjunct —
+        the stateless encoder wrongly adds one."""
+        enc = encode(tmp_path, """
+            SecRule ARGS|!ARGS:x "@streq a" "id:1,phase:2,pass"
+        """)
+        body = defs_of(enc)
+        assert "ARGS__x" not in body
+
+
+# ---------------------------------------------------------------------------
+# Script rendering / slicing
+# ---------------------------------------------------------------------------
+
+class TestAliveChain:
+    def test_terminator_extends_the_alive_chain(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,deny"
+            SecRule ARGS "@streq b" "id:2,phase:2,pass"
+        """)
+        body = defs_of(enc)
+        assert "(assert (= alive_0 (not fire_0)))" in body
+        assert "(assert (= fire_1 (and alive_0 match_1)))" in body
+
+    def test_pass_rule_does_not_extend_the_chain(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,pass"
+            SecRule ARGS "@streq b" "id:2,phase:2,pass"
+        """)
+        body = defs_of(enc)
+        assert "alive_" not in body
+        assert "(assert (= fire_1 match_1))" in body
+
+    def test_chain_is_linear_not_quadratic(self, tmp_path):
+        """Each terminator adds one link referring to the previous one, rather
+        than every later position re-listing all prior terminators."""
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,deny"
+            SecRule ARGS "@streq b" "id:2,phase:2,deny"
+            SecRule ARGS "@streq c" "id:3,phase:2,deny"
+            SecRule ARGS "@streq d" "id:4,phase:2,pass"
+        """)
+        body = defs_of(enc)
+        assert "(assert (= alive_1 (and alive_0 (not fire_1))))" in body
+        assert "(assert (= alive_2 (and alive_1 (not fire_2))))" in body
+        # The last rule refers only to the newest link.
+        assert "(assert (= fire_3 (and alive_2 match_3)))" in body
+
+
+class TestScript:
+    def test_slicing_omits_later_positions(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,pass"
+            SecRule ARGS "@streq b" "id:2,phase:2,pass"
+            SecRule ARGS "@streq c" "id:3,phase:2,pass"
+        """)
+        sliced = enc.script([enc.fire[0]], upto=0)
+        assert "fire_0" in sliced
+        assert "fire_1" not in sliced
+        assert "fire_2" not in sliced
+
+    def test_full_script_has_all_positions(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,pass"
+            SecRule ARGS "@streq b" "id:2,phase:2,pass"
+        """)
+        full = enc.script([enc.fire[1]])
+        assert "fire_0" in full and "fire_1" in full
+
+    def test_script_is_well_formed(self, tmp_path):
+        enc = encode(tmp_path, 'SecRule ARGS "@streq a" "id:1,phase:2,pass"\n')
+        script = enc.script([enc.fire[0]], upto=0)
+        assert script.startswith("(set-logic ")
+        assert script.rstrip().endswith("(check-sat)")
+        assert script.count("(") == script.count(")")
+
+    def test_request_counter_is_declared_non_negative(self, tmp_path):
+        enc = encode(tmp_path, 'SecRule ARGS "@streq a" "id:1,phase:2,pass"\n')
+        assert "(declare-const cnt_ARGS Int)" in enc.globals
+        assert "(assert (>= cnt_ARGS 0))" in enc.global_definitions
+
+    def test_value_match_is_guarded_by_collection_being_non_empty(self, tmp_path):
+        enc = encode(tmp_path, 'SecRule ARGS "@streq a" "id:1,phase:2,pass"\n')
+        assert "(> cnt_ARGS 0)" in defs_of(enc)
+
+
+class TestPositionLookup:
+    def test_position_of_rule_id(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:10,phase:1,pass"
+            SecRule ARGS "@streq b" "id:20,phase:2,pass"
+        """)
+        assert enc.order[enc.position_of_rule_id("10")].rule_id == "10"
+        assert enc.order[enc.position_of_rule_id("20")].rule_id == "20"
+        assert enc.position_of_rule_id("nope") is None

@@ -19,8 +19,21 @@ from .analyses import (
     intersection_outcome_label,
     _chain_label,
 )
+from .analyses.reachability import (
+    IMPOSSIBLE_MATCH,
+    UNREACHABLE,
+    ReachabilityChecker,
+)
+from .analyses.stateful import (
+    INTERSECTION,
+    SHADOWING,
+    SUBSUMPTION,
+    StatefulPairChecker,
+)
 from .parser import group_chains, parse_file
+from .ruleset import Ruleset
 from .solver_setup import ensure_z3_noodler
+from .state import StatefulEncoder
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -28,7 +41,16 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="wafan",
         description="SMT-based analysis of ModSecurity SecRule rulesets.",
     )
-    p.add_argument("conf", type=Path, help="Path to a ModSecurity .conf file.")
+    p.add_argument(
+        "conf",
+        type=Path,
+        nargs="+",
+        help=(
+            "Path(s) to ModSecurity .conf file(s), in the order the web server "
+            "includes them. Order matters: put crs-setup.conf first so its "
+            "SecAction initialisers are visible to the rules that read them."
+        ),
+    )
     p.add_argument(
         "--solver",
         metavar="PATH",
@@ -53,12 +75,25 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--analysis",
-        choices=["subsumption", "intersection", "contradiction", "witness"],
+        choices=["subsumption", "intersection", "contradiction", "witness", "reachability"],
         default="subsumption",
         help="Analysis to run (default: subsumption). "
              "'witness' finds a concrete input satisfying each rule. "
              "'contradiction' is like 'intersection' but additionally requires "
-             "the two rules to disagree on accepting/denying the shared input.",
+             "the two rules to disagree on accepting/denying the shared input. "
+             "'reachability' finds rules that can never fire, using the "
+             "order-aware whole-ruleset state model (implies --stateful).",
+    )
+    p.add_argument(
+        "--stateful",
+        action="store_true",
+        help=(
+            "Analyse rules as an ordered program with TX as mutable state, "
+            "instead of comparing match conditions in isolation. Models "
+            "SecAction/setvar, skipAfter, ctl:ruleRemoveById and disruptive "
+            "actions, so pairs are compared on whether they can actually both "
+            "*fire*. Applies to subsumption/intersection/contradiction."
+        ),
     )
     p.add_argument(
         "--timeout",
@@ -108,6 +143,18 @@ def _make_solver(args: argparse.Namespace) -> SubprocessSolver:
 
 
 _SEP = "-" * 66
+
+
+def _load_rules(confs: list[Path]) -> list:
+    """Concatenate the rules of every conf file, in include order."""
+    rules = []
+    for conf in confs:
+        rules.extend(parse_file(conf))
+    return rules
+
+
+def _conf_label(confs: list[Path]) -> str:
+    return " ".join(str(c) for c in confs)
 
 
 def _chain_ids(chain) -> list:
@@ -176,11 +223,11 @@ def _subsumption_pair_json(res) -> dict:
     }
 
 
-def _run_subsumption(conf: Path, solver: SubprocessSolver, verbosity: int = 0, as_json: bool = False) -> int:
+def _run_subsumption(confs: list[Path], solver: SubprocessSolver, verbosity: int = 0, as_json: bool = False) -> int:
     start = time.monotonic()
-    rules = parse_file(conf)
+    rules = _load_rules(confs)
     if verbosity >= 1 and not as_json:
-        print(f"Loaded {len(rules)} rules from {conf}")
+        print(f"Loaded {len(rules)} rules from {_conf_label(confs)}")
     chain_details = _chain_details(rules, emit=_print_json if as_json else None)
     support = _chain_support_stats(chain_details)
     checker = SubsumptionChecker(solver, verbosity=0 if as_json else verbosity)
@@ -200,7 +247,7 @@ def _run_subsumption(conf: Path, solver: SubprocessSolver, verbosity: int = 0, a
         highlighted = {c.chain1[0].rule_id for c in subsumed}
         _print_json({
             "kind": "summary",
-            "conf": str(conf),
+            "conf": _conf_label(confs),
             "analysis": "subsumption",
             "rules_total": len(rules),
             "elapsed_sec": round(time.monotonic() - start, 3),
@@ -246,11 +293,11 @@ def _intersection_pair_json(res) -> dict:
     }
 
 
-def _run_intersection(conf: Path, solver: SubprocessSolver, verbosity: int = 0, as_json: bool = False) -> int:
+def _run_intersection(confs: list[Path], solver: SubprocessSolver, verbosity: int = 0, as_json: bool = False) -> int:
     start = time.monotonic()
-    rules = parse_file(conf)
+    rules = _load_rules(confs)
     if verbosity >= 1 and not as_json:
-        print(f"Loaded {len(rules)} rules from {conf}")
+        print(f"Loaded {len(rules)} rules from {_conf_label(confs)}")
     chain_details = _chain_details(rules, emit=_print_json if as_json else None)
     support = _chain_support_stats(chain_details)
     checker = IntersectionChecker(solver, verbosity=0 if as_json else verbosity)
@@ -273,7 +320,7 @@ def _run_intersection(conf: Path, solver: SubprocessSolver, verbosity: int = 0, 
             highlighted.add(res.chain2[0].rule_id)
         _print_json({
             "kind": "summary",
-            "conf": str(conf),
+            "conf": _conf_label(confs),
             "analysis": "intersection",
             "rules_total": len(rules),
             "elapsed_sec": round(time.monotonic() - start, 3),
@@ -322,11 +369,11 @@ def _contradiction_pair_json(res) -> dict:
     }
 
 
-def _run_contradiction(conf: Path, solver: SubprocessSolver, verbosity: int = 0, as_json: bool = False) -> int:
+def _run_contradiction(confs: list[Path], solver: SubprocessSolver, verbosity: int = 0, as_json: bool = False) -> int:
     start = time.monotonic()
-    rules = parse_file(conf)
+    rules = _load_rules(confs)
     if verbosity >= 1 and not as_json:
-        print(f"Loaded {len(rules)} rules from {conf}")
+        print(f"Loaded {len(rules)} rules from {_conf_label(confs)}")
     chain_details = _chain_details(rules, emit=_print_json if as_json else None)
     support = _chain_support_stats(chain_details)
     checker = ContradictionChecker(solver, verbosity=0 if as_json else verbosity)
@@ -350,7 +397,7 @@ def _run_contradiction(conf: Path, solver: SubprocessSolver, verbosity: int = 0,
             highlighted.add(res.chain2[0].rule_id)
         _print_json({
             "kind": "summary",
-            "conf": str(conf),
+            "conf": _conf_label(confs),
             "analysis": "contradiction",
             "rules_total": len(rules),
             "elapsed_sec": round(time.monotonic() - start, 3),
@@ -404,11 +451,11 @@ def _witness_result_json(res) -> dict:
     }
 
 
-def _run_witness(conf: Path, solver: SubprocessSolver, verbosity: int = 0, as_json: bool = False) -> int:
+def _run_witness(confs: list[Path], solver: SubprocessSolver, verbosity: int = 0, as_json: bool = False) -> int:
     start = time.monotonic()
-    rules = parse_file(conf)
+    rules = _load_rules(confs)
     if verbosity >= 1 and not as_json:
-        print(f"Loaded {len(rules)} rules from {conf}")
+        print(f"Loaded {len(rules)} rules from {_conf_label(confs)}")
     chain_details = _chain_details(rules, emit=_print_json if as_json else None)
     support = _chain_support_stats(chain_details)
     checker = WitnessChecker(solver, verbosity=0 if as_json else verbosity)
@@ -427,7 +474,7 @@ def _run_witness(conf: Path, solver: SubprocessSolver, verbosity: int = 0, as_js
     if as_json:
         _print_json({
             "kind": "summary",
-            "conf": str(conf),
+            "conf": _conf_label(confs),
             "analysis": "witness",
             "rules_total": len(rules),
             "elapsed_sec": round(time.monotonic() - start, 3),
@@ -470,20 +517,226 @@ def _run_witness(conf: Path, solver: SubprocessSolver, verbosity: int = 0, as_js
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Stateful analyses (order-aware whole-ruleset model)
+# ---------------------------------------------------------------------------
+
+def _build_encoding(confs: list[Path]):
+    return StatefulEncoder(Ruleset.from_paths(confs)).encode()
+
+
+def _encoding_summary(encoding) -> dict:
+    """Machine-readable description of the state model's shape and limits."""
+    return {
+        "directives": len(encoding.order),
+        "rules": sum(1 for d in encoding.order if d.kind == "rule"),
+        "sec_actions": sum(1 for d in encoding.order if d.kind == "action"),
+        "state_vars": len(encoding.tx_sorts),
+        "state_vars_int": sum(1 for v in encoding.tx_sorts.values() if v == "Int"),
+        "state_read_never_written": sorted(
+            f"{c}.{n}" for (c, n) in encoding.never_written()
+        ),
+        "state_read_before_write": sorted(
+            f"{c}.{n}" for (c, n) in encoding.reads_before_write
+        ),
+        "abstracted_directives": len(encoding.abstracted),
+        "unmodelled_target_removals": len(encoding.target_removals),
+        "unresolved_markers": encoding.unresolved_markers,
+    }
+
+
+def _reachability_json(res) -> dict:
+    return {
+        "rule_id": res.rule_id,
+        "position": res.position,
+        "label": res.directive.label(),
+        "lineno": res.directive.lineno,
+        "phase": res.directive.phase,
+        "verdict": res.verdict,
+        "approximate": res.abstracted,
+        "approximate_reason": res.abstract_reason,
+        "elapsed_sec": round(res.elapsed_sec, 3),
+        "error": res.error,
+    }
+
+
+def _run_reachability(
+    confs: list[Path], solver: SubprocessSolver, verbosity: int = 0, as_json: bool = False
+) -> int:
+    start = time.monotonic()
+    encoding = _build_encoding(confs)
+    if verbosity >= 1 and not as_json:
+        rules = sum(1 for d in encoding.order if d.kind == "rule")
+        print(f"Loaded {rules} rules from {_conf_label(confs)}")
+        print(f"State model: {len(encoding.tx_sorts)} stateful variable(s)\n")
+
+    checker = ReachabilityChecker(solver, verbosity=0 if as_json else verbosity)
+    on_result = (
+        (lambda r: _print_json({"kind": "rule", **_reachability_json(r)}))
+        if as_json else None
+    )
+    results = checker.find_dead(encoding, on_result=on_result)
+
+    dead = [r for r in results if r.is_dead]
+    unreachable = [r for r in dead if r.verdict == UNREACHABLE]
+    impossible = [r for r in dead if r.verdict == IMPOSSIBLE_MATCH]
+    unknown = [r for r in results if r.verdict == "unknown"]
+
+    if as_json:
+        _print_json({
+            "kind": "summary",
+            "conf": _conf_label(confs),
+            "analysis": "reachability",
+            "elapsed_sec": round(time.monotonic() - start, 3),
+            **_encoding_summary(encoding),
+            "rules_checked": len(results),
+            "rules_dead": len(dead),
+            "rules_unreachable": len(unreachable),
+            "rules_impossible_match": len(impossible),
+            "rules_unknown": len(unknown),
+            "solver_queries": solver.query_count,
+            "solver_timeouts": solver.timeout_count,
+            "solver_errors": solver.error_count,
+        })
+        return 0
+
+    if verbosity >= 1:
+        print(f"\n{_SEP}")
+    if not dead:
+        print(f"No dead rules found  ({len(results)} rule(s) checked).")
+    else:
+        print(f"Dead rules  ({len(dead)} of {len(results)} checked)\n")
+        if unreachable:
+            print("  Never executed (control flow):")
+            for r in unreachable:
+                print(f"    {r.directive.label()}  line {r.directive.lineno}")
+            print()
+        if impossible:
+            print("  Executed, but the condition can never hold:")
+            for r in impossible:
+                print(f"    {r.directive.label()}  line {r.directive.lineno}")
+            print()
+    if unknown:
+        print(f"{len(unknown)} rule(s) returned unknown (solver timeout or unknown result).")
+    for caveat in encoding.caveats():
+        print(f"note: {caveat}")
+    return 0
+
+
+# `--analysis contradiction --stateful` runs the shadowing query: in an ordered
+# model two disruptive rules can never both fire, so the meaningful conflict is
+# an earlier rule silently pre-empting a later one (see wafan.analyses.stateful).
+_STATEFUL_MODE = {
+    "subsumption": SUBSUMPTION,
+    "intersection": INTERSECTION,
+    "contradiction": SHADOWING,
+}
+_STATEFUL_SYMBOL = {SUBSUMPTION: "\u2286", INTERSECTION: "\u2229", SHADOWING: "\u227b"}
+
+
+def _stateful_pair_json(res) -> dict:
+    return {
+        "rule1": res.rule_ids[0],
+        "rule2": res.rule_ids[1],
+        "label": f"#{res.rule_ids[0]} {_STATEFUL_SYMBOL[res.mode]} #{res.rule_ids[1]}",
+        "result": res.outcome,
+        "holds": res.holds,
+        "approximate": res.approximate,
+        "approximate_reasons": res.approximate_reasons,
+        "elapsed_sec": round(res.elapsed_sec, 3),
+        "error": res.error,
+    }
+
+
+def _run_stateful_pairs(
+    confs: list[Path],
+    solver: SubprocessSolver,
+    mode: str,
+    verbosity: int = 0,
+    as_json: bool = False,
+) -> int:
+    start = time.monotonic()
+    encoding = _build_encoding(confs)
+    if verbosity >= 1 and not as_json:
+        rules = sum(1 for d in encoding.order if d.kind == "rule")
+        print(f"Loaded {rules} rules from {_conf_label(confs)}")
+        print(f"Stateful {mode} analysis: {rules * (rules - 1)} pair(s)\n")
+
+    checker = StatefulPairChecker(solver, _STATEFUL_MODE[mode], verbosity=0 if as_json else verbosity)
+    on_result = (
+        (lambda r: _print_json({"kind": "pair", **_stateful_pair_json(r)}))
+        if as_json else None
+    )
+    results = checker.find_pairs(encoding, on_result=on_result)
+
+    holding = [r for r in results if r.holds]
+    unknown = [r for r in results if r.result == SolverResult.UNKNOWN]
+
+    if as_json:
+        _print_json({
+            "kind": "summary",
+            "conf": _conf_label(confs),
+            "analysis": f"stateful-{mode}",
+            "elapsed_sec": round(time.monotonic() - start, 3),
+            **_encoding_summary(encoding),
+            "pairs_checked": len(results),
+            "pairs_holding": len(holding),
+            "pairs_approximate": sum(1 for r in results if r.approximate),
+            "pairs_unknown": len(unknown),
+            "solver_queries": solver.query_count,
+            "solver_timeouts": solver.timeout_count,
+            "solver_errors": solver.error_count,
+        })
+        return 0
+
+    if verbosity >= 1:
+        print(f"\n{_SEP}")
+    symbol = _STATEFUL_SYMBOL[_STATEFUL_MODE[mode]]
+    heading = {
+        "subsumption": "Pairs where every transaction firing A also fires B",
+        "intersection": "Pairs that can both fire in one transaction",
+        "contradiction": "Pairs where the earlier rule shadows a conflicting later one",
+    }[mode]
+    if not holding:
+        print(f"None found  ({len(results)} pair(s) checked).")
+    else:
+        print(f"{heading}  ({len(holding)} found)\n")
+        for r in holding:
+            flag = "  (approximate)" if r.approximate else ""
+            print(f"  {r.directive1.label()}")
+            print(f"    {symbol}  {r.directive2.label()}{flag}")
+    if unknown:
+        print(f"\n{len(unknown)} pair(s) returned unknown (solver timeout or unknown result).")
+    for caveat in encoding.caveats():
+        print(f"note: {caveat}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    if not args.conf.is_file():
+    missing = [c for c in args.conf if not c.is_file()]
+    if missing:
+        label = " ".join(str(c) for c in missing)
         if args.json:
-            _print_json({"kind": "summary", "conf": str(args.conf), "analysis": args.analysis, "error": "not a file"})
+            _print_json({
+                "kind": "summary", "conf": label,
+                "analysis": args.analysis, "error": "not a file",
+            })
             return 1
-        print(f"error: {args.conf} is not a file", file=sys.stderr)
+        print(f"error: {label} is not a file", file=sys.stderr)
         return 1
 
     solver = _make_solver(args)
     verbosity = 2 if args.verbose2 else (1 if args.verbose else 0)
 
+    if args.analysis == "reachability":
+        return _run_reachability(args.conf, solver, verbosity=verbosity, as_json=args.json)
+    if args.stateful and args.analysis in ("subsumption", "intersection", "contradiction"):
+        return _run_stateful_pairs(
+            args.conf, solver, args.analysis, verbosity=verbosity, as_json=args.json
+        )
     if args.analysis == "subsumption":
         return _run_subsumption(args.conf, solver, verbosity=verbosity, as_json=args.json)
     if args.analysis == "intersection":

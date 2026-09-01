@@ -17,6 +17,16 @@ Implemented analyses:
   WitnessChecker – finds concrete inputs (models) that trigger a rule or
   chain of rules.
 
+  ReachabilityChecker – finds rules that can never fire, using the order-aware
+  whole-ruleset state model in wafan.state: control flow (skipAfter,
+  ctl:ruleRemoveById, disruptive actions) and TX state written by
+  SecAction/setvar are both modelled, so a rule guarded by state nothing
+  produces is reported as dead code.
+
+  StatefulPairChecker – intersection / subsumption / shadowing over the same
+  model, comparing whether two rules can actually both *fire* rather than
+  merely both match.
+
 Each analysis is solver-agnostic: any object implementing SolverBackend can
 be supplied. SubprocessSolver calls an external binary (default: z3-noodler)
 via stdin/stdout using the SMT-LIB2 format produced by wafan.smt.
@@ -67,6 +77,21 @@ from .contradiction import (
     chain_contradiction_smt2,
     contradiction_smt2,
 )
+from .reachability import (
+    IMPOSSIBLE_MATCH,
+    OK,
+    UNREACHABLE,
+    ReachabilityChecker,
+    ReachabilityResult,
+    analyse_reachability,
+)
+from .stateful import (
+    INTERSECTION,
+    SHADOWING,
+    SUBSUMPTION,
+    StatefulPairChecker,
+    StatefulPairResult,
+)
 from .witness import (
     ChainWitnessResult,
     WitnessChecker,
@@ -106,4 +131,15 @@ __all__ = [
     "rule_disposition",
     "chain_disposition",
     "intersection_outcome_label",
+    "ReachabilityChecker",
+    "ReachabilityResult",
+    "analyse_reachability",
+    "OK",
+    "UNREACHABLE",
+    "IMPOSSIBLE_MATCH",
+    "StatefulPairChecker",
+    "StatefulPairResult",
+    "INTERSECTION",
+    "SUBSUMPTION",
+    "SHADOWING",
 ]

@@ -21,6 +21,12 @@ class SecRuleVariable:
 class SecRuleAction:
     name: str
     arg: str = ""
+    # Second half of a two-part action, as msc_pyparser splits it. Both
+    # `ctl:ruleRemoveById=942100` (name="ctl", arg="ruleRemoveById",
+    # arg_value="942100") and unquoted `setvar:tx.a=+5` (name="setvar",
+    # arg="tx.a", arg_value="+5") land here. Empty for the single-part
+    # actions that make up the vast majority.
+    arg_value: str = ""
 
 
 @dataclass
@@ -56,7 +62,11 @@ def _parse_variable(raw: dict[str, Any]) -> SecRuleVariable:
 
 
 def _parse_action(raw: dict[str, Any]) -> SecRuleAction:
-    return SecRuleAction(name=raw["act_name"], arg=raw.get("act_arg", ""))
+    return SecRuleAction(
+        name=raw["act_name"],
+        arg=raw.get("act_arg", ""),
+        arg_value=raw.get("act_arg_val", "") or "",
+    )
 
 
 def _extract_rule_id(actions: list[dict[str, Any]]) -> str:
