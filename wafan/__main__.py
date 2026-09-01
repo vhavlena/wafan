@@ -521,8 +521,10 @@ def _run_witness(confs: list[Path], solver: SubprocessSolver, verbosity: int = 0
 # Stateful analyses (order-aware whole-ruleset model)
 # ---------------------------------------------------------------------------
 
-def _build_encoding(confs: list[Path]):
-    return StatefulEncoder(Ruleset.from_paths(confs)).encode()
+def _build_encoding(confs: list[Path], pairwise: bool = False):
+    """Build the state model. A pairwise analysis asserts two rules' conditions
+    in one query, so multi-valued collections need twice the array bound."""
+    return StatefulEncoder(Ruleset.from_paths(confs), pairwise=pairwise).encode()
 
 
 def _encoding_summary(encoding) -> dict:
@@ -532,6 +534,9 @@ def _encoding_summary(encoding) -> dict:
         "rules": sum(1 for d in encoding.order if d.kind == "rule"),
         "sec_actions": sum(1 for d in encoding.order if d.kind == "action"),
         "state_vars": len(encoding.tx_sorts),
+        "collection_members": encoding.members,
+        "collection_counts_exact": encoding.closed,
+        "collection_open_targets": encoding.open_targets,
         "state_vars_int": sum(1 for v in encoding.tx_sorts.values() if v == "Int"),
         "state_read_never_written": sorted(
             f"{c}.{n}" for (c, n) in encoding.never_written()
@@ -656,7 +661,7 @@ def _run_stateful_pairs(
     as_json: bool = False,
 ) -> int:
     start = time.monotonic()
-    encoding = _build_encoding(confs)
+    encoding = _build_encoding(confs, pairwise=True)
     if verbosity >= 1 and not as_json:
         rules = sum(1 for d in encoding.order if d.kind == "rule")
         print(f"Loaded {rules} rules from {_conf_label(confs)}")

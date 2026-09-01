@@ -15,10 +15,14 @@ from wafan.ruleset import Ruleset
 from wafan.state import (
     INT,
     STRING,
+    member_bounds,
     encode_ruleset,
     infer_tx_sorts,
+    is_multi_valued,
     macro_key,
+    required_members,
 )
+from wafan.parser import SecRuleVariable
 
 
 def encode(tmp_path, text: str, name: str = "rules.conf"):
@@ -245,6 +249,149 @@ class TestAbstraction:
 # Script rendering / slicing
 # ---------------------------------------------------------------------------
 
+class TestBoundedArrays:
+    """Multi-valued collections are modelled as bounded arrays of members."""
+
+    def test_multi_valued_classification(self):
+        assert is_multi_valued(SecRuleVariable("ARGS"))
+        assert is_multi_valued(SecRuleVariable("REQUEST_COOKIES", "/re/"))
+        assert not is_multi_valued(SecRuleVariable("REQUEST_METHOD"))
+        assert not is_multi_valued(SecRuleVariable("REQUEST_FILENAME"))
+
+    def test_bounds_are_per_target_not_global(self, tmp_path):
+        """One target's cardinality must not change how others are modelled.
+
+        Regression: a global bound let a large `&ARGS` demand open every
+        collection, and --- worse --- closed a scalar against another target's
+        larger bound, making the scalar's own count predicate unsatisfiable.
+        """
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,pass,chain"
+                SecRule ARGS "@streq b"
+            SecRule &REQUEST_FILENAME "@eq 2" "id:2,phase:2,pass"
+            SecRule &REQUEST_COOKIES "@eq 1" "id:3,phase:2,pass"
+        """)
+        bounds = {k: (v.slots, v.closed) for k, v in enc.bounds.items()}
+        assert bounds["ARGS"] == (2, True)              # two value conditions
+        assert bounds["REQUEST_FILENAME"] == (1, False)  # scalar, demands 2 -> open
+        assert bounds["REQUEST_COOKIES"] == (1, True)    # unaffected by the others
+        assert enc.open_targets == ["REQUEST_FILENAME"]
+
+    def test_count_predicate_raises_the_bound(self, tmp_path):
+        """A literal cardinality demand must be representable, or the target
+        cannot be closed and the rule would look dead."""
+        enc = encode(tmp_path, 'SecRule &ARGS "@eq 3" "id:1,phase:2,pass"\n')
+        assert enc.bounds["ARGS"].slots == 3
+        assert enc.bounds["ARGS"].closed is True
+
+    def test_huge_count_predicate_does_not_raise_the_bound(self, tmp_path):
+        enc = encode(tmp_path, 'SecRule &ARGS "@gt 200" "id:1,phase:2,pass"\n')
+        assert enc.bounds["ARGS"].slots == 1     # capped: no 201 slots
+        assert enc.bounds["ARGS"].closed is False
+
+    def test_value_and_count_demands_combine(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,pass,chain"
+                SecRule ARGS "@streq b"
+            SecRule &ARGS "@eq 3" "id:2,phase:2,pass"
+        """)
+        assert enc.bounds["ARGS"].slots == 3     # max(2 values, 3 members)
+
+    def test_bound_derived_from_the_widest_chain(self, tmp_path):
+        """A chain placing two conditions on one collection needs two members."""
+        one = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,pass"
+        """, "one.conf")
+        two = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,pass,chain"
+                SecRule ARGS "@streq b"
+        """, "two.conf")
+        assert one.members == 1
+        assert two.members == 2
+
+    def test_pairwise_bound_doubles(self, tmp_path):
+        from wafan.ruleset import Ruleset
+        path = tmp_path / "r.conf"
+        path.write_text('SecRule ARGS "@streq a" "id:1,phase:2,pass"\n')
+        rs = Ruleset.from_paths(path)
+        assert required_members(rs) == 1
+        assert required_members(rs, pairwise=True) == 2
+        assert member_bounds(rs, pairwise=True)["ARGS"].slots == 2
+
+    def test_members_are_a_disjunction_over_live_slots(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,pass,chain"
+                SecRule ARGS "@streq b"
+        """)
+        body = defs_of(enc)
+        assert "(or (and live_ARGS_1 (= ARGS_1 \"a\")) (and live_ARGS_2 (= ARGS_2 \"a\")))" in body
+        assert "(or (and live_ARGS_1 (= ARGS_1 \"b\")) (and live_ARGS_2 (= ARGS_2 \"b\")))" in body
+
+    def test_liveness_flags_are_prefix_closed(self, tmp_path):
+        """Symmetry breaking: live members occupy a prefix of the array."""
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,pass,chain"
+                SecRule ARGS "@streq b"
+        """)
+        assert "(assert (=> live_ARGS_2 live_ARGS_1))" in enc.global_definitions
+
+    def test_scalar_target_is_not_unrolled(self, tmp_path):
+        """Unrolling a scalar would let one request have two request methods."""
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,pass,chain"
+                SecRule ARGS "@streq b"
+            SecRule REQUEST_METHOD "@streq GET" "id:2,phase:2,pass"
+        """)
+        assert enc.members == 2
+        decls = decls_of(enc)
+        assert "(declare-const ARGS_2 String)" in decls
+        assert "(declare-const REQUEST_METHOD_2 String)" not in decls
+        assert "(declare-const REQUEST_METHOD_1 String)" in decls
+
+    def test_single_member_reproduces_the_old_shape(self, tmp_path):
+        enc = encode(tmp_path, 'SecRule ARGS "@streq a" "id:1,phase:2,pass"\n')
+        assert enc.members == 1
+        assert "(= match_0 (and live_ARGS_1 (= ARGS_1 \"a\")))" in defs_of(enc)
+
+
+class TestCollectionCardinality:
+    def test_closed_when_the_bound_covers_every_demand(self, tmp_path):
+        enc = encode(tmp_path, 'SecRule &ARGS "@eq 1" "id:1,phase:2,pass"\n')
+        assert enc.closed is True
+        assert "(assert (= cnt_ARGS (ite live_ARGS_1 1 0)))" in enc.global_definitions
+
+    def test_open_when_a_rule_demands_more_members(self, tmp_path):
+        """A large cardinality bound must not force a large unrolling."""
+        enc = encode(tmp_path, 'SecRule &ARGS "@gt 200" "id:1,phase:2,pass"\n')
+        assert enc.members == 1          # capped rather than unrolled
+        assert enc.closed is False
+        assert "(assert (>= cnt_ARGS (ite live_ARGS_1 1 0)))" in enc.global_definitions
+        assert any("bounded below" in c for c in enc.caveats())
+
+    def test_macro_cardinality_is_treated_as_unknown(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecAction "id:1,phase:1,pass,setvar:tx.max=5"
+            SecRule &ARGS "@gt %{tx.max}" "id:2,phase:2,pass"
+        """)
+        assert enc.closed is False
+
+    @pytest.mark.parametrize("op,slots,closed", [
+        ('"@eq 1"',  1, True),    # needs 1 member
+        ('"@ge 1"',  1, True),
+        ('"@gt 1"',  2, True),    # ">1" means at least 2
+        ('"@lt 9"',  1, True),    # upper bound only, no members demanded
+        ('"@eq 0"',  1, True),
+        ('"!@lt 9"', 1, False),   # negation gives a lower bound of 9, past the cap
+        ('"@eq 20"', 1, False),   # past the cap: not represented, target stays open
+    ])
+    def test_lower_bound_table(self, tmp_path, op, slots, closed):
+        from wafan.ruleset import Ruleset
+        path = tmp_path / f"c{abs(hash(op))}.conf"
+        path.write_text(f'SecRule &ARGS {op} "id:1,phase:2,pass"\n')
+        bound = member_bounds(Ruleset.from_paths(path))["ARGS"]
+        assert (bound.slots, bound.closed) == (slots, closed)
+
+
 class TestAliveChain:
     def test_terminator_extends_the_alive_chain(self, tmp_path):
         enc = encode(tmp_path, """
@@ -307,14 +454,17 @@ class TestScript:
         assert script.rstrip().endswith("(check-sat)")
         assert script.count("(") == script.count(")")
 
-    def test_request_counter_is_declared_non_negative(self, tmp_path):
+    def test_collection_count_tracks_the_live_members(self, tmp_path):
         enc = encode(tmp_path, 'SecRule ARGS "@streq a" "id:1,phase:2,pass"\n')
         assert "(declare-const cnt_ARGS Int)" in enc.globals
-        assert "(assert (>= cnt_ARGS 0))" in enc.global_definitions
+        # Nothing here needs more members than are modelled, so the count is
+        # exact rather than merely bounded below.
+        assert enc.closed is True
+        assert "(assert (= cnt_ARGS (ite live_ARGS_1 1 0)))" in enc.global_definitions
 
-    def test_value_match_is_guarded_by_collection_being_non_empty(self, tmp_path):
+    def test_value_match_is_guarded_by_member_presence(self, tmp_path):
         enc = encode(tmp_path, 'SecRule ARGS "@streq a" "id:1,phase:2,pass"\n')
-        assert "(> cnt_ARGS 0)" in defs_of(enc)
+        assert "(and live_ARGS_1 (= ARGS_1 \"a\"))" in defs_of(enc)
 
 
 class TestPositionLookup:

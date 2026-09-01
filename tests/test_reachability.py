@@ -178,6 +178,53 @@ CASES = [
         expected={"1150": OK, "1151": IMPOSSIBLE_MATCH},
     ),
     ReachCase(
+        name="chain_links_may_match_different_members",
+        rules="""
+            SecRule ARGS "@streq a" "id:1300,phase:2,pass,nolog,chain"
+                SecRule ARGS "@streq b"
+        """,
+        # ARGS is multi-valued: ?x=a&y=b satisfies the two links with two
+        # different members. Modelling the collection by a single value made
+        # this look dead.
+        expected={"1300": OK},
+    ),
+    ReachCase(
+        name="scalar_target_cannot_hold_two_values",
+        rules="""
+            SecRule REQUEST_METHOD "@streq GET" "id:1310,phase:2,pass,nolog,chain"
+                SecRule REQUEST_METHOD "@streq POST"
+        """,
+        # ...but a scalar really does have one value, so this stays dead.
+        expected={"1310": IMPOSSIBLE_MATCH},
+    ),
+    ReachCase(
+        name="large_cardinality_bound_stays_satisfiable",
+        rules="""
+            SecRule &ARGS "@gt 200" "id:1320,phase:2,pass,nolog"
+        """,
+        # The count is a free Int, so a big bound costs no unrolling.
+        expected={"1320": OK},
+    ),
+    ReachCase(
+        name="scalar_cardinality_is_not_closed_against_another_target",
+        rules="""
+            SecRule ARGS "@streq a" "id:1330,phase:2,pass,nolog,chain"
+                SecRule ARGS "@streq b"
+            SecRule &REQUEST_FILENAME "@eq 2" "id:1331,phase:2,pass,nolog"
+        """,
+        # The ARGS chain needs two slots. With a single global bound that also
+        # "closed" REQUEST_FILENAME at 2, contradicting its one slot and making
+        # 1331 falsely dead. Bounds are per target, so it stays live.
+        expected={"1330": OK, "1331": OK},
+    ),
+    ReachCase(
+        name="modest_cardinality_demand_is_representable",
+        rules="""
+            SecRule &ARGS "@eq 3" "id:1340,phase:2,pass,nolog"
+        """,
+        expected={"1340": OK},
+    ),
+    ReachCase(
         name="unsupported_operator_stays_reachable",
         rules="""
             SecRule ARGS "@detectSQLi" "id:1200,phase:2,pass,nolog"
@@ -369,6 +416,34 @@ def test_approximate_flag_set_when_a_side_is_abstracted(tmp_path):
     result = pairs[("1", "2")]
     assert result.approximate is True
     assert any("#1" in r for r in result.approximate_reasons)
+
+
+def test_member_bound_is_visible_on_the_encoding(tmp_path):
+    conf = write(tmp_path, """
+        SecRule ARGS "@streq a" "id:1,phase:2,pass,nolog,chain"
+            SecRule ARGS "@streq b"
+    """)
+    encoding = encode_ruleset(conf)
+    assert encoding.members == 2
+    assert encoding.closed is True
+
+
+def test_pairwise_encoding_doubles_the_bound(tmp_path):
+    """Two rules' conditions are asserted at once, so both need witnesses."""
+    conf = write(tmp_path, """
+        SecRule ARGS "@streq a" "id:1,phase:2,pass,nolog"
+        SecRule ARGS "@streq b" "id:2,phase:2,pass,nolog"
+    """)
+    single = encode_ruleset(conf)
+    both = encode_ruleset(conf, pairwise=True)
+    assert (single.members, both.members) == (1, 2)
+    # With one member the two rules look mutually exclusive; with two they
+    # can both fire on ?x=a&y=b.
+    def holds(enc):
+        pairs = StatefulPairChecker(make_solver(), INTERSECTION).find_pairs(enc)
+        return {r.rule_ids: r.holds for r in pairs}
+    assert holds(single)[("1", "2")] is False
+    assert holds(both)[("1", "2")] is True
 
 
 def test_unknown_mode_rejected():

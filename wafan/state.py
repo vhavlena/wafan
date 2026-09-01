@@ -50,6 +50,7 @@ Abstraction, and its direction
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
@@ -76,6 +77,33 @@ from .smt import (
 )
 
 INT, STRING = "Int", "String"
+
+# Collections that can hold more than one member in a single transaction, and
+# so are modelled as a bounded array (see `members` below). Everything not
+# listed here --- REQUEST_METHOD, REQUEST_URI, REQUEST_FILENAME, RESPONSE_BODY,
+# … --- holds exactly one value and stays a single constant.
+#
+# The default matters: unrolling a genuine scalar would let two conditions in
+# one chain be satisfied by two different "members" of something that has only
+# one, inventing requests that cannot exist (a chain requiring
+# REQUEST_METHOD to be both GET and POST would come out satisfiable). Treating
+# an unlisted collection as scalar instead merely reproduces the older,
+# single-representative behaviour, so an omission from this list costs
+# precision rather than soundness.
+MULTI_VALUED_COLLECTIONS = frozenset({
+    "ARGS", "ARGS_NAMES", "ARGS_GET", "ARGS_GET_NAMES", "ARGS_POST",
+    "ARGS_POST_NAMES", "REQUEST_HEADERS", "REQUEST_HEADERS_NAMES",
+    "REQUEST_COOKIES", "REQUEST_COOKIES_NAMES", "RESPONSE_HEADERS",
+    "RESPONSE_HEADERS_NAMES", "FILES", "FILES_NAMES", "FILES_SIZES",
+    "FILES_TMPNAMES", "FILES_TMP_CONTENT", "MULTIPART_FILENAME",
+    "MULTIPART_NAME", "MATCHED_VARS", "MATCHED_VARS_NAMES", "XML", "ENV",
+})
+
+
+def is_multi_valued(variable: SecRuleVariable) -> bool:
+    """True if *variable*'s collection can hold several members at once."""
+    return variable.name.upper() in MULTI_VALUED_COLLECTIONS
+
 
 _NUMERIC_SMT_OPS = {"eq": "=", "ge": ">=", "gt": ">", "le": "<=", "lt": "<"}
 
@@ -152,6 +180,138 @@ def infer_tx_sorts(ruleset: Ruleset) -> dict[TxKey, str]:
     return sorts
 
 
+# Ceiling on a bound derived from a cardinality predicate. A rule may demand
+# hundreds of members (CRS compares against `tx.max_num_args`); materialising
+# that many slots would be ruinous and buys nothing, since the count is a free
+# integer. Past this ceiling the target simply stays open.
+MAX_DERIVED_MEMBERS = 8
+
+
+@dataclass(frozen=True)
+class SpecBound:
+    """How one target spec is modelled: how many slots, and whether closed.
+
+    *closed* means the count equals the number of live slots, i.e. the array
+    models the whole collection. That is only legitimate when the slots can
+    represent every cardinality the ruleset demands of this target; otherwise
+    the slots are a prefix and the count is merely bounded below.
+    """
+
+    slots: int
+    closed: bool
+
+
+# Lower bound a numeric operator places on a count, keyed by (operator,
+# negated). Combinations absent from the table place no lower bound.
+_COUNT_LOWER_BOUND = {
+    ("eq", False): lambda n: n,
+    ("ge", False): lambda n: n,
+    ("gt", False): lambda n: n + 1,
+    ("lt", True):  lambda n: n,
+    ("le", True):  lambda n: n + 1,
+}
+
+
+def _count_lower_bound(rule: SecRule) -> Optional[int]:
+    """Lower bound this rule's operator puts on a counter target.
+
+    Returns 0 when it places none, and None when the bound cannot be
+    determined statically (a macro argument).
+    """
+    op_name, op_negated = _normalize_operator(rule.operator)
+    if op_name not in _NUMERIC_SMT_OPS:
+        return 0
+    negated = rule.negated or op_negated
+    fn = _COUNT_LOWER_BOUND.get((op_name, negated))
+    if fn is None:
+        return 0
+    arg = rule.operator_argument.strip()
+    if not re.fullmatch(r"[+-]?\d+", arg):
+        return None  # macro or non-literal: unknown
+    return fn(int(arg))
+
+
+def member_bounds(
+    ruleset: Ruleset, pairwise: bool = False, override: Optional[int] = None
+) -> dict[str, SpecBound]:
+    """Decide slot count and closedness for every request target, per spec.
+
+    Two independent demands set the slot count.
+
+    *Value conditions.* A condition ``∃v ∈ C. P(v)`` is witnessed by a single
+    member, so a query imposing *q* simultaneous conditions on one target is
+    satisfiable with at most *q* members: keeping one witness per condition
+    preserves every existential, and the universal arising from a negated rule
+    only becomes easier on a smaller set. *q* is the largest number of links of
+    one chain placing a condition on that target; a pairwise analysis asserts
+    two rules at once, so it doubles.
+
+    *Cardinality predicates.* ``&C "@eq 3"`` cannot be satisfied by an array the
+    model has closed at fewer than three members, so a literal lower bound
+    raises the slot count too --- but only up to :data:`MAX_DERIVED_MEMBERS`.
+    Beyond that, and whenever a bound is a macro and so unknown, the target
+    stays open instead: the count is a free integer, and leaving it merely
+    bounded below costs precision on the universal side of a subsumption query
+    while a hundred slots would cost the solver dearly.
+
+    Both are computed per target rather than globally. A single collection with
+    an unbounded cardinality must not open every other one, and --- the reason
+    this cannot be a global number at all --- a scalar target always has exactly
+    one slot, so closing it against some other target's larger bound would make
+    its own cardinality predicate unsatisfiable and the rule falsely dead.
+    """
+    value_conditions: Counter = Counter()
+    lower_bounds: dict[str, list[Optional[int]]] = {}
+    multi: dict[str, bool] = {}
+
+    for directive in ruleset.directives:
+        if directive.kind != "rule":
+            continue
+        per_spec: Counter = Counter()
+        for link in directive.chain:
+            bound = _count_lower_bound(link)
+            for v in link.variables:
+                if v.negated:
+                    continue
+                spec = _smt_var_name(v)
+                multi[spec] = is_multi_valued(v)
+                if v.counter:
+                    if v.name.lower() in STATEFUL_COLLECTIONS:
+                        continue  # TX counts come from the SSA chain, not an array
+                    lower_bounds.setdefault(spec, []).append(bound)
+                else:
+                    per_spec[spec] += 1
+        for spec, count in per_spec.items():
+            value_conditions[spec] = max(value_conditions[spec], count)
+
+    bounds: dict[str, SpecBound] = {}
+    for spec in set(value_conditions) | set(lower_bounds) | set(multi):
+        demanded = lower_bounds.get(spec, [])
+        known = [b for b in demanded if b is not None]
+
+        if not multi.get(spec, False):
+            slots = 1                      # scalars are never unrolled
+        elif override is not None:
+            slots = max(1, override)
+        else:
+            slots = max(1, value_conditions.get(spec, 1))
+            if pairwise:
+                slots *= 2
+            widest = max(known, default=0)
+            if widest <= MAX_DERIVED_MEMBERS:
+                slots = max(slots, widest)
+
+        closed = all(b is not None and b <= slots for b in demanded)
+        bounds[spec] = SpecBound(slots=slots, closed=closed)
+    return bounds
+
+
+def required_members(ruleset: Ruleset, pairwise: bool = False) -> int:
+    """Largest slot count any target in *ruleset* needs (see :func:`member_bounds`)."""
+    bounds = member_bounds(ruleset, pairwise=pairwise)
+    return max((b.slots for b in bounds.values()), default=1)
+
+
 # ---------------------------------------------------------------------------
 # Encoding result
 # ---------------------------------------------------------------------------
@@ -193,6 +353,11 @@ class StateEncoding:
     # initial state (0 for TX, free for the persistent collections).
     target_removals: list[int]               # positions using ctl:ruleRemoveTarget*
     unresolved_markers: list[str]
+    members: int = 1                         # largest array bound used
+    closed: bool = True                      # every target's count is exact
+    open_targets: list[str] = field(default_factory=list)  # targets whose count is
+    # only bounded below, because a rule demands more members than are modelled
+    bounds: dict[str, SpecBound] = field(default_factory=dict)  # per-target model
 
     def never_written(self) -> set[TxKey]:
         """State keys some rule reads that *no* rule in the ruleset writes.
@@ -261,6 +426,14 @@ class StateEncoding:
                 f"{len(self.target_removals)} ctl:ruleRemoveTarget* action(s) not "
                 "modelled; affected rules keep their full target list"
             )
+        if self.open_targets:
+            listed = ", ".join(self.open_targets[:4])
+            more = "" if len(self.open_targets) <= 4 else f" (+{len(self.open_targets) - 4} more)"
+            notes.append(
+                f"cardinality of {listed}{more} exceeds the modelled member count, "
+                "so those counts are bounded below rather than exact and "
+                "subsumption over them may be under-reported"
+            )
         if self.unresolved_markers:
             notes.append(
                 "skipAfter target(s) with no matching SecMarker in the analysed "
@@ -276,11 +449,16 @@ class StateEncoding:
 class StatefulEncoder:
     """Build a :class:`StateEncoding` for a :class:`~wafan.ruleset.Ruleset`."""
 
-    def __init__(self, ruleset: Ruleset) -> None:
+    def __init__(self, ruleset: Ruleset, members: Optional[int] = None,
+                 pairwise: bool = False) -> None:
         self.rs = ruleset
         self.order = ruleset.order
         self.cf = ruleset.control_flow
         self.tx_sorts = infer_tx_sorts(ruleset)
+        # Slot count and closedness, decided per target spec (see member_bounds).
+        self.bounds = member_bounds(ruleset, pairwise=pairwise, override=members)
+        self.members = max((b.slots for b in self.bounds.values()), default=1)
+        self.closed = all(b.closed for b in self.bounds.values())
 
         # Mutable encoding state, populated by encode().
         self._blocks: list[PositionBlock] = []
@@ -293,7 +471,7 @@ class StatefulEncoder:
         self._cnt_term: dict[TxKey, str] = {}
         self._val_term: dict[TxKey, str] = {}
         self._version: dict[str, int] = {}
-        self._request_vars: set[str] = set()
+        self._request_arrays: dict[str, tuple[list[str], list[str]]] = {}
         self._request_counters: dict[str, str] = {}
         self._transform_keys: dict[int, set[str]] = {}
         self._position: int = -1   # position currently being encoded
@@ -360,26 +538,64 @@ class StatefulEncoder:
             self._val_term[key] = self._initial_val(key)
         return self._val_term[key]
 
-    def _request_var(self, name: str) -> None:
-        if name not in self._request_vars:
-            self._request_vars.add(name)
-            self._globals.append(f"(declare-const {name} String)")
+    def _bound_for(self, name: str) -> SpecBound:
+        """Slot count and closedness for one spec; a lone slot if unseen."""
+        return self.bounds.get(name, SpecBound(slots=1, closed=True))
+
+    def _request_array(self, name: str, slots: int, closed: bool) -> tuple[list[str], list[str]]:
+        """Declare (once) the bounded array modelling one request target.
+
+        A target with *slots* members becomes *slots* String constants paired
+        with Boolean "this member is present" flags, plus an Int count.
+
+        Two constraints tie them together.
+
+        *Prefix closure* --- ``live_{i+1} => live_i`` --- says the live members
+        occupy a prefix. Matching is an existential over members and so is
+        permutation-invariant, meaning this removes no model up to reordering;
+        what it does remove is the factorial of equivalent liveness patterns
+        the solver would otherwise be free to enumerate.
+
+        *The count link* is deliberately asymmetric. If the last slot is unused
+        the whole array has been modelled and the count is exact; if it is used
+        there may be further members beyond the bound, so the count is only
+        bounded below. When the bound covers every cardinality the ruleset asks
+        for (see :func:`collections_are_closed`) the count is simply exact.
+        """
+        existing = self._request_arrays.get(name)
+        if existing is not None:
+            return existing
+
+        values = [f"{name}_{i}" for i in range(1, slots + 1)]
+        flags = [f"live_{name}_{i}" for i in range(1, slots + 1)]
+        for value, flag in zip(values, flags):
+            self._globals.append(f"(declare-const {value} String)")
+            self._globals.append(f"(declare-const {flag} Bool)")
+        for prev, cur in zip(flags, flags[1:]):
+            self._global_defs.append(f"(assert (=> {cur} {prev}))")
+        del slots  # the flag list is the authority from here on
+
+        count = f"cnt_{name}"
+        self._request_counters[name] = count
+        self._globals.append(f"(declare-const {count} Int)")
+        live_sum = "(+ " + " ".join(f"(ite {f} 1 0)" for f in flags) + ")" \
+            if len(flags) > 1 else f"(ite {flags[0]} 1 0)"
+        if closed:
+            self._global_defs.append(f"(assert (= {count} {live_sum}))")
+        else:
+            self._global_defs.append(f"(assert (>= {count} {live_sum}))")
+            self._global_defs.append(
+                f"(assert (=> (not {flags[-1]}) (= {count} {live_sum})))"
+            )
+
+        self._request_arrays[name] = (values, flags)
+        return values, flags
 
     def _request_counter(self, name: str) -> str:
-        """Free non-negative Int modelling ``&VAR`` for a request collection.
-
-        Unlike ``TX``, the size of a request collection is chosen by the
-        client, so it stays free. It is still tied to the value targets: a
-        collection with no members cannot match anything, which is what the
-        ``(> cnt 0)`` guard in :meth:`_request_atom` expresses.
-        """
-        sym = self._request_counters.get(name)
-        if sym is None:
-            sym = f"cnt_{name}"
-            self._request_counters[name] = sym
-            self._globals.append(f"(declare-const {sym} Int)")
-            self._global_defs.append(f"(assert (>= {sym} 0))")
-        return sym
+        """Int count for ``&VAR``, declaring the backing array if needed."""
+        bound = self._bound_for(name)
+        self._request_array(name, bound.slots, bound.closed)
+        return self._request_counters[name]
 
     # -- operator atoms ----------------------------------------------------
 
@@ -425,14 +641,25 @@ class StatefulEncoder:
             raise Abstracted(str(exc)) from exc
 
     def _request_atom(self, rule: SecRule, variable: SecRuleVariable, position: int) -> str:
+        """Encode one request target: an existential over its live members.
+
+        ModSecurity applies the operator to every member of a target and fires
+        if any matches, so the encoding is a disjunction over the array's
+        slots, each guarded by its presence flag. A single-valued target
+        collapses to one slot, which is the same formula the previous model
+        produced.
+        """
         name = _smt_var_name(variable)
-        counter = self._request_counter(name)
         if variable.counter:
-            return self._numeric_atom(rule, counter, position)
-        self._request_var(name)
-        atom = self._string_atom(rule, name)
-        # A collection with no members has nothing for the operator to match.
-        return f"(and (> {counter} 0) {atom})"
+            return self._numeric_atom(rule, self._request_counter(name), position)
+
+        bound = self._bound_for(name)
+        values, flags = self._request_array(name, bound.slots, bound.closed)
+        atoms = [
+            f"(and {flag} {self._string_atom(rule, value)})"
+            for value, flag in zip(values, flags)
+        ]
+        return atoms[0] if len(atoms) == 1 else "(or " + " ".join(atoms) + ")"
 
     def _target_atom(self, rule: SecRule, variable: SecRuleVariable, position: int) -> str:
         collection = variable.name.lower()
@@ -642,6 +869,10 @@ class StatefulEncoder:
             reads_before_write=self._reads_before_write,
             target_removals=target_removals,
             unresolved_markers=self.rs.unresolved_markers(),
+            members=self.members,
+            closed=self.closed,
+            open_targets=sorted(n for n, b in self.bounds.items() if not b.closed),
+            bounds=dict(self.bounds),
         )
 
     def _preamble(self) -> tuple[dict[str, str], dict[str, list[str]]]:
@@ -671,6 +902,15 @@ class StatefulEncoder:
         return decls, axioms
 
 
-def encode_ruleset(paths) -> StateEncoding:
-    """Convenience wrapper: parse *paths* and return its state encoding."""
-    return StatefulEncoder(Ruleset.from_paths(paths)).encode()
+def encode_ruleset(paths, members: Optional[int] = None,
+                   pairwise: bool = False) -> StateEncoding:
+    """Convenience wrapper: parse *paths* and return its state encoding.
+
+    *members* overrides the array bound for multi-valued collections; when
+    omitted it is derived from the ruleset (see :func:`required_members`).
+    Pass ``pairwise=True`` for an encoding that will be used by a pairwise
+    analysis, which asserts two rules' conditions at once and therefore needs
+    twice the bound.
+    """
+    ruleset = Ruleset.from_paths(paths)
+    return StatefulEncoder(ruleset, members=members, pairwise=pairwise).encode()
