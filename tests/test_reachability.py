@@ -446,6 +446,49 @@ def test_pairwise_encoding_doubles_the_bound(tmp_path):
     assert holds(both)[("1", "2")] is True
 
 
+def test_selector_is_a_subset_of_its_collection(tmp_path):
+    """ARGS:id's members ARE ARGS members, so these cannot both fire."""
+    conf = write(tmp_path, """
+        SecRule ARGS:id "@streq 42" "id:1,phase:2,pass,nolog"
+        SecRule &ARGS   "@eq 0"     "id:2,phase:2,pass,nolog"
+    """)
+    pairs = _pairs(conf, INTERSECTION)
+    assert pairs[("1", "2")].holds is False
+
+
+def test_names_view_shares_the_base_collection(tmp_path):
+    """A parameter named "x" means ARGS is non-empty."""
+    conf = write(tmp_path, """
+        SecRule ARGS_NAMES "@streq x" "id:1,phase:2,pass,nolog"
+        SecRule &ARGS      "@eq 0"    "id:2,phase:2,pass,nolog"
+    """)
+    pairs = _pairs(conf, INTERSECTION)
+    assert pairs[("1", "2")].holds is False
+
+
+def test_exclusion_removes_the_only_candidate_member(tmp_path):
+    """With exactly one cookie, the exclusion and the name test conflict.
+
+    Rule 1 requires a cookie *not* named "s" to hold "v", while its second
+    link requires a cookie named "s" -- satisfiable in general with two
+    members, but `&REQUEST_COOKIES "@eq 1"` forces them to be the same one.
+    Rule 2 drops the exclusion and stays live, showing the exclusion is what
+    kills rule 1 rather than the cardinality alone.
+    """
+    conf = write(tmp_path, """
+        SecRule REQUEST_COOKIES|!REQUEST_COOKIES:s "@streq v" "id:1,phase:2,pass,nolog,chain"
+            SecRule &REQUEST_COOKIES "@eq 1" "chain"
+            SecRule REQUEST_COOKIES_NAMES "@streq s"
+        SecRule REQUEST_COOKIES "@streq v" "id:2,phase:2,pass,nolog,chain"
+            SecRule &REQUEST_COOKIES "@eq 1" "chain"
+            SecRule REQUEST_COOKIES_NAMES "@streq s"
+    """)
+    results = ReachabilityChecker(make_solver()).find_dead(encode_ruleset(conf))
+    verdicts = {r.rule_id: r.verdict for r in results}
+    assert verdicts["1"] == IMPOSSIBLE_MATCH
+    assert verdicts["2"] == OK
+
+
 def test_unknown_mode_rejected():
     with pytest.raises(ValueError):
         StatefulPairChecker(make_solver(), "nonsense")

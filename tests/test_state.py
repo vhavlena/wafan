@@ -19,6 +19,7 @@ from wafan.state import (
     encode_ruleset,
     infer_tx_sorts,
     is_multi_valued,
+    resolve_target,
     macro_key,
     required_members,
 )
@@ -352,6 +353,80 @@ class TestBoundedArrays:
         enc = encode(tmp_path, 'SecRule ARGS "@streq a" "id:1,phase:2,pass"\n')
         assert enc.members == 1
         assert "(= match_0 (and live_ARGS_1 (= ARGS_1 \"a\")))" in defs_of(enc)
+
+
+class TestSharedArrays:
+    """Specs on one collection read one array, so their relationships hold
+    by construction rather than needing axioms."""
+
+    def test_selector_filters_the_shared_array(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS:id "@streq 42" "id:1,phase:2,pass"
+            SecRule ARGS    "@streq 42" "id:2,phase:2,pass"
+        """)
+        assert set(enc.bounds) == {"ARGS"}          # one array, not two
+        body = defs_of(enc)
+        assert '(and live_ARGS_1 (= ARGS_name_1 "id") (= ARGS_1 "42"))' in body
+        assert '(and live_ARGS_1 (= ARGS_1 "42"))' in body
+
+    def test_names_view_reads_the_name_field(self, tmp_path):
+        enc = encode(tmp_path, 'SecRule ARGS_NAMES "@streq secret" "id:1,phase:2,pass"\n')
+        assert set(enc.bounds) == {"ARGS"}
+        assert '(and live_ARGS_1 (= ARGS_name_1 "secret"))' in defs_of(enc)
+
+    def test_count_of_a_names_view_is_the_base_count(self, tmp_path):
+        """&ARGS and &ARGS_NAMES count the same members."""
+        enc = encode(tmp_path, """
+            SecRule &ARGS       "@eq 0" "id:1,phase:2,pass"
+            SecRule &ARGS_NAMES "@eq 0" "id:2,phase:2,pass"
+        """)
+        body = defs_of(enc)
+        assert body.count("(= cnt_ARGS 0)") == 2
+
+    def test_selector_count_is_a_filtered_sum(self, tmp_path):
+        enc = encode(tmp_path, 'SecRule &ARGS:action "@eq 1" "id:1,phase:2,pass"\n')
+        assert '(ite (and live_ARGS_1 (= ARGS_name_1 "action")) 1 0)' in defs_of(enc)
+
+    def test_exclusion_narrows_only_its_own_collection(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS|!ARGS:/__utm/|REQUEST_COOKIES "@streq bad" "id:1,phase:2,pass"
+        """)
+        body = defs_of(enc)
+        assert '(not (str.in_re ARGS_name_1 (re.from_ecma2020 ".*(__utm).*")))' in body
+        # the cookie disjunct must not inherit the ARGS exclusion
+        assert '(and live_REQUEST_COOKIES_1 (= REQUEST_COOKIES_1 "bad"))' in body
+
+    def test_regex_selector_matches_anywhere_in_the_name(self, tmp_path):
+        """ModSecurity searches the name rather than anchoring to it."""
+        enc = encode(tmp_path, 'SecRule REQUEST_COOKIES:/SESS/ "@streq x" "id:1,phase:2,pass"\n')
+        assert '.*(SESS).*' in defs_of(enc)
+
+    def test_header_names_are_case_insensitive(self, tmp_path):
+        """HTTP header names fold case; query-parameter names do not."""
+        enc = encode(tmp_path, """
+            SecRule REQUEST_HEADERS:User-Agent "@streq curl" "id:1,phase:2,pass"
+            SecRule REQUEST_HEADERS:user-agent "@streq curl" "id:2,phase:2,pass"
+            SecRule ARGS:id "@streq 1" "id:3,phase:2,pass"
+            SecRule ARGS:ID "@streq 1" "id:4,phase:2,pass"
+        """)
+        body = defs_of(enc)
+        assert body.count('(= (str.to_lower REQUEST_HEADERS_name_1) "user-agent")') == 2
+        assert '(= ARGS_name_1 "id")' in body and '(= ARGS_name_1 "ID")' in body
+
+    def test_xml_selector_is_xpath_not_a_name(self, tmp_path):
+        """XML:/* is an XPath expression, so it keeps an array of its own."""
+        enc = encode(tmp_path, 'SecRule XML:/* "@streq x" "id:1,phase:2,pass"\n')
+        ref = resolve_target(SecRuleVariable("XML", "/*"))
+        assert ref.selector == "" and ref.family in enc.bounds
+        assert "_name_" not in defs_of(enc)
+
+    def test_family_slots_are_shared_across_specs(self, tmp_path):
+        """Two specs on one collection in a chain compete for the same slots."""
+        enc = encode(tmp_path, """
+            SecRule ARGS:a "@streq 1" "id:1,phase:2,pass,chain"
+                SecRule ARGS:b "@streq 2"
+        """)
+        assert enc.bounds["ARGS"].slots == 2
 
 
 class TestCollectionCardinality:

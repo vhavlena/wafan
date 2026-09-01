@@ -65,6 +65,8 @@ from .ruleset import (
 )
 from .smt import (
     SMT_LOGIC,
+    _cached_pcre_to_ecma2020,
+    _escape_smt_string,
     UnsupportedOperatorError,
     UnsupportedTransformError,
     _normalize_operator,
@@ -100,9 +102,88 @@ MULTI_VALUED_COLLECTIONS = frozenset({
 })
 
 
+# A "_NAMES" collection is not a collection of its own: it is a view over the
+# member *names* of its base. Mapping it onto the same array is what makes
+# `&ARGS` and `&ARGS_NAMES` agree, and lets one chain link match a parameter's
+# name while another matches its value.
+NAMES_VIEW_OF = {
+    "ARGS_NAMES": "ARGS",
+    "ARGS_GET_NAMES": "ARGS_GET",
+    "ARGS_POST_NAMES": "ARGS_POST",
+    "REQUEST_HEADERS_NAMES": "REQUEST_HEADERS",
+    "REQUEST_COOKIES_NAMES": "REQUEST_COOKIES",
+    "RESPONSE_HEADERS_NAMES": "RESPONSE_HEADERS",
+    "FILES_NAMES": "FILES",
+    "MATCHED_VARS_NAMES": "MATCHED_VARS",
+}
+
+# Collections whose selector is a member *name*, so that `COLL:sel` can be
+# encoded as a filter over the shared array. XML is excluded: its selector is
+# an XPath expression (`XML:/*`), not a name, so each XML target keeps an array
+# of its own.
+_NOT_NAME_KEYED = frozenset({"XML"})
+
+# Collections whose member names are compared case-insensitively. HTTP header
+# names are, per RFC 7230; query-parameter names are not.
+CASE_INSENSITIVE_NAMES = frozenset({"REQUEST_HEADERS", "RESPONSE_HEADERS"})
+
+
 def is_multi_valued(variable: SecRuleVariable) -> bool:
     """True if *variable*'s collection can hold several members at once."""
     return variable.name.upper() in MULTI_VALUED_COLLECTIONS
+
+
+@dataclass(frozen=True)
+class TargetRef:
+    """Where a target spec reads from, and how it filters.
+
+    Several specs share one array: ``ARGS``, ``ARGS:id``, ``ARGS:/re/`` and
+    ``ARGS_NAMES`` all read the members of ``ARGS``, differing only in which
+    field they inspect and which members they admit. Resolving them onto a
+    common *family* is what makes the relationships between them hold by
+    construction rather than needing axioms --- ``ARGS:id`` is a subset of
+    ``ARGS`` because it is literally the same members, filtered.
+    """
+
+    family: str        # SMT-safe name of the backing array
+    multi: bool        # array of members, or a lone value
+    reads_names: bool  # the operator sees the member name, not its value
+    selector: str      # "" for the whole collection
+    selector_is_regex: bool
+    fold_case: bool    # compare names case-insensitively
+
+
+def _sanitise_symbol(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]", lambda m: f"_x{ord(m.group()):02x}_", text)
+
+
+def resolve_target(variable: SecRuleVariable) -> TargetRef:
+    """Map a target spec onto its backing array and filter."""
+    name = variable.name.upper()
+    part = variable.part
+
+    if not is_multi_valued(variable) or name in _NOT_NAME_KEYED:
+        # Scalars, and collections whose selector is not a member name, keep
+        # the selector folded into the symbol: there is nothing to filter.
+        return TargetRef(
+            family=_smt_var_name(variable),
+            multi=is_multi_valued(variable),
+            reads_names=False,
+            selector="",
+            selector_is_regex=False,
+            fold_case=False,
+        )
+
+    base = NAMES_VIEW_OF.get(name, name)
+    is_regex = part.startswith("/") and part.endswith("/") and len(part) > 1
+    return TargetRef(
+        family=_sanitise_symbol(base),
+        multi=True,
+        reads_names=name in NAMES_VIEW_OF,
+        selector=part[1:-1] if is_regex else part,
+        selector_is_regex=is_regex,
+        fold_case=base in CASE_INSENSITIVE_NAMES,
+    )
 
 
 _NUMERIC_SMT_OPS = {"eq": "=", "ge": ">=", "gt": ">", "le": "<=", "lt": "<"}
@@ -254,11 +335,13 @@ def member_bounds(
     bounded below costs precision on the universal side of a subsumption query
     while a hundred slots would cost the solver dearly.
 
-    Both are computed per target rather than globally. A single collection with
-    an unbounded cardinality must not open every other one, and --- the reason
-    this cannot be a global number at all --- a scalar target always has exactly
-    one slot, so closing it against some other target's larger bound would make
-    its own cardinality predicate unsatisfiable and the rule falsely dead.
+    Both are computed per *family* --- the array a spec reads from --- rather
+    than globally. A single collection with an unbounded cardinality must not
+    open every other one, and, the reason this cannot be a global number at
+    all, a scalar target always has exactly one slot, so closing it against
+    some other target's larger bound would make its own cardinality predicate
+    unsatisfiable and the rule falsely dead. Note that ``ARGS`` and
+    ``ARGS:id`` share a family and therefore compete for the same slots.
     """
     value_conditions: Counter = Counter()
     lower_bounds: dict[str, list[Optional[int]]] = {}
@@ -273,14 +356,16 @@ def member_bounds(
             for v in link.variables:
                 if v.negated:
                     continue
-                spec = _smt_var_name(v)
-                multi[spec] = is_multi_valued(v)
+                if v.name.lower() in STATEFUL_COLLECTIONS:
+                    continue  # TX state comes from the SSA chain, not an array
+                ref = resolve_target(v)
+                multi[ref.family] = ref.multi
                 if v.counter:
-                    if v.name.lower() in STATEFUL_COLLECTIONS:
-                        continue  # TX counts come from the SSA chain, not an array
-                    lower_bounds.setdefault(spec, []).append(bound)
+                    lower_bounds.setdefault(ref.family, []).append(bound)
                 else:
-                    per_spec[spec] += 1
+                    # Specs sharing a family share one array, so their
+                    # conditions compete for the same slots.
+                    per_spec[ref.family] += 1
         for spec, count in per_spec.items():
             value_conditions[spec] = max(value_conditions[spec], count)
 
@@ -471,8 +556,15 @@ class StatefulEncoder:
         self._cnt_term: dict[TxKey, str] = {}
         self._val_term: dict[TxKey, str] = {}
         self._version: dict[str, int] = {}
-        self._request_arrays: dict[str, tuple[list[str], list[str]]] = {}
+        self._request_arrays: dict[str, tuple[list[str], list[str], list[str]]] = {}
         self._request_counters: dict[str, str] = {}
+        # Families whose members carry no name (scalars, XPath-selected XML).
+        self._unkeyed: set[str] = {
+            resolve_target(v).family
+            for d in ruleset.directives if d.kind == "rule"
+            for link in d.chain for v in link.variables
+            if not resolve_target(v).multi or v.name.upper() in _NOT_NAME_KEYED
+        }
         self._transform_keys: dict[int, set[str]] = {}
         self._position: int = -1   # position currently being encoded
         # Running "the transaction has not been ended yet" term; see _reach_expr.
@@ -542,44 +634,47 @@ class StatefulEncoder:
         """Slot count and closedness for one spec; a lone slot if unseen."""
         return self.bounds.get(name, SpecBound(slots=1, closed=True))
 
-    def _request_array(self, name: str, slots: int, closed: bool) -> tuple[list[str], list[str]]:
-        """Declare (once) the bounded array modelling one request target.
+    def _request_array(self, family: str, slots: int, closed: bool,
+                       keyed: bool) -> tuple[list[str], list[str], list[str]]:
+        """Declare (once) the bounded array backing one collection family.
 
-        A target with *slots* members becomes *slots* String constants paired
-        with Boolean "this member is present" flags, plus an Int count.
+        Each of *slots* members is a value constant, a "this member is present"
+        flag and --- when *keyed* --- a name constant, so that a selector can be
+        expressed as a filter over the same array rather than as a second,
+        unrelated one.
 
-        Two constraints tie them together.
+        Two constraints tie the slots together.
 
-        *Prefix closure* --- ``live_{i+1} => live_i`` --- says the live members
-        occupy a prefix. Matching is an existential over members and so is
-        permutation-invariant, meaning this removes no model up to reordering;
-        what it does remove is the factorial of equivalent liveness patterns
-        the solver would otherwise be free to enumerate.
+        *Prefix closure* (``live_{i+1} => live_i``) says the live members occupy
+        a prefix. Matching is an existential over members and so permutation
+        invariant, meaning this removes no model up to reordering; what it
+        removes is the pile of equivalent liveness patterns the solver would
+        otherwise enumerate.
 
         *The count link* is deliberately asymmetric. If the last slot is unused
         the whole array has been modelled and the count is exact; if it is used
         there may be further members beyond the bound, so the count is only
         bounded below. When the bound covers every cardinality the ruleset asks
-        for (see :func:`collections_are_closed`) the count is simply exact.
+        of this family (see :func:`member_bounds`) the count is simply exact.
         """
-        existing = self._request_arrays.get(name)
+        existing = self._request_arrays.get(family)
         if existing is not None:
             return existing
 
-        values = [f"{name}_{i}" for i in range(1, slots + 1)]
-        flags = [f"live_{name}_{i}" for i in range(1, slots + 1)]
-        for value, flag in zip(values, flags):
-            self._globals.append(f"(declare-const {value} String)")
+        values = [f"{family}_{i}" for i in range(1, slots + 1)]
+        flags = [f"live_{family}_{i}" for i in range(1, slots + 1)]
+        names = [f"{family}_name_{i}" for i in range(1, slots + 1)] if keyed else []
+        for symbol in (*values, *names):
+            self._globals.append(f"(declare-const {symbol} String)")
+        for flag in flags:
             self._globals.append(f"(declare-const {flag} Bool)")
         for prev, cur in zip(flags, flags[1:]):
             self._global_defs.append(f"(assert (=> {cur} {prev}))")
-        del slots  # the flag list is the authority from here on
 
-        count = f"cnt_{name}"
-        self._request_counters[name] = count
+        count = f"cnt_{family}"
+        self._request_counters[family] = count
         self._globals.append(f"(declare-const {count} Int)")
-        live_sum = "(+ " + " ".join(f"(ite {f} 1 0)" for f in flags) + ")" \
-            if len(flags) > 1 else f"(ite {flags[0]} 1 0)"
+        live_sum = self._live_sum(flags)
         if closed:
             self._global_defs.append(f"(assert (= {count} {live_sum}))")
         else:
@@ -588,14 +683,44 @@ class StatefulEncoder:
                 f"(assert (=> (not {flags[-1]}) (= {count} {live_sum})))"
             )
 
-        self._request_arrays[name] = (values, flags)
-        return values, flags
+        self._request_arrays[family] = (values, flags, names)
+        return values, flags, names
 
-    def _request_counter(self, name: str) -> str:
-        """Int count for ``&VAR``, declaring the backing array if needed."""
-        bound = self._bound_for(name)
-        self._request_array(name, bound.slots, bound.closed)
-        return self._request_counters[name]
+    @staticmethod
+    def _live_sum(flags: Sequence[str], extra: Optional[Sequence[str]] = None) -> str:
+        """Number of live slots, optionally restricted by a per-slot predicate."""
+        terms = [
+            f"(ite {f} 1 0)" if extra is None else f"(ite (and {f} {p}) 1 0)"
+            for f, p in zip(flags, extra if extra is not None else flags)
+        ]
+        return terms[0] if len(terms) == 1 else "(+ " + " ".join(terms) + ")"
+
+    def _array_for(self, ref: TargetRef) -> tuple[list[str], list[str], list[str]]:
+        bound = self._bound_for(ref.family)
+        keyed = ref.multi and ref.family not in self._unkeyed
+        return self._request_array(ref.family, bound.slots, bound.closed, keyed)
+
+    def _selector_predicate(self, ref: TargetRef, name_symbol: str) -> str:
+        """Constraint saying a member's name matches *ref*'s selector.
+
+        A regex selector matches anywhere in the name --- ModSecurity searches
+        rather than anchoring --- so the wildcards are spliced into the pattern
+        text. They cannot be added with ``re.++``/``re.*`` because
+        ``re.from_ecma2020`` is a solver extension that does not compose with
+        the standard regex constructors.
+        """
+        subject = f"(str.to_lower {name_symbol})" if ref.fold_case else name_symbol
+        if ref.selector_is_regex:
+            conv = _cached_pcre_to_ecma2020(ref.selector)
+            body = conv.pattern
+            # Only pad the side that is not already anchored: `.*(^s$).*` is
+            # both redundant and markedly harder for the solver than `^s$`.
+            prefix = "" if body.startswith("^") else ".*"
+            suffix = "" if body.endswith("$") else ".*"
+            pattern = _escape_smt_string(f"{prefix}({body}){suffix}")
+            return f'(str.in_re {subject} (re.from_ecma2020 "{pattern}"))'
+        literal = ref.selector.lower() if ref.fold_case else ref.selector
+        return f'(= {subject} "{_escape_smt_string(literal)}")'
 
     # -- operator atoms ----------------------------------------------------
 
@@ -640,28 +765,52 @@ class StatefulEncoder:
         except (UnsupportedOperatorError, UnsupportedTransformError, UnsupportedPatternError) as exc:
             raise Abstracted(str(exc)) from exc
 
-    def _request_atom(self, rule: SecRule, variable: SecRuleVariable, position: int) -> str:
+    def _request_atom(
+        self,
+        rule: SecRule,
+        variable: SecRuleVariable,
+        position: int,
+        exclusions: Sequence[TargetRef] = (),
+    ) -> str:
         """Encode one request target: an existential over its live members.
 
-        ModSecurity applies the operator to every member of a target and fires
-        if any matches, so the encoding is a disjunction over the array's
-        slots, each guarded by its presence flag. A single-valued target
-        collapses to one slot, which is the same formula the previous model
-        produced.
+        ModSecurity applies the operator to every member a target resolves to
+        and fires if any matches, so this is a disjunction over the backing
+        array's slots. Each disjunct is guarded by the slot's presence flag,
+        by the target's own selector, and by the negation of every exclusion
+        that narrows the same collection.
         """
-        name = _smt_var_name(variable)
+        ref = resolve_target(variable)
         if variable.counter:
-            return self._numeric_atom(rule, self._request_counter(name), position)
+            return self._numeric_atom(rule, self._request_counter(ref), position)
 
-        bound = self._bound_for(name)
-        values, flags = self._request_array(name, bound.slots, bound.closed)
-        atoms = [
-            f"(and {flag} {self._string_atom(rule, value)})"
-            for value, flag in zip(values, flags)
-        ]
-        return atoms[0] if len(atoms) == 1 else "(or " + " ".join(atoms) + ")"
+        values, flags, names = self._array_for(ref)
+        disjuncts = []
+        for index, (value, flag) in enumerate(zip(values, flags)):
+            subject = names[index] if ref.reads_names else value
+            guards = [flag]
+            if ref.selector and names:
+                guards.append(self._selector_predicate(ref, names[index]))
+            for excluded in exclusions:
+                if names:
+                    guards.append(
+                        f"(not {self._selector_predicate(excluded, names[index])})"
+                    )
+            guards.append(self._string_atom(rule, subject))
+            disjuncts.append("(and " + " ".join(guards) + ")")
+        return disjuncts[0] if len(disjuncts) == 1 else "(or " + " ".join(disjuncts) + ")"
 
-    def _target_atom(self, rule: SecRule, variable: SecRuleVariable, position: int) -> str:
+    def _request_counter(self, ref: TargetRef) -> str:
+        """Term for ``&VAR``: the whole count, or a count of matching members."""
+        values, flags, names = self._array_for(ref)
+        if not ref.selector or not names:
+            self._array_for(ref)
+            return self._request_counters[ref.family]
+        matching = [self._selector_predicate(ref, name) for name in names]
+        return self._live_sum(flags, matching)
+
+    def _target_atom(self, rule: SecRule, variable: SecRuleVariable, position: int,
+                     exclusions: Sequence[TargetRef] = ()) -> str:
         collection = variable.name.lower()
         if collection in STATEFUL_COLLECTIONS and variable.part:
             key = (collection, variable.part.lower())
@@ -675,16 +824,24 @@ class StatefulEncoder:
                     )
                 return self._numeric_atom(rule, term, position)
             return self._string_atom(rule, term)
-        return self._request_atom(rule, variable, position)
+        return self._request_atom(rule, variable, position, exclusions)
 
     def _rule_match(self, rule: SecRule, position: int) -> str:
-        # A negated target (`!ARGS:foo`) excludes one member from a
-        # collection. With a collection modelled by a single representative
-        # there is nothing to subtract, so the exclusion is dropped: the
-        # modelled match is then a superset of the real one, which is the
-        # safe direction here (see the module docstring).
+        # A negated target (`!ARGS:/__utm/`) removes members from the
+        # collection it names, and only from that one, so exclusions are
+        # grouped by family and applied to that family's disjuncts. An
+        # exclusion on a family whose members carry no name cannot be
+        # expressed and is dropped, which over-approximates the match --- the
+        # safe direction (see the module docstring).
+        exclusions: dict[str, list[TargetRef]] = {}
+        for v in rule.variables:
+            if v.negated:
+                ref = resolve_target(v)
+                exclusions.setdefault(ref.family, []).append(ref)
+
         atoms = [
-            self._target_atom(rule, v, position)
+            self._target_atom(rule, v, position,
+                              exclusions.get(resolve_target(v).family, ()))
             for v in rule.variables
             if not v.negated
         ]
