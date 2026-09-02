@@ -675,6 +675,8 @@ def _stateful_pair_json(res) -> dict:
         "holds": res.holds,
         "approximate": res.approximate,
         "approximate_reasons": res.approximate_reasons,
+        "derived": res.derived,
+        "derived_reason": res.derived_reason,
         "elapsed_sec": round(res.elapsed_sec, 3),
         "error": res.error,
     }
@@ -705,7 +707,10 @@ def _run_stateful_pairs(
     results = checker.find_pairs(encoding, on_result=on_result, positions=positions)
 
     holding = [r for r in results if r.holds]
-    unknown = [r for r in results if r.result == SolverResult.UNKNOWN]
+    # A derived verdict comes from the two directives' target lists, not from
+    # the solver, so it is neither a timeout nor an unknown answer.
+    derived = [r for r in results if r.derived]
+    unknown = [r for r in results if r.result == SolverResult.UNKNOWN and not r.derived]
 
     if as_json:
         _print_json({
@@ -717,6 +722,7 @@ def _run_stateful_pairs(
             "pairs_checked": len(results),
             "pairs_holding": len(holding),
             "pairs_approximate": sum(1 for r in results if r.approximate),
+            "pairs_derived": len(derived),
             "pairs_unknown": len(unknown),
             "solver_queries": solver.query_count,
             "solver_timeouts": solver.timeout_count,
@@ -729,7 +735,7 @@ def _run_stateful_pairs(
     symbol = _STATEFUL_SYMBOL[_STATEFUL_MODE[mode]]
     heading = {
         "subsumption": "Pairs where every transaction firing A also fires B",
-        "intersection": "Pairs that can both fire in one transaction",
+        "intersection": "Pairs that can both fire on one common member",
         "contradiction": "Pairs where the earlier rule shadows a conflicting later one",
     }[mode]
     if not holding:
@@ -740,8 +746,10 @@ def _run_stateful_pairs(
             flag = "  (approximate)" if r.approximate else ""
             print(f"  {r.directive1.label()}")
             print(f"    {symbol}  {r.directive2.label()}{flag}")
+    if derived:
+        print(f"\n{len(derived)} pair(s) settled without the solver (no common target).")
     if unknown:
-        print(f"\n{len(unknown)} pair(s) returned unknown (solver timeout or unknown result).")
+        print(f"{len(unknown)} pair(s) returned unknown (solver timeout or unknown result).")
     for caveat in encoding.caveats():
         print(f"note: {caveat}")
     return 0

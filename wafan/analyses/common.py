@@ -10,10 +10,12 @@ from ..smt import (
     _operator_builder,
     _restrictable_transform_keys,
     _rules_relevant_codepoints,
+    chain_witness_map,
     effective_transforms,
     is_supported_operator,
     transform_preamble,
 )
+from ..targets import resolve_target
 from .solver import SolverResult
 
 _SMT_SEP = "  " + "-" * 62
@@ -42,10 +44,17 @@ def _rule_label(rule: SecRule, pat_width: int = 35) -> str:
 
     Format: ``#ID [VAR1,VAR2 OP "PATTERN"]``
 
-    Variable list is capped at three names; pattern is truncated to
-    *pat_width* characters so the label fits on one terminal line.
+    Each target is shown as written --- selector, ``&`` and ``!`` included ---
+    since two rules differing only in a selector get different verdicts, and a
+    label that dropped it would render them indistinguishable. The list is
+    capped at three targets; the pattern is truncated to *pat_width*
+    characters so the label fits on one terminal line.
     """
-    var_names = [v.name for v in rule.variables]
+    var_names = [
+        f"{'&' if v.counter else ''}{'!' if v.negated else ''}{v.name}"
+        + (f":{v.part}" if v.part else "")
+        for v in rule.variables
+    ]
     if len(var_names) > 3:
         vars_str = ",".join(var_names[:3]) + ",..."
     else:
@@ -176,8 +185,139 @@ def _chain_variable_names(chain: Sequence[SecRule]) -> frozenset[str]:
 
 
 def chains_share_variable(chain1: Sequence[SecRule], chain2: Sequence[SecRule]) -> bool:
-    """True if any link of chain1 and any link of chain2 target a common variable."""
+    """True if any link of chain1 and any link of chain2 target a common variable.
+
+    Compares the variable names as written, so ``ARGS`` and ``ARGS_NAMES``
+    count as different: use :func:`chains_share_target` for the question the
+    pairwise analyses actually ask, which is whether the two can read one
+    common member.
+    """
     return bool(_chain_variable_names(chain1) & _chain_variable_names(chain2))
+
+
+# ---------------------------------------------------------------------------
+# Common and escaping witnesses
+# ---------------------------------------------------------------------------
+#
+# A rule's condition is existential over the members its target list resolves
+# to, so two rules both firing on one request does not make them overlap: the
+# witnesses may be two different arguments, or two unrelated collections. What
+# the pairwise analyses ask is a relation between the two witness *sets* --- do
+# they meet (intersection), is one contained in the other (subsumption) --- and
+# both are decided here by conjoining the two sides' conditions on one shared
+# address per collection (see the address model in wafan.smt).
+#
+# Reading the target lists only decides which addresses exist to share; every
+# question about whether they can actually hold the same member --- selector
+# against selector, exclusion, name against value, pattern against pattern ---
+# goes to the solver as a constraint on the shared name and value symbols.
+
+
+def chain_value_families(chain: Sequence[SecRule]) -> frozenset[str]:
+    """The families whose members *chain* reads, i.e. where it can witness.
+
+    A ``&`` spec is excluded: it reads a cardinality rather than a member, so
+    it constrains no address and can never supply a common witness.
+    """
+    return frozenset(
+        resolve_target(v).family
+        for rule in chain
+        for v in rule.variables
+        if not v.negated and not v.counter
+    )
+
+
+def chains_share_target(chain1: Sequence[SecRule], chain2: Sequence[SecRule]) -> bool:
+    """True if the two chains can read a common member.
+
+    Resolves each spec onto its backing family, so ``ARGS``, ``ARGS:id`` and
+    ``ARGS_NAMES`` all count as the same target --- they are the same members,
+    filtered or viewed differently. Whether a *specific* member can satisfy
+    both sides is left to the solver.
+    """
+    return bool(chain_value_families(chain1) & chain_value_families(chain2))
+
+
+def solve_any(solver, scripts: Sequence[str]) -> SolverResult:
+    """Solve a query given as a disjunction of scripts: SAT iff any is.
+
+    Satisfiability distributes over disjunction, so a query the solver cannot
+    decide in one piece can be asked one branch at a time --- and that is not
+    a mere convenience. A refined pairwise query is a disjunction whose
+    branches carry negated regex memberships, and z3-noodler answers
+    ``unknown`` to the disjunction while deciding every branch of it: the
+    two halves of ``fire_p and (not fire_q or (wit_p and not wit_q))`` come
+    back ``unsat`` each, and the whole ``unknown``.
+
+    UNSAT only when every branch is; UNKNOWN when none is SAT and some branch
+    could not be decided.
+    """
+    verdict = SolverResult.UNSAT
+    for script in scripts:
+        result = solver.solve(script)
+        if result == SolverResult.SAT:
+            return SolverResult.SAT
+        if result == SolverResult.UNKNOWN:
+            verdict = SolverResult.UNKNOWN
+    return verdict
+
+
+def solver_timed_out(solver, before: int) -> bool:
+    """Whether the solver's last call ran out of time, given its
+    ``timeout_count`` from before that call.
+
+    A timeout is not the same answer as a formula the solver declined to
+    decide, and the difference decides whether splitting a disjunction is
+    worth trying: splitting rescues the second and only multiplies the cost of
+    the first, since every branch carries the same expensive constraints.
+    """
+    return getattr(solver, "timeout_count", 0) > before
+
+
+def chain_common_witness(
+    chain1: Sequence[SecRule],
+    chain2: Sequence[SecRule],
+) -> list[str]:
+    """One term per target both chains can witness their match in.
+
+    Empty when they share no target: with no address in common the two witness
+    sets are disjoint whatever the request, so the pair does not intersect
+    however freely both chains can fire.
+
+    Returned per target rather than pre-disjoined, because the caller may have
+    to ask the solver one at a time (see :func:`solve_any`).
+    """
+    w1 = chain_witness_map(chain1)
+    w2 = chain_witness_map(chain2)
+    return [f"(and {w1[family]} {w2[family]})" for family in w1 if family in w2]
+
+
+def chain_escaping_witness(
+    chain1: Sequence[SecRule],
+    chain2: Sequence[SecRule],
+) -> list[str]:
+    """One term per target where chain1 witnesses and chain2 does not.
+
+    This is the refutation of containment, and the second way subsumption can
+    fail: chain2 may well fire on every request chain1 fires on and still not
+    match the member chain1 matched.
+
+    Only the targets both chains read contribute. A collection chain2 never
+    looks at is no evidence that it misses anything --- its coverage is judged
+    where it looks. Counting those too would mean a chain guarded on
+    ``TX:flag`` could never be subsumed by the plain rule whose pattern it
+    repeats, though deleting it changes no verdict. Whether the two read any
+    common target at all is a question about the pair, settled before the
+    query is built (see :func:`chains_share_target`).
+
+    Empty when there is nothing to contain: no shared target, or no witness
+    on chain1's side (a ``&``-only condition, whose containment is vacuous).
+    """
+    w1 = chain_witness_map(chain1)
+    w2 = chain_witness_map(chain2)
+    return [
+        f"(and {w1[family]} (not {w2[family]}))" for family in w1 if family in w2
+    ]
 
 
 _DENY_ACTIONS = frozenset({"deny", "drop", "block"})

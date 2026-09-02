@@ -7,12 +7,16 @@ not quite the question a rule author has. This module asks the stronger ones,
 using the whole-ruleset model from :mod:`wafan.state`.
 
 ``intersection``
-    Is there a single transaction in which **both rules actually fire** —
-    both reached, both matched, given everything the ruleset does to ``TX``
-    state and control flow before them?
+    Is there a single transaction in which **both rules actually fire on one
+    member** — both reached, both matching the same argument, header or ``TX``
+    variable, given everything the ruleset does to state and control flow
+    before them? Both firing is not enough: a match is existential over the
+    members a target resolves to, so two rules on ``ARGS`` both fire on
+    ``?x=a&y=b`` while matching different arguments.
 
 ``subsumption``
-    Does **every** transaction that fires rule A also fire rule B?
+    Does **every** transaction that fires rule A also fire rule B, matching
+    every member A matched among those B reads?
 
 ``shadowing``
     For an earlier rule A and a later rule B whose dispositions conflict
@@ -33,11 +37,12 @@ Why "shadowing" and not "contradiction"
     from ``fire``.
 
 Two rules with no request variable in common can still interact through
-``TX``, so this module does not apply the "no shared variable" pruning the
-stateless checkers use — with state in the model, that filter is unsound.
-Because that filter is gone, this is a genuine O(n²) sweep of solver calls;
-:mod:`wafan.analyses.reachability` is O(n) and finds the dead-code class of
-defect, so prefer it for a first pass over a large ruleset, then use
+``TX``, so nothing here is pruned by comparing variable *names*. What does
+settle a pair without a solver call is having no address in common at all
+(see :func:`common_witness`), which is the query's own answer rather than a
+filter in front of it. Everything else is a genuine O(n²) sweep of solver
+calls; :mod:`wafan.analyses.reachability` is O(n) and finds the dead-code
+class of defect, so prefer it for a first pass over a large ruleset, then use
 ``positions=`` here to focus on what it flagged.
 """
 
@@ -48,8 +53,72 @@ from typing import Callable, Optional, Sequence
 
 from ..ruleset import Directive
 from ..state import StateEncoding
-from .common import chain_disposition
+from .common import chain_disposition, solve_any, solver_timed_out
 from .solver import SolverBackend, SolverResult
+
+# ---------------------------------------------------------------------------
+# Common and escaping witnesses
+# ---------------------------------------------------------------------------
+#
+# A match is existential over the members a target list resolves to, and the
+# state model makes each of those a slot of an array (or a name of a writable
+# collection), so `fire_p and fire_q` is satisfiable by two rules witnessing
+# at two *different* slots. That is the co-firing question --- the right one
+# for whether a chain can complete or a verdict can be reached, and the weaker
+# one for whether two rules inspect the same data. Equating the addresses is
+# what separates the two, and is what these build.
+#
+# The addresses come from the encoding, which recorded them as it built each
+# position's atoms (see StateEncoding.witness_map); the conditions are read at
+# the state versions of their own positions, so a shared `TX` name whose value
+# was rewritten in between is correctly two different values.
+
+
+def common_witness(encoding: StateEncoding, p: int, q: int) -> list[str]:
+    """One term per address at which both *p* and *q* can witness.
+
+    Empty when they read no address in common: the two witness sets are then
+    disjoint whatever the transaction does, so the pair does not overlap
+    however freely both can fire.
+
+    Returned per address rather than pre-disjoined, because the caller may
+    have to ask the solver one address at a time (see
+    :func:`~wafan.analyses.common.solve_any`).
+    """
+    w_p, w_q = encoding.witness_map(p), encoding.witness_map(q)
+    return [f"(and {w_p[a]} {w_q[a]})" for a in w_p if a in w_q]
+
+
+def escaping_witness(encoding: StateEncoding, p: int, q: int) -> list[str]:
+    """One term per address at which *p* can witness and *q* cannot.
+
+    This is the refutation of containment, and the second way subsumption can
+    fail: the directive at *q* may fire in every transaction *p* fires in and
+    still not match the member *p* matched.
+
+    Only addresses both read contribute --- one *q* never looks at is no
+    evidence that it misses anything, and counting it would leave a chain
+    guarded on ``TX:flag`` un-subsumable by the plain rule whose pattern it
+    repeats. Empty when they share no address at all, which leaves nothing to
+    contain.
+    """
+    w_p, w_q = encoding.witness_map(p), encoding.witness_map(q)
+    return [f"(and {w_p[a]} (not {w_q[a]}))" for a in w_p if a in w_q]
+
+
+def witness_incomplete(encoding: StateEncoding, p: int, q: int) -> str:
+    """Why *p* or *q* has no usable address map, or ``""`` when both do.
+
+    An abstracted directive's map describes only the links that were encoded
+    before the encoder gave up, so it must not be read as the addresses the
+    directive really reads.
+    """
+    for pos in (p, q):
+        reason = encoding.witness_partial.get(pos)
+        if reason:
+            return f"#{encoding.order[pos].rule_id}: {reason}"
+    return ""
+
 
 INTERSECTION = "intersection"
 SUBSUMPTION = "subsumption"
@@ -76,6 +145,10 @@ class StatefulPairResult:
     # encoder, so a positive verdict may be spurious (see wafan.state).
     approximate: bool = False
     approximate_reasons: list[str] = field(default_factory=list)
+    # True when the verdict follows from the addresses the two directives
+    # read, with no solver call needed (see StatefulPairChecker.check_pair).
+    derived: bool = False
+    derived_reason: str = ""
 
     @property
     def rule_ids(self) -> tuple[str, str]:
@@ -103,6 +176,11 @@ class StatefulPairResult:
 
     @property
     def outcome(self) -> str:
+        if self.derived and self.mode == SUBSUMPTION:
+            # Not "unknown": nothing was left undecided. With no target in
+            # common there is nothing to contain, and what remains is whether
+            # the first rule can fire at all.
+            return "degenerate"
         if self.result == SolverResult.UNKNOWN:
             return "unknown"
         if self.mode == SUBSUMPTION:
@@ -111,7 +189,10 @@ class StatefulPairResult:
             if self.result == SolverResult.UNSAT:
                 return "no_shadowing"
             return "shadowing" if self.dispositions_conflict else "overlap_no_conflict"
-        return "never_both_fire" if self.result == SolverResult.UNSAT else "both_fire"
+        # Not "both_fire"/"never_both_fire": the query asks whether one
+        # member witnesses both, and two rules that overlap nowhere can still
+        # fire in the same transaction on two different members.
+        return "no_overlap" if self.result == SolverResult.UNSAT else "overlap"
 
 
 class StatefulPairChecker:
@@ -124,16 +205,76 @@ class StatefulPairChecker:
         self._mode = mode
         self._verbosity = verbosity
 
-    def _assertions(self, encoding: StateEncoding, p: int, q: int) -> list[str]:
+    def _query(self, encoding: StateEncoding, p: int, q: int,
+               refine: bool = True) -> Optional[tuple[list[str], list[str]]]:
+        """The query for one ordered pair as (common part, alternatives).
+
+        The alternatives are a disjunction: the query holds if any one of them
+        does alongside the common part. Kept apart so a disjunction the solver
+        cannot decide whole can be asked branch by branch.
+
+        *refine* off falls back to the co-firing forms, which is what an
+        incomplete address map leaves available.
+
+        None means the addresses alone decide it: for intersection and
+        shadowing there is no common one, so no member can witness both; for
+        subsumption there is nothing to contain, and what remains is whether
+        the first directive can fire at all --- a question about one rule,
+        which reachability answers.
+        """
         fire_p, fire_q = encoding.fire[p], encoding.fire[q]
         if self._mode == SUBSUMPTION:
-            # SAT ⇔ some transaction fires p but not q ⇒ p ⊄ q.
-            return [fire_p, f"(not {fire_q})"]
+            # SAT ⇔ some transaction fires p but not q, or p matches a member
+            # q does not ⇒ p ⊄ q.
+            if not refine:
+                return [fire_p], [f"(not {fire_q})"]
+            escaping = escaping_witness(encoding, p, q)
+            if not escaping:
+                return None
+            return [fire_p], [f"(not {fire_q})", *escaping]
+
         if self._mode == SHADOWING:
             # p fires (and, being disruptive, ends the transaction) on a
             # request that q would also have matched.
-            return [fire_p, encoding.match[q]]
-        return [fire_p, fire_q]
+            head = [fire_p, encoding.match[q]]
+        else:
+            head = [fire_p, fire_q]
+        if not refine:
+            return head, []
+        shared = common_witness(encoding, p, q)
+        if not shared:
+            return None
+        return head, shared
+
+    def _solve(self, encoding: StateEncoding, head: list[str],
+               alternatives: list[str], upto: int) -> SolverResult:
+        """Solve ``head and (or alternatives)``, splitting it if need be.
+
+        One script first, since that is one solver call; on ``unknown`` the
+        disjunction is asked one branch at a time, which is what a refined
+        subsumption query usually needs --- a negated regex membership under a
+        disjunction is where z3-noodler gives up, though it decides each
+        branch of it (see :func:`~wafan.analyses.common.solve_any`).
+        """
+        if not alternatives:
+            return self._solver.solve(encoding.script(head, upto=upto))
+
+        combined = (
+            alternatives[0] if len(alternatives) == 1
+            else "(or " + " ".join(alternatives) + ")"
+        )
+        timeouts = getattr(self._solver, "timeout_count", 0)
+        result = self._solver.solve(encoding.script(head + [combined], upto=upto))
+        if (result != SolverResult.UNKNOWN or len(alternatives) == 1
+                or solver_timed_out(self._solver, timeouts)):
+            # A timeout is a different answer from a formula declined: every
+            # branch carries the same expensive constraints, so splitting one
+            # only multiplies the wait.
+            return result
+        return solve_any(
+            self._solver,
+            [encoding.script(head + [alt], upto=upto) for alt in alternatives],
+        )
 
     def check_pair(self, encoding: StateEncoding, p: int, q: int) -> StatefulPairResult:
         """Query one ordered pair of execution positions.
@@ -148,8 +289,47 @@ class StatefulPairChecker:
             if pos in encoding.abstracted
         ]
 
-        smt2 = encoding.script(self._assertions(encoding, p, q), upto=max(p, q))
-        result = self._solver.solve(smt2)
+        incomplete = witness_incomplete(encoding, p, q)
+        if incomplete:
+            reasons.append(f"address map incomplete ({incomplete}): co-firing only")
+        query = self._query(encoding, p, q, refine=not incomplete)
+
+        if query is None:
+            # Settled by the target lists: no solver call, and no verdict
+            # smuggled in either --- for subsumption what is left is a
+            # dead-code question about one rule, reported as unknown rather
+            # than as a subsumption so that a rule matching nothing does not
+            # come out redundant given every unrelated one.
+            derived = (
+                SolverResult.UNKNOWN if self._mode == SUBSUMPTION
+                else SolverResult.UNSAT
+            )
+            res = StatefulPairResult(
+                mode=self._mode,
+                directive1=d1,
+                directive2=d2,
+                position1=p,
+                position2=q,
+                result=derived,
+                approximate=bool(reasons),
+                approximate_reasons=reasons,
+                derived=True,
+                derived_reason=(
+                    "no common target: subsumption could only hold degenerately"
+                    if self._mode == SUBSUMPTION
+                    else "no common target: witness sets are disjoint"
+                ),
+            )
+            if self._verbosity >= 1:
+                print(
+                    f"  #{d1.rule_id} {_SYMBOL[self._mode]} #{d2.rule_id}"
+                    f"  [{res.outcome}]  ({res.derived_reason})",
+                    flush=True,
+                )
+            return res
+
+        head, alternatives = query
+        result = self._solve(encoding, head, alternatives, upto=max(p, q))
 
         res = StatefulPairResult(
             mode=self._mode,

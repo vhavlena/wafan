@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from wafan.analyses import SubprocessSolver
+from wafan.analyses import SolverResult, SubprocessSolver
 from wafan.analyses.reachability import (
     IMPOSSIBLE_MATCH,
     OK,
@@ -394,6 +394,137 @@ def test_stateful_subsumption_false_when_guard_differs(tmp_path):
     assert pairs[("2", "1")].holds is True
 
 
+# ---------------------------------------------------------------------------
+# One common member, not merely one transaction
+# ---------------------------------------------------------------------------
+
+def _positions(encoding, *rule_ids):
+    return [encoding.position_of_rule_id(rid) for rid in rule_ids]
+
+
+def test_intersection_needs_one_common_member(tmp_path):
+    """Two rules on ARGS can both fire on ?x=aaa&y=bbb without overlapping.
+
+    The bounded array is what makes this expressible: each rule takes its own
+    slot, so co-firing is satisfiable while no single argument matches both.
+    """
+    conf = write(tmp_path, """
+        SecRule ARGS "@streq aaa" "id:1,phase:2,pass,nolog"
+        SecRule ARGS "@streq bbb" "id:2,phase:2,pass,nolog"
+    """)
+    encoding = encode_ruleset(conf, pairwise=True)
+    p, q = _positions(encoding, "1", "2")
+
+    # Co-firing, the question this analysis used to ask, is satisfiable...
+    co_firing = encoding.script([encoding.fire[p], encoding.fire[q]], upto=max(p, q))
+    assert make_solver().solve(co_firing) == SolverResult.SAT
+
+    # ... but no member witnesses both.
+    res = StatefulPairChecker(make_solver(), INTERSECTION).check_pair(encoding, p, q)
+    assert res.outcome == "no_overlap"
+    assert res.holds is False
+
+
+def test_intersection_shares_a_member_when_one_can_satisfy_both(tmp_path):
+    conf = write(tmp_path, """
+        SecRule ARGS "@streq aaa" "id:1,phase:2,pass,nolog"
+        SecRule ARGS:id "@streq aaa" "id:2,phase:2,pass,nolog"
+    """)
+    encoding = encode_ruleset(conf, pairwise=True)
+    p, q = _positions(encoding, "1", "2")
+    res = StatefulPairChecker(make_solver(), INTERSECTION).check_pair(encoding, p, q)
+    assert res.holds is True
+
+
+def test_intersection_selector_conflict_has_no_common_member(tmp_path):
+    conf = write(tmp_path, """
+        SecRule ARGS:id "@streq aaa" "id:1,phase:2,pass,nolog"
+        SecRule ARGS:user "@streq aaa" "id:2,phase:2,pass,nolog"
+    """)
+    encoding = encode_ruleset(conf, pairwise=True)
+    p, q = _positions(encoding, "1", "2")
+    res = StatefulPairChecker(make_solver(), INTERSECTION).check_pair(encoding, p, q)
+    assert res.holds is False
+    # Decided by the solver from the two name constraints, not by the target
+    # lists: both rules do read ARGS.
+    assert res.derived is False
+
+
+def test_subsumption_over_a_selector_subset(tmp_path):
+    conf = write(tmp_path, """
+        SecRule ARGS:id "@streq aaa" "id:1,phase:2,pass,nolog"
+        SecRule ARGS "@streq aaa" "id:2,phase:2,pass,nolog"
+    """)
+    encoding = encode_ruleset(conf, pairwise=True)
+    p, q = _positions(encoding, "1", "2")
+    checker = StatefulPairChecker(make_solver(), SUBSUMPTION)
+    assert checker.check_pair(encoding, p, q).holds is True
+    assert checker.check_pair(encoding, q, p).holds is False
+
+
+def test_subsumption_keeps_a_tx_guarded_chain(tmp_path):
+    """A guard link reads a target the other rule never does.
+
+    Counting that as an escaping witness would leave every guarded chain
+    un-subsumable by the plain rule whose pattern it repeats, though deleting
+    it changes no verdict.
+    """
+    conf = write(tmp_path, """
+        SecAction "id:9,phase:2,pass,nolog,setvar:tx.flag=1"
+        SecRule ARGS "@streq aaa" "id:1,phase:2,pass,nolog,chain"
+            SecRule TX:flag "@eq 1"
+        SecRule ARGS "@streq aaa" "id:2,phase:2,pass,nolog"
+    """)
+    encoding = encode_ruleset(conf, pairwise=True)
+    p, q = _positions(encoding, "1", "2")
+    assert StatefulPairChecker(make_solver(), SUBSUMPTION).check_pair(encoding, p, q).holds
+
+
+def test_pair_without_a_common_target_is_settled_without_the_solver(tmp_path):
+    conf = write(tmp_path, """
+        SecRule ARGS "@streq aaa" "id:1,phase:2,pass,nolog"
+        SecRule REQUEST_URI "@streq aaa" "id:2,phase:2,pass,nolog"
+    """)
+    encoding = encode_ruleset(conf, pairwise=True)
+    p, q = _positions(encoding, "1", "2")
+
+    solver = make_solver()
+    res = StatefulPairChecker(solver, INTERSECTION).check_pair(encoding, p, q)
+    assert res.outcome == "no_overlap"
+    assert res.derived is True
+    assert solver.query_count == 0
+
+    # Subsumption is not reported either way: what is left is whether rule 1
+    # is dead, which is a question about one rule.
+    sub = StatefulPairChecker(solver, SUBSUMPTION).check_pair(encoding, p, q)
+    assert sub.derived is True
+    assert sub.holds is False
+    assert solver.query_count == 0
+
+
+def test_abstracted_rule_falls_back_to_co_firing(tmp_path):
+    """An abstracted match has no usable address map.
+
+    Reading the addresses collected before the encoder gave up as "everything
+    this rule reads" could report an overlap away; the pair falls back to the
+    weaker question and says so.
+    """
+    conf = write(tmp_path, """
+        SecAction "id:9,phase:2,pass,nolog,setvar:tx.n=5"
+        SecRule TX:n "@rx 5" "id:1,phase:2,pass,nolog,t:lowercase"
+        SecRule ARGS "@streq aaa" "id:2,phase:2,pass,nolog"
+    """)
+    encoding = encode_ruleset(conf, pairwise=True)
+    p, q = _positions(encoding, "1", "2")
+    assert p in encoding.abstracted
+    assert p in encoding.witness_partial
+
+    res = StatefulPairChecker(make_solver(), INTERSECTION).check_pair(encoding, p, q)
+    assert res.approximate is True
+    assert any("co-firing only" in r for r in res.approximate_reasons)
+    assert res.holds is True
+
+
 def test_disruptive_rules_can_never_both_fire(tmp_path):
     """The reason stateful "contradiction" has to be shadowing instead.
 
@@ -487,13 +618,21 @@ def test_pairwise_encoding_doubles_the_bound(tmp_path):
     single = encode_ruleset(conf)
     both = encode_ruleset(conf, pairwise=True)
     assert (single.members, both.members) == (1, 2)
-    # With one member the two rules look mutually exclusive; with two they
-    # can both fire on ?x=a&y=b.
-    def holds(enc):
-        pairs = StatefulPairChecker(make_solver(), INTERSECTION).find_pairs(enc)
-        return {r.rule_ids: r.holds for r in pairs}
-    assert holds(single)[("1", "2")] is False
-    assert holds(both)[("1", "2")] is True
+
+    # One member makes the two rules look mutually exclusive -- there is no
+    # request in the model where both fire. Two members admit ?x=a&y=b.
+    def both_fire(enc):
+        p, q = _positions(enc, "1", "2")
+        script = enc.script([enc.fire[p], enc.fire[q]], upto=max(p, q))
+        return make_solver().solve(script)
+
+    assert both_fire(single) == SolverResult.UNSAT
+    assert both_fire(both) == SolverResult.SAT
+    # Both firing is still not an overlap: the witnesses are two different
+    # arguments, which is what the pairwise query asks about (see
+    # test_intersection_needs_one_common_member).
+    pairs = StatefulPairChecker(make_solver(), INTERSECTION).find_pairs(both)
+    assert {r.rule_ids: r.holds for r in pairs}[("1", "2")] is False
 
 
 def test_selector_is_a_subset_of_its_collection(tmp_path):

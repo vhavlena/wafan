@@ -5,6 +5,8 @@ from pathlib import Path
 
 from wafan.parser import parse_file, parse_rx_rules, SecRule, SecRuleVariable, SecRuleAction
 from wafan.smt import (
+    chain_witness_map,
+    rule_atoms,
     rule_to_smt,
     rules_to_smt,
     chain_to_smt,
@@ -236,7 +238,11 @@ class TestRxRuleToSmt:
         )
         assert len(rule_to_smt(rule).declarations) == 1
 
-    def test_variable_part_included_in_name(self):
+    def test_selector_is_a_name_filter_on_the_shared_family(self):
+        # REQUEST_HEADERS:User-Agent reads a member of REQUEST_HEADERS, so it
+        # shares that family's address and constrains its name -- rather than
+        # getting a symbol of its own, which would hide the relation to a rule
+        # reading the whole collection.
         rule = SecRule(
             rule_id="1",
             variables=[SecRuleVariable(name="REQUEST_HEADERS", part="User-Agent")],
@@ -247,7 +253,27 @@ class TestRxRuleToSmt:
             chained=False,
             lineno=1,
         )
-        assert "REQUEST_HEADERS__User_x2d_Agent" in rule_to_smt(rule).declarations[0]
+        f = rule_to_smt(rule)
+        assert "(declare-const REQUEST_HEADERS String)" in f.declarations
+        assert "(declare-const REQUEST_HEADERS_name String)" in f.declarations
+        # Header names are case-insensitive, hence the folded comparison.
+        assert '(= (str.to_lower REQUEST_HEADERS_name) "user-agent")' in f.assertion
+        assert "str.in_re REQUEST_HEADERS (re.from_ecma2020" in f.assertion
+
+    def test_scalar_keeps_selector_folded_into_symbol(self):
+        # XML's selector is an XPath expression, not a member name, so there
+        # is nothing to filter and the spec keeps a symbol of its own.
+        rule = SecRule(
+            rule_id="1",
+            variables=[SecRuleVariable(name="XML", part="/*")],
+            operator="@rx",
+            operator_argument="curl",
+            negated=False,
+            actions=[],
+            chained=False,
+            lineno=1,
+        )
+        assert "XML___x2f__x2a_" in rule_to_smt(rule).declarations[0]
 
     def test_rule_id_preserved(self):
         assert rule_to_smt(make_rule(rule_id="954100")).rule_id == "954100"
@@ -826,3 +852,151 @@ class TestChainToSmt:
         ]
         assert len(url_decode_decls) == 1
         assert url_decode_decls[0].count("str.replace_re_all") < 256
+
+
+# ---------------------------------------------------------------------------
+# The address model: one member per collection, shared by every spec on it
+# ---------------------------------------------------------------------------
+
+def spec_rule(*variables: SecRuleVariable, pattern="a", operator="@rx", rule_id="1") -> SecRule:
+    return SecRule(
+        rule_id=rule_id,
+        variables=list(variables),
+        operator=operator,
+        operator_argument=pattern,
+        negated=False,
+        actions=[],
+        chained=False,
+        lineno=1,
+    )
+
+
+class TestAddresses:
+    def test_two_selectors_share_one_name_symbol(self):
+        # ARGS:id and ARGS:user read the same collection, so they constrain
+        # one name symbol -- which is what lets a solver see that no single
+        # member satisfies both.
+        f = rule_to_smt(spec_rule(SecRuleVariable("ARGS", "id"), SecRuleVariable("ARGS", "user")))
+        assert f.declarations.count("(declare-const ARGS_name String)") == 1
+        assert f.assertion.count('(= ARGS_name "id")') == 1
+        assert f.assertion.count('(= ARGS_name "user")') == 1
+
+    def test_selector_narrows_the_same_family_as_the_bare_collection(self):
+        bare = rule_to_smt(spec_rule(SecRuleVariable("ARGS")))
+        narrowed = rule_to_smt(spec_rule(SecRuleVariable("ARGS", "id")))
+        assert bare.declarations == ["(declare-const ARGS String)"]
+        assert "(declare-const ARGS String)" in narrowed.declarations
+        # The narrowed spec's condition is the bare one plus a name guard, so
+        # the containment holds by construction rather than needing an axiom.
+        assert bare.assertion in narrowed.assertion
+
+    def test_exclusion_is_a_negated_name_guard(self):
+        # `!ARGS:pass` removes members; encoding it as another positive
+        # disjunct (as a whole-spec symbol would) reads as the opposite.
+        f = rule_to_smt(spec_rule(
+            SecRuleVariable("ARGS"),
+            SecRuleVariable("ARGS", "pass", negated=True),
+        ))
+        assert f.assertion.startswith("(and ")
+        assert '(not (= ARGS_name "pass"))' in f.assertion
+
+    def test_exclusion_narrows_only_its_own_collection(self):
+        f = rule_to_smt(spec_rule(
+            SecRuleVariable("ARGS"),
+            SecRuleVariable("REQUEST_COOKIES"),
+            SecRuleVariable("ARGS", "pass", negated=True),
+        ))
+        assert f.assertion == (
+            '(or (and (not (= ARGS_name "pass")) '
+            '(str.in_re ARGS (re.from_ecma2020 "a"))) '
+            '(str.in_re REQUEST_COOKIES (re.from_ecma2020 "a")))'
+        )
+
+    def test_regex_selector_searches_the_name(self):
+        # ModSecurity searches the name rather than anchoring, so the
+        # pattern is padded -- on the unanchored side only.
+        f = rule_to_smt(spec_rule(SecRuleVariable("ARGS", "/^id/")))
+        assert '(str.in_re ARGS_name (re.from_ecma2020 "(^id).*"))' in f.assertion
+
+    def test_names_view_reads_the_name_of_its_base_family(self):
+        f = rule_to_smt(spec_rule(SecRuleVariable("ARGS_NAMES")))
+        # Same family as ARGS, so a name rule and a value rule can be asked
+        # about one common member; the operator reads the name.
+        assert "(declare-const ARGS String)" in f.declarations
+        assert "str.in_re ARGS_name (re.from_ecma2020" in f.assertion
+
+    def test_counter_reads_a_cardinality(self):
+        f = rule_to_smt(spec_rule(SecRuleVariable("ARGS", counter=True), operator="@eq", pattern="3"))
+        assert f.declarations == ["(declare-const cnt_ARGS Int)"]
+        assert "(= cnt_ARGS 3)" in f.assertion
+
+    def test_counter_cannot_be_negative(self):
+        # Without the guard, `&ARGS "@lt 5"` is satisfiable by a count of -1.
+        f = rule_to_smt(spec_rule(SecRuleVariable("ARGS", counter=True), operator="@lt", pattern="5"))
+        assert "(>= cnt_ARGS 0)" in f.assertion
+
+    def test_negated_counter_keeps_the_nonnegativity_guard_outside(self):
+        f = rule_to_smt(spec_rule(SecRuleVariable("ARGS", counter=True), operator="!@eq", pattern="0"))
+        assert f.assertion == "(and (>= cnt_ARGS 0) (not (= cnt_ARGS 0)))"
+
+    def test_filtered_counter_is_its_own_cardinality(self):
+        f = rule_to_smt(spec_rule(SecRuleVariable("ARGS", "id", counter=True), operator="@eq", pattern="1"))
+        assert f.declarations == ["(declare-const cnt_ARGS__id Int)"]
+
+    def test_counter_with_a_non_numeric_operator_is_unsupported(self):
+        # Better skipped than encoded as a comparison against a member value,
+        # which would make the rule share an address it never reads.
+        with pytest.raises(UnsupportedOperatorError):
+            rule_to_smt(spec_rule(SecRuleVariable("ARGS", counter=True), operator="@rx", pattern="a"))
+
+    def test_xml_keeps_its_selector_in_the_symbol(self):
+        # An XPath selector is not a member name, so there is nothing to
+        # filter and the spec keeps a family of its own.
+        f = rule_to_smt(spec_rule(SecRuleVariable("XML", "/*")))
+        assert f.declarations == ["(declare-const XML___x2f__x2a_ String)"]
+
+
+class TestRuleAtoms:
+    def test_counters_witness_nowhere(self):
+        atoms = rule_atoms(spec_rule(
+            SecRuleVariable("ARGS", counter=True),
+            operator="@eq", pattern="0",
+        ))
+        assert atoms.by_family == {}
+        assert len(atoms.counter_atoms) == 1
+
+    def test_atoms_are_keyed_by_family(self):
+        atoms = rule_atoms(spec_rule(
+            SecRuleVariable("ARGS", "id"),
+            SecRuleVariable("ARGS_NAMES"),
+            SecRuleVariable("REQUEST_URI"),
+        ))
+        assert set(atoms.by_family) == {"ARGS", "REQUEST_URI"}
+        assert len(atoms.by_family["ARGS"]) == 2
+
+    def test_assertion_disjoins_every_atom(self):
+        atoms = rule_atoms(spec_rule(SecRuleVariable("ARGS"), SecRuleVariable("REQUEST_URI")))
+        assert atoms.assertion().startswith("(or ")
+
+    def test_rule_with_only_exclusions_has_no_atoms(self):
+        with pytest.raises(UnsupportedOperatorError):
+            rule_atoms(spec_rule(SecRuleVariable("ARGS", "pass", negated=True))).assertion()
+
+
+class TestChainWitnessMap:
+    def test_links_on_one_family_are_disjoined(self):
+        # A witness is contributed by a single link, so the links' conditions
+        # are disjoined here -- the conjunction over links is the chain's
+        # match condition, which the pairwise queries assert separately.
+        link1 = spec_rule(SecRuleVariable("ARGS"), pattern="a")
+        link2 = spec_rule(SecRuleVariable("ARGS"), pattern="b")
+        link1.chained = True
+        witnesses = chain_witness_map([link1, link2])
+        assert set(witnesses) == {"ARGS"}
+        assert witnesses["ARGS"].startswith("(or ")
+
+    def test_links_on_different_families_stay_separate(self):
+        link1 = spec_rule(SecRuleVariable("ARGS"), pattern="a")
+        link2 = spec_rule(SecRuleVariable("REQUEST_URI"), pattern="b")
+        link1.chained = True
+        assert set(chain_witness_map([link1, link2])) == {"ARGS", "REQUEST_URI"}

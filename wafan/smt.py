@@ -22,7 +22,14 @@ Supported operators (see _OPERATORS / is_supported_operator):
                  (str.to_int input) is -1 for any non-digit string
 
 All operators support ``!`` negation (e.g. ``!@rx``) and the rule-level
-``negated`` flag.
+``negated`` flag. A ``&`` (counter) spec is the exception: it hands the
+operator a cardinality rather than a member value, so only the numeric
+operators apply to it (see :func:`_counter_atom`).
+
+Targets are modelled as one member per collection --- a value, a name and,
+for ``&``, a count --- which every spec on that collection shares, the
+selector becoming a filter on the name. See the "Addresses" section below for
+what that buys and what it costs.
 
 SecRule ``t:`` transformations are handled in two ways:
 
@@ -36,11 +43,12 @@ Modelled precisely as a define-fun:
                     wafan.transforms.html_entity_decode for the full table
                     and pass-ordering rules.
   urlDecode       – t_urlDecode, see wafan.transforms.url_decode
+  urlDecodeUni    – t_urlDecodeUni, see wafan.transforms.url_decode_uni. One
+                    rewrite pass per decodable codepoint, so the unrestricted
+                    declaration is large; transform_preamble trims it to the
+                    codepoints a rule's pattern can match.
 
 Uninterpreted functions (declared per-formula with constraining axioms):
-  urlDecodeUni    – t_urlDecodeUni    : length-non-increasing (idempotence
-                                        is NOT asserted — it does not hold
-                                        for inputs such as '%2541')
   removeWhitespace– t_removeWhitespace: idempotent, result contains no
                                         space / tab / CR / LF
   compressWhitespace–t_compressWhitespace: idempotent, no consecutive spaces
@@ -63,6 +71,13 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from .parser import SecRule, SecRuleAction, SecRuleVariable
+from .targets import (
+    TargetRef,
+    is_name_keyed,
+    resolve_target,
+    sanitise_symbol,
+    smt_var_name,
+)
 from .regex_alphabet import extract_relevant_codepoints_precise
 from .regex_conv import UnsupportedPatternError, pcre_to_ecma2020
 from .transforms.html_entity_decode import html_entity_decode_fun_decl
@@ -451,21 +466,9 @@ def transform_preamble(
 # Variable / pattern helpers
 # ---------------------------------------------------------------------------
 
-def _smt_var_name(variable: SecRuleVariable) -> str:
-    """Produce a sanitised SMT identifier for a ModSecurity variable.
-
-    ``variable.part`` may itself be a regex (e.g. ``ARGS:/jform\\[pass\\]/``),
-    which can contain characters like ``/[]\\`` that are not valid in an
-    unquoted SMT-LIB2 simple symbol. Anything outside ``[A-Za-z0-9_]`` is
-    replaced with its hex codepoint (e.g. ``[`` -> ``_x5b_``) rather than a
-    single ``_``, so two different variable specs that merely differ in
-    which non-alnum characters they contain (e.g. ``ARGS:a.b`` vs
-    ``ARGS:a_b``) can't collide onto the same SMT identifier.
-    """
-    name = variable.name
-    if variable.part:
-        name = f"{name}__{variable.part}"
-    return re.sub(r"[^A-Za-z0-9_]", lambda m: f"_x{ord(m.group()):02x}_", name)
+# Kept as a private alias: the whole-spec symbol is still the right thing for
+# a target :func:`resolve_target` cannot key by name (see wafan.targets).
+_smt_var_name = smt_var_name
 
 
 def _escape_smt_string(pattern: str) -> str:
@@ -746,6 +749,212 @@ def _operator_builder(rule: SecRule) -> Callable[[str], str]:
 
 
 # ---------------------------------------------------------------------------
+# Addresses
+# ---------------------------------------------------------------------------
+#
+# A rule's condition is existential over the members its target list resolves
+# to, and this encoding models one such member per collection: a value, a name
+# and (for `&`) a cardinality. That one member is the *address* at which the
+# rule witnesses its match, and every spec on a collection reads it --- `ARGS`,
+# `ARGS:id`, `ARGS:/re/` and `ARGS_NAMES` differ only in which field the
+# operator sees and which names are admitted (see wafan.targets).
+#
+# Sharing the address across specs is what puts the relations between them in
+# the solver's hands rather than the caller's: `ARGS:id` entails `ARGS`, and
+# `ARGS:id` conflicts with `ARGS:user`, because both are constraints on one
+# name symbol. It is also what makes a pairwise query able to ask for a
+# *common* witness rather than mere coexistence, which is the difference
+# between two rules overlapping and two rules both happening to fire.
+#
+# The cost is the flip side of the same identification: two conditions on one
+# collection are forced onto the same member, so a chain matching two
+# different arguments comes out unsatisfiable here. The stateful encoder's
+# bounded arrays are the fix (see wafan.state).
+
+
+def value_symbol(ref: TargetRef) -> str:
+    """Symbol holding the value of the member read at *ref*'s address."""
+    return ref.family
+
+
+def name_symbol(ref: TargetRef) -> str:
+    """Symbol holding that member's name. Only name-keyed families have one."""
+    return f"{ref.family}_name"
+
+
+def count_symbol(ref: TargetRef) -> str:
+    """Symbol for ``&``'s cardinality: the whole family, or its filtered part.
+
+    A filtered count gets a symbol of its own, so ``&ARGS`` and ``&ARGS:id``
+    are independent --- the encoding does not relate them, which loses
+    ``&ARGS:id <= &ARGS`` and so costs precision, not soundness.
+    """
+    if not ref.selector:
+        return f"cnt_{ref.family}"
+    return f"cnt_{ref.family}__{sanitise_symbol(ref.selector)}"
+
+
+def selector_predicate(ref: TargetRef, name_sym: str) -> str:
+    """Constraint saying a member's name matches *ref*'s selector.
+
+    A regex selector matches anywhere in the name --- ModSecurity searches
+    rather than anchoring --- so the wildcards are spliced into the pattern
+    text. They cannot be added with ``re.++``/``re.*`` because
+    ``re.from_ecma2020`` is a solver extension that does not compose with the
+    standard regex constructors.
+    """
+    subject = f"(str.to_lower {name_sym})" if ref.fold_case else name_sym
+    if ref.selector_is_regex:
+        body = _cached_pcre_to_ecma2020(ref.selector).pattern
+        # Only pad the side that is not already anchored: `.*(^s$).*` is both
+        # redundant and markedly harder for the solver than `^s$`.
+        prefix = "" if body.startswith("^") else ".*"
+        suffix = "" if body.endswith("$") else ".*"
+        pattern = _escape_smt_string(f"{prefix}({body}){suffix}")
+        return f'(str.in_re {subject} (re.from_ecma2020 "{pattern}"))'
+    literal = ref.selector.lower() if ref.fold_case else ref.selector
+    return f'(= {subject} "{_escape_smt_string(literal)}")'
+
+
+def _counter_atom(rule: SecRule, ref: TargetRef) -> str:
+    """Encode ``&VAR "@op N"``: the operator applied to a cardinality.
+
+    A counter reads how many members a target resolves to rather than what
+    any one of them says, so it constrains no address and never contributes a
+    witness (see :class:`RuleAtoms`).
+    """
+    op_name, op_negated = _normalize_operator(rule.operator)
+    smt_op = _NUMERIC_OPS.get(op_name)
+    if smt_op is None:
+        raise UnsupportedOperatorError(
+            f"Rule {rule.rule_id}: operator '{rule.operator}' is not numeric, "
+            f"so it cannot be applied to a count"
+        )
+    argument = rule.operator_argument.strip()
+    try:
+        value = int(argument)
+    except ValueError as exc:
+        raise UnsupportedOperatorError(
+            f"Operator argument '{argument}' is not an integer"
+        ) from exc
+    count = count_symbol(ref)
+    atom = _wrap_negated(f"({smt_op} {count} {value})", rule.negated or op_negated)
+    # A cardinality is never negative, and the guard has to sit outside the
+    # negation: without it `&ARGS "@lt 5"` and `&TX:x "!@eq 0"` are both
+    # satisfiable by a count of -1, which no transaction can produce.
+    return f"(and (>= {count} 0) {atom})"
+
+
+@dataclass
+class RuleAtoms:
+    """One rule's condition, split by the address each disjunct constrains.
+
+    *by_family* holds the atoms that read a member --- the ones that witness
+    somewhere, keyed by the family whose address they read. *counter_atoms*
+    holds the ``&`` atoms, which read a cardinality and so witness nowhere.
+    The rule's match condition is the disjunction of everything.
+    """
+
+    by_family: dict[str, list[str]] = field(default_factory=dict)
+    counter_atoms: list[str] = field(default_factory=list)
+    declarations: list[str] = field(default_factory=list)
+
+    def assertion(self) -> str:
+        atoms = [a for atoms in self.by_family.values() for a in atoms]
+        atoms += self.counter_atoms
+        if not atoms:
+            raise UnsupportedOperatorError("rule has no positive targets")
+        return atoms[0] if len(atoms) == 1 else "(or " + " ".join(atoms) + ")"
+
+    def witness_map(self) -> dict[str, str]:
+        """Per family, the condition under which this rule witnesses there."""
+        return {
+            family: atoms[0] if len(atoms) == 1 else "(or " + " ".join(atoms) + ")"
+            for family, atoms in self.by_family.items()
+        }
+
+
+def rule_atoms(rule: SecRule) -> RuleAtoms:
+    """Split *rule*'s condition into per-address atoms over shared symbols.
+
+    A negated target (``!ARGS:/__utm/``) removes members from the collection
+    it names, and only from that one, so exclusions are grouped by family and
+    applied as negated name guards to that family's atoms. An exclusion on a
+    family whose members carry no name cannot be expressed and is dropped,
+    which over-approximates the match --- the safe direction.
+
+    Raises:
+        UnsupportedOperatorError: if the operator is not supported, or (for
+            numeric operators) its argument is not an integer.
+        UnsupportedTransformError: if a t: action is unknown.
+    """
+    assertion_fn = _operator_builder(rule)
+    transforms = effective_transforms(rule)
+
+    exclusions: dict[str, list[TargetRef]] = {}
+    for variable in rule.variables:
+        if variable.negated and is_name_keyed(variable):
+            ref = resolve_target(variable)
+            exclusions.setdefault(ref.family, []).append(ref)
+
+    out = RuleAtoms()
+    declared: set[str] = set()
+
+    def declare(symbol: str, sort: str) -> None:
+        if symbol not in declared:
+            declared.add(symbol)
+            out.declarations.append(f"(declare-const {symbol} {sort})")
+
+    for variable in rule.variables:
+        if variable.negated:
+            continue
+        ref = resolve_target(variable)
+        if variable.counter:
+            declare(count_symbol(ref), "Int")
+            out.counter_atoms.append(_counter_atom(rule, ref))
+            continue
+
+        declare(value_symbol(ref), "String")
+        excluded_here = exclusions.get(ref.family, ())
+        if ref.selector or ref.reads_names or excluded_here:
+            declare(name_symbol(ref), "String")
+
+        guards: list[str] = []
+        if ref.selector:
+            guards.append(selector_predicate(ref, name_symbol(ref)))
+        for excluded in excluded_here:
+            guards.append(f"(not {selector_predicate(excluded, name_symbol(ref))})")
+
+        subject = name_symbol(ref) if ref.reads_names else value_symbol(ref)
+        guards.append(assertion_fn(apply_transforms_smt(subject, transforms)))
+
+        atom = guards[0] if len(guards) == 1 else "(and " + " ".join(guards) + ")"
+        out.by_family.setdefault(ref.family, []).append(atom)
+
+    return out
+
+
+def chain_witness_map(chain: Sequence[SecRule]) -> dict[str, str]:
+    """Per family, the condition under which *chain* witnesses at its address.
+
+    A chain matches only if every link does, but a witness is contributed by
+    a single link: the links may read different collections, and a pair of
+    chains intersects when *some* link of each witnesses at one address. So
+    the links' per-family conditions are disjoined here, not conjoined --- the
+    conjunction over links is the chain's match condition, asserted
+    separately alongside this (see ``chain_intersection_smt2``).
+    """
+    merged: dict[str, list[str]] = {}
+    for rule in chain:
+        for family, condition in rule_atoms(rule).witness_map().items():
+            merged.setdefault(family, []).append(condition)
+    return {
+        family: conds[0] if len(conds) == 1 else "(or " + " ".join(conds) + ")"
+        for family, conds in merged.items()
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -763,8 +972,11 @@ def rule_to_smt(
     around each variable expression.  Uninterpreted transforms are declared and
     axiomatised in the formula preamble.
 
-    Each ModSecurity variable becomes a free String constant.  Multiple
-    variables produce a disjunctive assertion.
+    Each collection contributes one free member --- a value, a name and, for
+    ``&``, a cardinality --- which every spec on that collection reads, with
+    the selector as a name filter (see :func:`rule_atoms`). Multiple targets
+    produce a disjunctive assertion, matching ModSecurity's existential over
+    the members a target list resolves to.
 
     Supported operators: @rx, @streq, @contains, @beginsWith, @endsWith,
     @within, @pm, @pmFromFile (alias @pmf), @eq, @ge, @gt, @le, @lt (each
@@ -804,26 +1016,14 @@ def rule_to_smt(
         restrictable = _restrictable_transform_keys([transforms])
     fun_decls, axioms = transform_preamble(transforms, relevant, restrictable)
 
-    declarations: list[str] = []
-    assertions: list[str] = []
-    seen: set[str] = set()
-
-    for variable in rule.variables:
-        v = _smt_var_name(variable)
-        if v not in seen:
-            declarations.append(f"(declare-const {v} String)")
-            seen.add(v)
-        var_expr = apply_transforms_smt(v, transforms)
-        assertions.append(assertion_fn(var_expr))
-
-    assertion = assertions[0] if len(assertions) == 1 else "(or " + " ".join(assertions) + ")"
+    atoms = rule_atoms(rule)
 
     return SmtFormula(
         rule_id=rule.rule_id,
         fun_declarations=fun_decls,
         axioms=axioms,
-        declarations=declarations,
-        assertion=assertion,
+        declarations=atoms.declarations,
+        assertion=atoms.assertion(),
     )
 
 

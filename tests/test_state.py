@@ -175,9 +175,12 @@ class TestSSA:
         """)
         body = defs_of(enc)
         # Each read is guarded by the name being set: an unset TX variable has
-        # no member, so `@eq 0` must not match its initial zero.
-        assert "(assert (= match_1 (and (> cnt_tx_a_1 0) (= v_tx_a_1 1))))" in body
-        assert "(assert (= match_3 (and (> cnt_tx_a_2 0) (= v_tx_a_2 2))))" in body
+        # no member, so `@eq 0` must not match its initial zero. The condition
+        # is named after the address it reads (see StateEncoding.witness_map).
+        assert "(assert (= wit_1_tx_a (and (> cnt_tx_a_1 0) (= v_tx_a_1 1))))" in body
+        assert "(assert (= match_1 wit_1_tx_a))" in body
+        assert "(assert (= wit_3_tx_a (and (> cnt_tx_a_2 0) (= v_tx_a_2 2))))" in body
+        assert "(assert (= match_3 wit_3_tx_a))" in body
 
     def test_rule_reads_pre_state_of_its_own_setvar(self, tmp_path):
         """A rule's operator sees the value *before* its own setvar runs."""
@@ -185,7 +188,7 @@ class TestSSA:
             SecAction "id:1,phase:1,pass,setvar:tx.a=1"
             SecRule TX:a "@eq 1" "id:2,phase:1,pass,setvar:tx.a=99"
         """)
-        assert "(assert (= match_1 (and (> cnt_tx_a_1 0) (= v_tx_a_1 1))))" in defs_of(enc)
+        assert "(assert (= wit_1_tx_a (and (> cnt_tx_a_1 0) (= v_tx_a_1 1))))" in defs_of(enc)
 
 
 class TestStateSelectors:
@@ -489,8 +492,26 @@ class TestBoundedArrays:
                 SecRule ARGS "@streq b"
         """)
         body = defs_of(enc)
-        assert "(or (and live_ARGS_1 (= ARGS_1 \"a\")) (and live_ARGS_2 (= ARGS_2 \"a\")))" in body
-        assert "(or (and live_ARGS_1 (= ARGS_1 \"b\")) (and live_ARGS_2 (= ARGS_2 \"b\")))" in body
+        # One named condition per slot, disjoined: the link matches if any
+        # live member does. Naming them is what lets a pairwise query ask the
+        # two rules to agree on *which* member (see witness_map).
+        assert '(assert (= wit_0_ARGS_0 (and live_ARGS_1 (= ARGS_1 "a"))))' in body
+        assert '(assert (= wit_0_ARGS_1 (and live_ARGS_2 (= ARGS_2 "a"))))' in body
+        assert '(assert (= wit_0_ARGS_0_2 (and live_ARGS_1 (= ARGS_1 "b"))))' in body
+        assert '(assert (= wit_0_ARGS_1_2 (and live_ARGS_2 (= ARGS_2 "b"))))' in body
+        # The links are conjoined, each an existential over the slots.
+        assert ("(assert (= match_0 (and (or wit_0_ARGS_0 wit_0_ARGS_1) "
+                "(or wit_0_ARGS_0_2 wit_0_ARGS_1_2))))") in body
+
+    def test_witness_map_addresses_the_slots(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,pass,chain"
+                SecRule ARGS "@streq b"
+        """)
+        # Both links read the same two addresses, so the directive witnesses
+        # at either -- under the disjunction of the links' conditions there.
+        assert enc.addresses(0) == {"req:ARGS#0", "req:ARGS#1"}
+        assert enc.witness_map(0)["req:ARGS#0"] == "(or wit_0_ARGS_0 wit_0_ARGS_0_2)"
 
     def test_liveness_flags_are_prefix_closed(self, tmp_path):
         """Symmetry breaking: live members occupy a prefix of the array."""
@@ -516,7 +537,9 @@ class TestBoundedArrays:
     def test_single_member_reproduces_the_old_shape(self, tmp_path):
         enc = encode(tmp_path, 'SecRule ARGS "@streq a" "id:1,phase:2,pass"\n')
         assert enc.members == 1
-        assert "(= match_0 (and live_ARGS_1 (= ARGS_1 \"a\")))" in defs_of(enc)
+        body = defs_of(enc)
+        assert '(assert (= wit_0_ARGS_0 (and live_ARGS_1 (= ARGS_1 "a"))))' in body
+        assert "(assert (= match_0 wit_0_ARGS_0))" in body
 
 
 class TestSharedArrays:

@@ -57,6 +57,17 @@ from typing import Optional, Sequence
 
 from .parser import SecRule, SecRuleVariable
 from .regex_conv import UnsupportedPatternError
+from .targets import (
+    CASE_INSENSITIVE_NAMES,
+    MULTI_VALUED_COLLECTIONS,
+    NAMES_VIEW_OF,
+    TargetRef,
+    _NOT_NAME_KEYED,
+    is_multi_valued,
+    is_name_keyed,
+    resolve_target,
+    sanitise_symbol as _sanitise_symbol,
+)
 from .ruleset import (
     PERSISTENT_COLLECTIONS,
     STATEFUL_COLLECTIONS,
@@ -72,7 +83,7 @@ from .smt import (
     UnsupportedTransformError,
     _normalize_operator,
     _operator_builder,
-    _smt_var_name,
+    selector_predicate,
     _wrap_negated,
     apply_transforms_smt,
     effective_transforms,
@@ -87,112 +98,6 @@ INT, STRING = "Int", "String"
 # so SMT operators and string literals fall away).
 _DECLARE_RE = re.compile(r"^\(declare-(?:const|fun)\s+([A-Za-z_][A-Za-z0-9_]*)")
 _SYMBOL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-
-# Collections that can hold more than one member in a single transaction, and
-# so are modelled as a bounded array (see `members` below). Everything not
-# listed here --- REQUEST_METHOD, REQUEST_URI, REQUEST_FILENAME, RESPONSE_BODY,
-# … --- holds exactly one value and stays a single constant.
-#
-# The default matters: unrolling a genuine scalar would let two conditions in
-# one chain be satisfied by two different "members" of something that has only
-# one, inventing requests that cannot exist (a chain requiring
-# REQUEST_METHOD to be both GET and POST would come out satisfiable). Treating
-# an unlisted collection as scalar instead merely reproduces the older,
-# single-representative behaviour, so an omission from this list costs
-# precision rather than soundness.
-MULTI_VALUED_COLLECTIONS = frozenset({
-    "ARGS", "ARGS_NAMES", "ARGS_GET", "ARGS_GET_NAMES", "ARGS_POST",
-    "ARGS_POST_NAMES", "REQUEST_HEADERS", "REQUEST_HEADERS_NAMES",
-    "REQUEST_COOKIES", "REQUEST_COOKIES_NAMES", "RESPONSE_HEADERS",
-    "RESPONSE_HEADERS_NAMES", "FILES", "FILES_NAMES", "FILES_SIZES",
-    "FILES_TMPNAMES", "FILES_TMP_CONTENT", "MULTIPART_FILENAME",
-    "MULTIPART_NAME", "MATCHED_VARS", "MATCHED_VARS_NAMES", "XML", "ENV",
-})
-
-
-# A "_NAMES" collection is not a collection of its own: it is a view over the
-# member *names* of its base. Mapping it onto the same array is what makes
-# `&ARGS` and `&ARGS_NAMES` agree, and lets one chain link match a parameter's
-# name while another matches its value.
-NAMES_VIEW_OF = {
-    "ARGS_NAMES": "ARGS",
-    "ARGS_GET_NAMES": "ARGS_GET",
-    "ARGS_POST_NAMES": "ARGS_POST",
-    "REQUEST_HEADERS_NAMES": "REQUEST_HEADERS",
-    "REQUEST_COOKIES_NAMES": "REQUEST_COOKIES",
-    "RESPONSE_HEADERS_NAMES": "RESPONSE_HEADERS",
-    "FILES_NAMES": "FILES",
-    "MATCHED_VARS_NAMES": "MATCHED_VARS",
-}
-
-# Collections whose selector is a member *name*, so that `COLL:sel` can be
-# encoded as a filter over the shared array. XML is excluded: its selector is
-# an XPath expression (`XML:/*`), not a name, so each XML target keeps an array
-# of its own.
-_NOT_NAME_KEYED = frozenset({"XML"})
-
-# Collections whose member names are compared case-insensitively. HTTP header
-# names are, per RFC 7230; query-parameter names are not.
-CASE_INSENSITIVE_NAMES = frozenset({"REQUEST_HEADERS", "RESPONSE_HEADERS"})
-
-
-def is_multi_valued(variable: SecRuleVariable) -> bool:
-    """True if *variable*'s collection can hold several members at once."""
-    return variable.name.upper() in MULTI_VALUED_COLLECTIONS
-
-
-@dataclass(frozen=True)
-class TargetRef:
-    """Where a target spec reads from, and how it filters.
-
-    Several specs share one array: ``ARGS``, ``ARGS:id``, ``ARGS:/re/`` and
-    ``ARGS_NAMES`` all read the members of ``ARGS``, differing only in which
-    field they inspect and which members they admit. Resolving them onto a
-    common *family* is what makes the relationships between them hold by
-    construction rather than needing axioms --- ``ARGS:id`` is a subset of
-    ``ARGS`` because it is literally the same members, filtered.
-    """
-
-    family: str        # SMT-safe name of the backing array
-    multi: bool        # array of members, or a lone value
-    reads_names: bool  # the operator sees the member name, not its value
-    selector: str      # "" for the whole collection
-    selector_is_regex: bool
-    fold_case: bool    # compare names case-insensitively
-
-
-def _sanitise_symbol(text: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_]", lambda m: f"_x{ord(m.group()):02x}_", text)
-
-
-def resolve_target(variable: SecRuleVariable) -> TargetRef:
-    """Map a target spec onto its backing array and filter."""
-    name = variable.name.upper()
-    part = variable.part
-
-    if not is_multi_valued(variable) or name in _NOT_NAME_KEYED:
-        # Scalars, and collections whose selector is not a member name, keep
-        # the selector folded into the symbol: there is nothing to filter.
-        return TargetRef(
-            family=_smt_var_name(variable),
-            multi=is_multi_valued(variable),
-            reads_names=False,
-            selector="",
-            selector_is_regex=False,
-            fold_case=False,
-        )
-
-    base = NAMES_VIEW_OF.get(name, name)
-    is_regex = part.startswith("/") and part.endswith("/") and len(part) > 1
-    return TargetRef(
-        family=_sanitise_symbol(base),
-        multi=True,
-        reads_names=name in NAMES_VIEW_OF,
-        selector=part[1:-1] if is_regex else part,
-        selector_is_regex=is_regex,
-        fold_case=base in CASE_INSENSITIVE_NAMES,
-    )
-
 
 _NUMERIC_SMT_OPS = {"eq": "=", "ge": ">=", "gt": ">", "le": "<=", "lt": "<"}
 
@@ -536,6 +441,17 @@ class StateEncoding:
     bounds: dict[str, SpecBound] = field(default_factory=dict)  # per-target model
     dynamic_slots: list[DynamicSlot] = field(default_factory=list)  # run-time-named
     # state entries, whose keys are SMT terms rather than literals
+    witness: dict[int, dict[str, list[str]]] = field(default_factory=dict)
+    # position -> address -> the conditions under which the directive there
+    # witnesses its match at that address (see witness_map). An *address* is
+    # one member of one collection: a slot of a request array, or a name of a
+    # writable one. Two directives overlap when one address witnesses both,
+    # which is a stronger and more useful statement than both firing on one
+    # request -- see wafan.analyses.stateful.
+    witness_partial: dict[int, str] = field(default_factory=dict)
+    # position -> why its address map is incomplete. A pairwise query
+    # involving such a position falls back to the co-firing form rather than
+    # reading an empty map as "witnesses nowhere".
     _dependencies: Optional[tuple] = field(default=None, repr=False, compare=False)
 
     def never_written(self) -> set[TxKey]:
@@ -549,6 +465,24 @@ class StateEncoding:
         missing (e.g. crs-setup.conf).
         """
         return {key for key in self.reads_before_write if key not in self.tx_sorts}
+
+    def witness_map(self, position: int) -> dict[str, str]:
+        """Per address, the condition under which *position*'s directive
+        witnesses its match there.
+
+        A directive is one chain, and a witness is contributed by a single
+        link, so the links' conditions at one address are disjoined: the
+        conjunction over links is the directive's match condition, which a
+        query asserts separately alongside this.
+        """
+        return {
+            address: terms[0] if len(terms) == 1 else "(or " + " ".join(terms) + ")"
+            for address, terms in self.witness.get(position, {}).items()
+        }
+
+    def addresses(self, position: int) -> frozenset[str]:
+        """The addresses *position*'s directive reads, i.e. where it can witness."""
+        return frozenset(self.witness.get(position, {}))
 
     def position_of_rule_id(self, rule_id: str) -> Optional[int]:
         for pos, d in enumerate(self.order):
@@ -731,6 +665,15 @@ class StatefulEncoder:
         self._reach: dict[int, str] = {}
         self._match: dict[int, str] = {}
         self._abstracted: dict[int, str] = {}
+        # Where each directive can witness its match: address -> the
+        # conditions under which it does. Recorded as the atoms are built,
+        # since they carry the state versions current at that position and
+        # cannot be reconstructed afterwards. See StateEncoding.witness_map.
+        self._witness: dict[int, dict[str, list[str]]] = {}
+        self._witness_partial: dict[int, str] = {}
+        self._witness_symbols: set[str] = set()
+        # The block being filled, so an atom can name itself where it is built.
+        self._block: Optional[PositionBlock] = None
         self._cnt_term: dict[TxKey, str] = {}
         self._val_term: dict[TxKey, str] = {}
         self._version: dict[str, int] = {}
@@ -886,24 +829,10 @@ class StatefulEncoder:
     def _selector_predicate(self, ref: TargetRef, name_symbol: str) -> str:
         """Constraint saying a member's name matches *ref*'s selector.
 
-        A regex selector matches anywhere in the name --- ModSecurity searches
-        rather than anchoring --- so the wildcards are spliced into the pattern
-        text. They cannot be added with ``re.++``/``re.*`` because
-        ``re.from_ecma2020`` is a solver extension that does not compose with
-        the standard regex constructors.
+        Shared with the stateless encoder: the two differ in how many members
+        they model, not in what a selector means.
         """
-        subject = f"(str.to_lower {name_symbol})" if ref.fold_case else name_symbol
-        if ref.selector_is_regex:
-            conv = _cached_pcre_to_ecma2020(ref.selector)
-            body = conv.pattern
-            # Only pad the side that is not already anchored: `.*(^s$).*` is
-            # both redundant and markedly harder for the solver than `^s$`.
-            prefix = "" if body.startswith("^") else ".*"
-            suffix = "" if body.endswith("$") else ".*"
-            pattern = _escape_smt_string(f"{prefix}({body}){suffix}")
-            return f'(str.in_re {subject} (re.from_ecma2020 "{pattern}"))'
-        literal = ref.selector.lower() if ref.fold_case else ref.selector
-        return f'(= {subject} "{_escape_smt_string(literal)}")'
+        return selector_predicate(ref, name_symbol)
 
     # -- operator atoms ----------------------------------------------------
 
@@ -948,6 +877,55 @@ class StatefulEncoder:
         except (UnsupportedOperatorError, UnsupportedTransformError, UnsupportedPatternError) as exc:
             raise Abstracted(str(exc)) from exc
 
+    # -- addresses ---------------------------------------------------------
+    #
+    # An address is one member of one collection: a slot of a request array,
+    # or a name of a writable collection (which is why the two are keyed
+    # differently below). Recording which addresses a directive's match can
+    # be witnessed at, and under what condition, is what lets a pairwise
+    # query ask for a *common* witness rather than for two rules that merely
+    # both fire --- on a request carrying two arguments, or on two unrelated
+    # collections. A `&` count is not an address: it reads how many members
+    # there are, not what any one of them says.
+
+    @staticmethod
+    def _slot_address(family: str, index: int) -> str:
+        return f"req:{family}#{index}"
+
+    @staticmethod
+    def _state_address(collection: str, name: str) -> str:
+        return f"st:{collection}:{name}"
+
+    @staticmethod
+    def _dynamic_address(slot: DynamicSlot) -> str:
+        # The slot's value symbol is unique to it, and two positions reading
+        # the same run-time-named entry read that same symbol.
+        return f"dyn:{slot.value}"
+
+    def _name_witness(self, position: int, address: str, term: str) -> str:
+        """Name one witness condition, and record it under its address.
+
+        The symbol, not the term, is what goes into the match disjunction and
+        into the address map, so each condition is written once and a pairwise
+        query relating two addresses is pure Boolean structure. That matters
+        for more than script size: an inlined ``(and A (not B))`` over two
+        regex memberships had the solver return *unknown* where the same
+        relation over two defined Booleans is decided at once.
+        """
+        short = address.split(":", 1)[1].replace("#", "_").replace(":", "_")
+        base = f"wit_{position}_{_sanitise_symbol(short)}"
+        symbol, n = base, 1
+        while symbol in self._witness_symbols:
+            n += 1
+            symbol = f"{base}_{n}"
+        self._witness_symbols.add(symbol)
+
+        assert self._block is not None
+        self._block.declarations.append(f"(declare-const {symbol} Bool)")
+        self._block.definitions.append(f"(assert (= {symbol} {term}))")
+        self._witness.setdefault(position, {}).setdefault(address, []).append(symbol)
+        return symbol
+
     def _request_atom(
         self,
         rule: SecRule,
@@ -980,7 +958,11 @@ class StatefulEncoder:
                         f"(not {self._selector_predicate(excluded, names[index])})"
                     )
             guards.append(self._string_atom(rule, subject))
-            disjuncts.append("(and " + " ".join(guards) + ")")
+            disjuncts.append(self._name_witness(
+                position,
+                self._slot_address(ref.family, index),
+                "(and " + " ".join(guards) + ")",
+            ))
         return disjuncts[0] if len(disjuncts) == 1 else "(or " + " ".join(disjuncts) + ")"
 
     def _request_counter(self, ref: TargetRef) -> str:
@@ -1063,7 +1045,11 @@ class StatefulEncoder:
             body = self._numeric_atom(rule, slot.value, position)
         else:
             body = self._string_atom(rule, slot.value)
-        return f"(and {slot.live} {key_test} {body})"
+        return self._name_witness(
+            position,
+            self._dynamic_address(slot),
+            f"(and {slot.live} {key_test} {body})",
+        )
 
     def _stateful_scan_atom(self, rule: SecRule, collection: str, pattern: str,
                             counter: bool, position: int) -> str:
@@ -1096,9 +1082,12 @@ class StatefulEncoder:
                     raise Abstracted(
                         f"transforms applied to Int-sorted {key[0]}.{key[1]}"
                     )
-                atoms.append(f"(and {guard} {self._numeric_atom(rule, term, position)})")
+                atom = f"(and {guard} {self._numeric_atom(rule, term, position)})"
             else:
-                atoms.append(f"(and {guard} {self._string_atom(rule, term)})")
+                atom = f"(and {guard} {self._string_atom(rule, term)})"
+            # Each name the selector resolves to is an address of its own,
+            # which is what lets `TX:/^score/` share a witness with `TX:score`.
+            atoms.append(self._name_witness(position, self._state_address(*key), atom))
         return atoms[0] if len(atoms) == 1 else "(or " + " ".join(atoms) + ")"
 
     def _target_atom(self, rule: SecRule, variable: SecRuleVariable, position: int,
@@ -1143,7 +1132,11 @@ class StatefulEncoder:
                     body = self._numeric_atom(rule, term, position)
                 else:
                     body = self._string_atom(rule, term)
-                atoms.insert(0, f"(and (> {self._cnt(key, position)} 0) {body})")
+                atoms.insert(0, self._name_witness(
+                    position,
+                    self._state_address(*key),
+                    f"(and (> {self._cnt(key, position)} 0) {body})",
+                ))
             elif not atoms:
                 # Nothing writes this name, so the target resolves to no
                 # members and the operator cannot hold.
@@ -1409,6 +1402,7 @@ class StatefulEncoder:
 
             self._position = position
             block = PositionBlock(position=position)
+            self._block = block
             if directive.removes_targets:
                 target_removals.append(position)
 
@@ -1434,6 +1428,7 @@ class StatefulEncoder:
             if directive.kind == "rule":
                 match_sym = f"match_{position}"
                 block.declarations.append(f"(declare-const {match_sym} Bool)")
+                mark = (len(block.declarations), len(block.definitions))
                 try:
                     match_expr = self._chain_match(directive.chain, position)
                 except Abstracted as exc:
@@ -1441,6 +1436,18 @@ class StatefulEncoder:
                     # over-approximates `fire`, so an abstracted rule is never
                     # reported dead or excluded from a pair.
                     self._abstracted[position] = str(exc)
+                    # Whatever links were encoded before the failure describe
+                    # only part of the condition, so the addresses collected
+                    # for this position are not the ones it really reads.
+                    # Dropping them and recording why keeps a pairwise query
+                    # from concluding "no common witness" from a partial map.
+                    self._witness.pop(position, None)
+                    self._witness_partial[position] = str(exc)
+                    # The witnesses named before the failure are referenced by
+                    # nothing now, so drop their declarations too rather than
+                    # leave the solver constraints it cannot use.
+                    del block.declarations[mark[0]:]
+                    del block.definitions[mark[1]:]
                 else:
                     block.definitions.append(f"(assert (= {match_sym} {match_expr}))")
             self._match[position] = match_sym
@@ -1474,6 +1481,8 @@ class StatefulEncoder:
             fire=self._fire,
             reach=self._reach,
             match=self._match,
+            witness=self._witness,
+            witness_partial=self._witness_partial,
             abstracted=self._abstracted,
             tx_sorts=self.tx_sorts,
             reads_before_write=self._reads_before_write,

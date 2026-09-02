@@ -16,6 +16,13 @@ import pytest
 
 from wafan.parser import parse_rx_rules, group_chains, SecRule, SecRuleVariable, SecRuleAction
 from wafan.smt import UnsupportedOperatorError, UnsupportedTransformError, chain_to_smt
+from wafan.analyses.common import (
+    chain_common_witness,
+    chain_escaping_witness,
+    chains_share_target,
+    solve_any,
+)
+from wafan.analyses.subsumption import subsumption_alternatives
 from wafan.analyses import (
     SolverResult,
     SubprocessSolver,
@@ -1457,3 +1464,260 @@ class TestWitnessCheckerChain:
         other = [make_rule(rule_id="2", pattern="baz")]
         results = checker.find_chain_witnesses(chain + other)
         assert len(results) == 2
+
+
+# ---------------------------------------------------------------------------
+# Common and escaping witnesses: what makes a pairwise verdict about the pair
+# ---------------------------------------------------------------------------
+
+def target_rule(*variables: SecRuleVariable, pattern="a", rule_id="1", operator="@rx") -> SecRule:
+    return SecRule(
+        rule_id=rule_id,
+        variables=list(variables),
+        operator=operator,
+        operator_argument=pattern,
+        negated=False,
+        actions=[],
+        chained=False,
+        lineno=1,
+    )
+
+
+class TestChainsShareTarget:
+    def test_selector_shares_with_the_bare_collection(self):
+        # ARGS:id reads members of ARGS, so the two can match one member --
+        # a relation `chains_share_variable` sees only by accident of both
+        # specs being spelled "ARGS".
+        c1 = [target_rule(SecRuleVariable("ARGS", "id"))]
+        c2 = [target_rule(SecRuleVariable("ARGS"))]
+        assert chains_share_target(c1, c2)
+
+    def test_names_view_shares_with_a_value_view(self):
+        c1 = [target_rule(SecRuleVariable("ARGS_NAMES"))]
+        c2 = [target_rule(SecRuleVariable("ARGS"))]
+        assert chains_share_target(c1, c2)
+        # ... which the name-based test misses, ARGS_NAMES being a different
+        # variable name.
+        assert not chains_share_variable(c1, c2)
+
+    def test_counter_shares_no_address(self):
+        # `&ARGS` reads how many members there are, not what one of them
+        # says, so it can never supply a common witness.
+        c1 = [target_rule(SecRuleVariable("ARGS", counter=True), operator="@eq", pattern="3")]
+        c2 = [target_rule(SecRuleVariable("ARGS"))]
+        assert not chains_share_target(c1, c2)
+        assert chains_share_variable(c1, c2)
+
+    def test_disjoint_collections_share_nothing(self):
+        c1 = [target_rule(SecRuleVariable("ARGS"))]
+        c2 = [target_rule(SecRuleVariable("REQUEST_URI"))]
+        assert not chains_share_target(c1, c2)
+
+    def test_exclusions_do_not_count_as_reads(self):
+        c1 = [target_rule(SecRuleVariable("ARGS"), SecRuleVariable("REQUEST_URI", negated=True))]
+        c2 = [target_rule(SecRuleVariable("REQUEST_URI"))]
+        assert not chains_share_target(c1, c2)
+
+
+class TestCommonWitness:
+    def test_disjoint_targets_leave_no_common_witness(self):
+        c1 = [target_rule(SecRuleVariable("ARGS"))]
+        c2 = [target_rule(SecRuleVariable("REQUEST_URI"))]
+        assert chain_common_witness(c1, c2) == []
+        # The query then carries its own answer.
+        assert "(assert false)" in chain_intersection_smt2(c1, c2)
+
+    def test_single_shared_address_needs_no_extra_assertion(self):
+        # Two single-target rules on one collection have only one address to
+        # witness at, so their own conditions already say it.
+        c1 = [target_rule(SecRuleVariable("ARGS"), pattern="a")]
+        c2 = [target_rule(SecRuleVariable("ARGS"), pattern="b")]
+        asserts = [l for l in chain_intersection_smt2(c1, c2).splitlines() if l.startswith("(assert")]
+        assert len(asserts) == 2
+
+    def test_overlapping_target_lists_require_the_shared_one(self):
+        # Each rule can fire on a collection the other ignores, so co-firing
+        # is easy; overlapping means agreeing on REQUEST_URI.
+        c1 = [target_rule(SecRuleVariable("ARGS"), SecRuleVariable("REQUEST_URI"), pattern="a")]
+        c2 = [target_rule(SecRuleVariable("REQUEST_URI"), SecRuleVariable("REQUEST_HEADERS"), pattern="b")]
+        assert chain_common_witness(c1, c2) == [
+            '(and (str.in_re REQUEST_URI (re.from_ecma2020 "a")) '
+            '(str.in_re REQUEST_URI (re.from_ecma2020 "b")))'
+        ]
+        asserts = [l for l in chain_intersection_smt2(c1, c2).splitlines() if l.startswith("(assert")]
+        assert len(asserts) == 3
+
+    def test_selector_pair_shares_the_name_symbol(self):
+        c1 = [target_rule(SecRuleVariable("ARGS", "id"))]
+        c2 = [target_rule(SecRuleVariable("ARGS", "user"))]
+        # One address, so no extra assertion -- but the two conditions now
+        # constrain one name symbol, which is what makes the pair unsat.
+        smt2 = chain_intersection_smt2(c1, c2)
+        assert len([l for l in smt2.splitlines() if l.startswith("(assert")]) == 2
+        assert '(= ARGS_name "id")' in smt2 and '(= ARGS_name "user")' in smt2
+
+    def test_one_alternative_per_shared_target(self):
+        # Asked one at a time when the solver cannot take the disjunction.
+        c1 = [target_rule(SecRuleVariable("ARGS"), SecRuleVariable("REQUEST_URI"), pattern="a")]
+        c2 = [target_rule(SecRuleVariable("ARGS"), SecRuleVariable("REQUEST_URI"), pattern="b")]
+        terms = chain_common_witness(c1, c2)
+        assert len(terms) == 2
+        single = chain_intersection_smt2(c1, c2, alternatives=[terms[0]])
+        assert terms[0] in single and terms[1] not in single
+
+
+class TestEscapingWitness:
+    def test_selector_is_subsumed_by_the_bare_collection(self):
+        # `ARGS:id "@rx a"` matches only members `ARGS "@rx a"` also matches,
+        # so the refutation must come out unsatisfiable.
+        c1 = [target_rule(SecRuleVariable("ARGS", "id"), pattern="a")]
+        c2 = [target_rule(SecRuleVariable("ARGS"), pattern="a")]
+        f1, f2 = chain_to_smt(c1), chain_to_smt(c2)
+        # The one escaping term is `chain1 and not chain2`, which the first
+        # disjunct already says, so the refutation stays the plain one.
+        assert subsumption_alternatives(c1, c2, f1, f2) == [f"(not {f2.assertion})"]
+        smt2 = chain_subsumption_smt2(c1, c2, f1, f2)
+        assert f"(assert {f1.assertion})" in smt2
+        assert f"(assert (not {f2.assertion}))" in smt2
+
+    def test_unshared_target_contributes_no_escape(self):
+        # A collection chain2 never reads is no evidence that it misses
+        # anything: its coverage is judged where it looks. Whether the pair
+        # shares a target at all is settled before the query is built.
+        c1 = [target_rule(SecRuleVariable("ARGS"), pattern="a")]
+        c2 = [target_rule(SecRuleVariable("REQUEST_URI"), pattern="a")]
+        assert chain_escaping_witness(c1, c2) == []
+
+    def test_partial_overlap_escapes_only_on_the_shared_target(self):
+        c1 = [target_rule(SecRuleVariable("ARGS"), SecRuleVariable("REQUEST_URI"), pattern="a")]
+        c2 = [target_rule(SecRuleVariable("REQUEST_URI"), pattern="b")]
+        assert chain_escaping_witness(c1, c2) == [
+            '(and (str.in_re REQUEST_URI (re.from_ecma2020 "a")) '
+            '(not (str.in_re REQUEST_URI (re.from_ecma2020 "b"))))'
+        ]
+
+    def test_guarded_chain_is_still_subsumed_by_the_rule_it_repeats(self):
+        # A chain whose extra link reads TX matches no ARGS member the plain
+        # rule misses, so deleting it changes nothing -- an escape on TX would
+        # make every guarded chain un-subsumable.
+        link = target_rule(SecRuleVariable("ARGS"), pattern="a", rule_id="1")
+        link.chained = True
+        guard = target_rule(SecRuleVariable("TX", "flag"), pattern="1", operator="@streq", rule_id="")
+        c1 = [link, guard]
+        c2 = [target_rule(SecRuleVariable("ARGS"), pattern="a", rule_id="2")]
+        f1, f2 = chain_to_smt(c1), chain_to_smt(c2)
+        escaping = chain_escaping_witness(c1, c2)
+        assert all("TX__flag" not in term for term in escaping)
+        smt2 = chain_subsumption_smt2(c1, c2, f1, f2)
+        assert '(= TX__flag "1")' in smt2.split("(assert")[1]   # f1 keeps the guard
+        assert '(= TX__flag "1")' not in smt2.split("(assert")[2]  # the refutation drops it
+
+    def test_counter_only_condition_has_no_witness_to_escape(self):
+        c1 = [target_rule(SecRuleVariable("ARGS", counter=True), operator="@eq", pattern="3")]
+        c2 = [target_rule(SecRuleVariable("ARGS"), pattern="a")]
+        assert chain_escaping_witness(c1, c2) == []
+
+
+class TestDerivedPairVerdicts:
+    def test_unshared_targets_are_disjoint_without_the_solver(self):
+        solver = ConstantSolver(SolverResult.SAT)
+        c1 = [target_rule(SecRuleVariable("ARGS"), rule_id="1")]
+        c2 = [target_rule(SecRuleVariable("REQUEST_URI"), rule_id="2")]
+        res = IntersectionChecker(solver).check_chain_pair(c1, c2)
+        # The verdict follows from the query's own shared-witness assertion,
+        # so a solver that says SAT to everything cannot change it.
+        assert res.result == SolverResult.UNSAT
+        assert "no common target" in res.skip_reason
+
+    def test_unshared_targets_leave_subsumption_degenerate(self):
+        solver = ConstantSolver(SolverResult.UNSAT)
+        c1 = [target_rule(SecRuleVariable("ARGS"), rule_id="1")]
+        c2 = [target_rule(SecRuleVariable("REQUEST_URI"), rule_id="2")]
+        res = SubsumptionChecker(solver).check_chain_pair(c1, c2)
+        # Not reported as a subsumption: what is left is whether chain1 is
+        # dead code, which is a question about one rule.
+        assert res.skipped
+        assert not res.is_subsumed
+        assert "no common target" in res.skip_reason
+
+    def test_names_view_pair_is_checked_rather_than_skipped(self):
+        solver = ConstantSolver(SolverResult.SAT)
+        c1 = [target_rule(SecRuleVariable("ARGS_NAMES"), rule_id="1")]
+        c2 = [target_rule(SecRuleVariable("ARGS"), rule_id="2")]
+        res = IntersectionChecker(solver).check_chain_pair(c1, c2)
+        assert not res.skipped
+        assert res.has_intersection
+
+
+class TestModelParsingIntegers:
+    def test_integer_binding_is_parsed(self):
+        # A `&` spec's witness is a count, printed unquoted.
+        from wafan.analyses.solver import _parse_get_value_output
+        assert _parse_get_value_output('((ARGS "abc")\n (cnt_ARGS 3))') == {
+            "ARGS": "abc", "cnt_ARGS": "3",
+        }
+
+    def test_quoted_digits_stay_strings(self):
+        from wafan.analyses.solver import _parse_get_value_output
+        assert _parse_get_value_output('((ARGS "3"))') == {"ARGS": "3"}
+
+
+class TestSolveAny:
+    def test_sat_when_any_branch_is(self):
+        results = iter([SolverResult.UNSAT, SolverResult.SAT])
+        solver = CallbackSolver(lambda _: next(results))
+        assert solve_any(solver, ["a", "b"]) == SolverResult.SAT
+
+    def test_unsat_only_when_every_branch_is(self):
+        solver = ConstantSolver(SolverResult.UNSAT)
+        assert solve_any(solver, ["a", "b", "c"]) == SolverResult.UNSAT
+
+    def test_undecided_branch_leaves_the_whole_unknown(self):
+        results = iter([SolverResult.UNSAT, SolverResult.UNKNOWN])
+        solver = CallbackSolver(lambda _: next(results))
+        assert solve_any(solver, ["a", "b"]) == SolverResult.UNKNOWN
+
+    def test_stops_at_the_first_sat(self):
+        calls = []
+        solver = CallbackSolver(lambda s: calls.append(s) or SolverResult.SAT)
+        solve_any(solver, ["a", "b", "c"])
+        assert calls == ["a"]
+
+
+class TestTimeoutIsNotIndecision:
+    def test_split_is_skipped_after_a_timeout(self):
+        # Every branch carries the same expensive constraints, so splitting a
+        # query that ran out of time only multiplies the wait.
+        class TimingOutSolver:
+            def __init__(self):
+                self.timeout_count = 0
+                self.calls = 0
+
+            def solve(self, _smt2):
+                self.calls += 1
+                self.timeout_count += 1
+                return SolverResult.UNKNOWN
+
+        c1 = [target_rule(SecRuleVariable("ARGS"), SecRuleVariable("REQUEST_URI"), pattern="a")]
+        c2 = [target_rule(SecRuleVariable("ARGS"), SecRuleVariable("REQUEST_URI"), pattern="b")]
+        solver = TimingOutSolver()
+        res = IntersectionChecker(solver).check_chain_pair(c1, c2)
+        assert res.result == SolverResult.UNKNOWN
+        assert solver.calls == 1
+
+    def test_split_runs_when_the_solver_merely_declined(self):
+        class DecliningSolver:
+            def __init__(self):
+                self.timeout_count = 0
+                self.calls = 0
+
+            def solve(self, _smt2):
+                self.calls += 1
+                return SolverResult.UNKNOWN if self.calls == 1 else SolverResult.UNSAT
+
+        c1 = [target_rule(SecRuleVariable("ARGS"), SecRuleVariable("REQUEST_URI"), pattern="a")]
+        c2 = [target_rule(SecRuleVariable("ARGS"), SecRuleVariable("REQUEST_URI"), pattern="b")]
+        solver = DecliningSolver()
+        res = IntersectionChecker(solver).check_chain_pair(c1, c2)
+        assert res.result == SolverResult.UNSAT
+        assert solver.calls == 3  # the disjunction, then one target at a time

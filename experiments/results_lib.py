@@ -44,6 +44,7 @@ def file_summary(reports: dict[str, dict]) -> pd.DataFrame:
 def aggregate_stats(files_df: pd.DataFrame) -> pd.DataFrame:
     """Per-report sums of the numeric summary counters (pairs, chains, solver stats)."""
     num_cols = ["pairs_checked", "pairs_disjoint", "pairs_intersecting", "pairs_contradicting",
+                "pairs_holding", "pairs_derived", "pairs_approximate",
                 "pairs_unknown", "chains_total", "chains_highlighted", "solver_timeouts",
                 "solver_errors", "unsupported_operator", "unsupported_pattern", "unsupported_transform"]
     cols = [c for c in num_cols if c in files_df.columns]
