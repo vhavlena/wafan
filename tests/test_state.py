@@ -18,6 +18,7 @@ from wafan.state import (
     member_bounds,
     encode_ruleset,
     capture_writes,
+    name_is_dynamic,
     infer_tx_sorts,
     is_multi_valued,
     resolve_target,
@@ -173,8 +174,10 @@ class TestSSA:
             SecRule TX:a "@eq 2" "id:4,phase:1,pass"
         """)
         body = defs_of(enc)
-        assert "(assert (= match_1 (= v_tx_a_1 1)))" in body
-        assert "(assert (= match_3 (= v_tx_a_2 2)))" in body
+        # Each read is guarded by the name being set: an unset TX variable has
+        # no member, so `@eq 0` must not match its initial zero.
+        assert "(assert (= match_1 (and (> cnt_tx_a_1 0) (= v_tx_a_1 1))))" in body
+        assert "(assert (= match_3 (and (> cnt_tx_a_2 0) (= v_tx_a_2 2))))" in body
 
     def test_rule_reads_pre_state_of_its_own_setvar(self, tmp_path):
         """A rule's operator sees the value *before* its own setvar runs."""
@@ -182,7 +185,98 @@ class TestSSA:
             SecAction "id:1,phase:1,pass,setvar:tx.a=1"
             SecRule TX:a "@eq 1" "id:2,phase:1,pass,setvar:tx.a=99"
         """)
-        assert "(assert (= match_1 (= v_tx_a_1 1)))" in defs_of(enc)
+        assert "(assert (= match_1 (and (> cnt_tx_a_1 0) (= v_tx_a_1 1))))" in defs_of(enc)
+
+
+class TestStateSelectors:
+    """`TX:/re/` selects state variables by name. The writable namespace is
+    statically known, so a selector resolves exactly -- except where a name is
+    itself computed at run time."""
+
+    def test_static_scan_covers_matching_names_only(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecAction "id:1,phase:1,pass,t:none,setvar:'tx.hdr_a=1'"
+            SecAction "id:2,phase:1,pass,t:none,setvar:'tx.hdr_b=2'"
+            SecAction "id:3,phase:1,pass,t:none,setvar:'tx.other=3'"
+            SecRule TX:/^hdr_/ "@eq 1" "id:4,phase:2,pass,t:none"
+        """)
+        body = defs_of(enc)
+        assert "v_tx_hdr_a_1" in body and "v_tx_hdr_b_1" in body
+        assert "v_tx_other_1" not in body.split("match_3")[-1]
+
+    def test_scan_disjunct_is_guarded_by_the_name_being_set(self, tmp_path):
+        """The static set is names that *could* exist; the count guard turns
+        that into names that *do* exist at this position."""
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq x" "id:1,phase:1,pass,t:none,setvar:'tx.hdr_a=1'"
+            SecRule TX:/^hdr_/ "@eq 1" "id:2,phase:2,pass,t:none"
+        """)
+        assert "(> cnt_tx_hdr_a_1 0)" in defs_of(enc)
+
+    def test_scan_matching_nothing_is_false(self, tmp_path):
+        enc = encode(tmp_path, 'SecRule TX:/^nope_/ "@eq 1" "id:1,phase:2,pass,t:none"\n')
+        assert "(= match_0 false)" in defs_of(enc)
+
+    def test_counter_scan_sums_the_matching_names(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecAction "id:1,phase:1,pass,t:none,setvar:'tx.hdr_a=1'"
+            SecAction "id:2,phase:1,pass,t:none,setvar:'tx.hdr_b=1'"
+            SecRule &TX:/^hdr_/ "@ge 2" "id:3,phase:2,pass,t:none"
+        """)
+        body = defs_of(enc)
+        assert "(ite (> cnt_tx_hdr_a_1 0) 1 0)" in body
+        assert "(ite (> cnt_tx_hdr_b_1 0) 1 0)" in body
+
+
+class TestDynamicStateNames:
+    """A setvar whose name contains a macro writes a key known only at run
+    time, so the key must be an SMT term and reads must test it symbolically."""
+
+    def test_name_is_dynamic(self):
+        assert name_is_dynamic("hdr_%{tx.1}")
+        assert not name_is_dynamic("hdr_host")
+
+    def test_key_becomes_a_concatenation_term(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS "@rx ^(.*)$" "id:1,phase:1,pass,capture,t:none,setvar:'tx.hdr_%{tx.1}=1'"
+        """)
+        assert len(enc.dynamic_slots) == 1
+        slot = enc.dynamic_slots[0]
+        assert slot.source == "hdr_%{tx.1}"
+        assert f'(assert (= {slot.key} (str.++ "hdr_" v_tx_1_1)))' in defs_of(enc)
+
+    def test_selector_tests_the_key_symbolically(self, tmp_path):
+        """Regression: matching the selector against the literal name
+        `hdr_%{tx.1}` in Python reported the reader dead, though the capture
+        could well be "host"."""
+        enc = encode(tmp_path, """
+            SecRule ARGS "@rx ^(.*)$" "id:1,phase:1,pass,capture,t:none,setvar:'tx.hdr_%{tx.1}=1'"
+            SecRule &TX:/^hdr_host$/ "!@eq 0" "id:2,phase:2,pass,t:none"
+        """)
+        body = defs_of(enc)
+        assert "str.in_re k_tx_dyn0" in body
+        assert "(= match_1 false)" not in body
+
+    def test_exact_name_read_also_considers_dynamic_keys(self, tmp_path):
+        """A run-time name may be exactly the one a later rule asks for."""
+        enc = encode(tmp_path, """
+            SecRule ARGS "@rx ^(.*)$" "id:1,phase:1,pass,capture,t:none,setvar:'tx.hdr_%{tx.1}=1'"
+            SecRule TX:hdr_host "@eq 1" "id:2,phase:2,pass,t:none"
+        """)
+        assert '(= k_tx_dyn0 "hdr_host")' in defs_of(enc)
+
+    def test_read_of_a_name_nothing_writes_is_false(self, tmp_path):
+        """With no dynamic writer either, the variable cannot exist."""
+        enc = encode(tmp_path, 'SecRule TX:absent "@eq 1" "id:1,phase:2,pass,t:none"\n')
+        assert "(= match_0 false)" in defs_of(enc)
+
+    def test_dynamic_names_excluded_from_static_matching(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS "@rx ^(.*)$" "id:1,phase:1,pass,capture,t:none,setvar:'tx.hdr_%{tx.1}=1'"
+            SecRule TX:/^hdr_/ "@streq 1" "id:2,phase:2,pass,t:none"
+        """)
+        # handled as a dynamic slot, not as a literal key named "hdr_%{tx.1}"
+        assert "v_tx_hdr__x25__x7b_" not in defs_of(enc)
 
 
 class TestCaptureWrites:

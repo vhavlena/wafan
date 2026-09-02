@@ -235,6 +235,25 @@ CASES = [
         expected={"1350": OK},
     ),
     ReachCase(
+        name="dynamically_named_state_is_reachable_by_selector",
+        rules="""
+            SecRule ARGS "@rx ^(.*)$" "id:1360,phase:1,pass,nolog,capture,t:none,setvar:'tx.hdr_%{tx.1}=1'"
+            SecRule &TX:/^hdr_host$/ "!@eq 0" "id:1361,phase:2,pass,nolog,t:none"
+        """,
+        # The written key is "hdr_" ++ <capture>; if the capture is "host" the
+        # variable exists. Matching the selector against the unexpanded literal
+        # reported this dead.
+        expected={"1360": OK, "1361": OK},
+    ),
+    ReachCase(
+        name="selector_matching_no_written_name_is_dead",
+        rules="""
+            SecAction "id:1370,phase:1,pass,nolog,t:none,setvar:'tx.hdr_a=1'"
+            SecRule TX:/^nothing_/ "@eq 1" "id:1371,phase:2,pass,nolog,t:none"
+        """,
+        expected={"1371": IMPOSSIBLE_MATCH},
+    ),
+    ReachCase(
         name="unsupported_operator_stays_reachable",
         rules="""
             SecRule ARGS "@detectSQLi" "id:1200,phase:2,pass,nolog"

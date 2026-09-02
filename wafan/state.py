@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from functools import lru_cache
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
@@ -258,6 +259,14 @@ def capture_written_keys(ruleset: Ruleset) -> set[TxKey]:
     return keys
 
 
+_MACRO_PIECE = re.compile(r"%\{([A-Za-z_]+)\.([A-Za-z0-9_.]+)\}")
+
+
+def name_is_dynamic(name: str) -> bool:
+    """True if a ``setvar`` target name is only known at run time."""
+    return "%{" in name
+
+
 def _rhs_is_integer(rhs: str) -> bool:
     return bool(re.fullmatch(r"[+-]?\d+", rhs.strip()))
 
@@ -322,6 +331,25 @@ def infer_tx_sorts(ruleset: Ruleset) -> dict[TxKey, str]:
 # that many slots would be ruinous and buys nothing, since the count is a free
 # integer. Past this ceiling the target simply stays open.
 MAX_DERIVED_MEMBERS = 8
+
+
+@dataclass(frozen=True)
+class DynamicSlot:
+    """A state entry whose *name* is computed at run time.
+
+    ``setvar:'tx.hdr_%{tx.1}=1'`` writes a key that is only known once the
+    macro resolves, so the key cannot be a Python string: it becomes an SMT
+    term, and a read has to test it symbolically. Statically named entries
+    keep their cheaper treatment --- their keys are literals, so a selector can
+    be matched against them at encode time.
+    """
+
+    collection: str
+    key: str      # SMT String term for the name, e.g. (str.++ "hdr_" v_tx_1_1)
+    value: str    # SMT term for the value
+    live: str     # Bool: this entry was written and not since unset
+    sort: str
+    source: str   # the literal setvar name, for reporting
 
 
 @dataclass(frozen=True)
@@ -499,6 +527,8 @@ class StateEncoding:
     open_targets: list[str] = field(default_factory=list)  # targets whose count is
     # only bounded below, because a rule demands more members than are modelled
     bounds: dict[str, SpecBound] = field(default_factory=dict)  # per-target model
+    dynamic_slots: list[DynamicSlot] = field(default_factory=list)  # run-time-named
+    # state entries, whose keys are SMT terms rather than literals
 
     def never_written(self) -> set[TxKey]:
         """State keys some rule reads that *no* rule in the ruleset writes.
@@ -628,6 +658,7 @@ class StatefulEncoder:
         self._reads_before_write: dict[TxKey, list[int]] = {}
         # Capture slots filled during the chain walk of the directive being
         # encoded: key -> (fresh value symbol, value before the directive).
+        self._dynamic_slots: list[DynamicSlot] = []
         self._pending_captures: dict[TxKey, tuple[str, str]] = {}
         self._cnt_before_captures: dict[TxKey, str] = {}
         self._fresh = 0
@@ -869,21 +900,165 @@ class StatefulEncoder:
         matching = [self._selector_predicate(ref, name) for name in names]
         return self._live_sum(flags, matching)
 
-    def _target_atom(self, rule: SecRule, variable: SecRuleVariable, position: int,
-                     exclusions: Sequence[TargetRef] = ()) -> str:
-        collection = variable.name.lower()
-        if collection in STATEFUL_COLLECTIONS and variable.part:
-            key = (collection, variable.part.lower())
-            if variable.counter:
-                return self._numeric_atom(rule, self._cnt(key, position), position)
+    @lru_cache(maxsize=256)
+    def _name_regex(pattern: str):  # type: ignore[misc]
+        """Compile a selector regex for matching state variable names.
+
+        Names are compared case-insensitively, matching ModSecurity, and the
+        match is a search rather than an anchored one. Returns None when the
+        pattern cannot be compiled either as written or after PCRE
+        translation.
+        """
+        for candidate in (pattern, _cached_pcre_to_ecma2020(pattern).pattern):
+            try:
+                return re.compile(candidate, re.IGNORECASE)
+            except re.error:
+                continue
+        return None
+
+    _name_regex = staticmethod(_name_regex)  # type: ignore[assignment]
+
+    def _matching_state_keys(self, collection: str, pattern: str) -> list[TxKey]:
+        """State keys of *collection* whose name matches *pattern*.
+
+        Unlike a request collection, the writable namespace is statically
+        known: a name can only exist if some ``setvar`` or ``capture`` writes
+        it. Resolving a regex selector against that set is therefore exact ---
+        and an empty result is a real finding, meaning no such variable can
+        ever exist.
+        """
+        compiled = self._name_regex(pattern)
+        if compiled is None:
+            raise Abstracted(f"selector regex '/{pattern}/' could not be compiled")
+        return sorted(
+            k for k in self.tx_sorts
+            if k[0] == collection and not name_is_dynamic(k[1])
+            and compiled.search(k[1])
+        )
+
+    def _dynamic_matches(self, collection: str, pattern: Optional[str],
+                         exact: Optional[str] = None) -> list[tuple[DynamicSlot, str]]:
+        """Dynamic slots of *collection* whose key could satisfy the selector.
+
+        The key is an SMT term, so the test is symbolic: equality for an exact
+        name, regex membership for a selector. Whether it really matches is
+        left to the solver, which is the only way a run-time-computed name can
+        be related to the name a later rule asks for.
+        """
+        out = []
+        for slot in self._dynamic_slots:
+            if slot.collection != collection:
+                continue
+            if exact is not None:
+                out.append((slot, f'(= {slot.key} "{_escape_smt_string(exact)}")'))
+            else:
+                conv = _cached_pcre_to_ecma2020(pattern or "")
+                body = conv.pattern
+                prefix = "" if body.startswith("^") else ".*"
+                suffix = "" if body.endswith("$") else ".*"
+                expr = _escape_smt_string(f"{prefix}({body}){suffix}")
+                out.append(
+                    (slot, f'(str.in_re {slot.key} (re.from_ecma2020 "{expr}"))')
+                )
+        return out
+
+    def _dynamic_atom(self, rule: SecRule, slot: DynamicSlot, key_test: str,
+                      position: int) -> str:
+        """One disjunct: this dynamic entry is present, keyed right, and matches."""
+        if slot.sort == INT:
+            if effective_transforms(rule):
+                raise Abstracted(f"transforms applied to Int-sorted {slot.source}")
+            body = self._numeric_atom(rule, slot.value, position)
+        else:
+            body = self._string_atom(rule, slot.value)
+        return f"(and {slot.live} {key_test} {body})"
+
+    def _stateful_scan_atom(self, rule: SecRule, collection: str, pattern: str,
+                            counter: bool, position: int) -> str:
+        """Encode ``COLL:/re/`` as a scan over the matching state variables."""
+        keys = self._matching_state_keys(collection, pattern)
+        dynamic = self._dynamic_matches(collection, pattern)
+
+        if counter:
+            terms = [f"(ite (> {self._cnt(k, position)} 0) 1 0)" for k in keys]
+            terms += [f"(ite (and {s.live} {t}) 1 0)" for s, t in dynamic]
+            if not terms:
+                total = "0"
+            elif len(terms) == 1:
+                total = terms[0]
+            else:
+                total = "(+ " + " ".join(terms) + ")"
+            return self._numeric_atom(rule, total, position)
+
+        if not keys and not dynamic:
+            # No rule writes a name matching the selector, so the target
+            # resolves to no members and the operator cannot hold.
+            return "false"
+
+        atoms = [self._dynamic_atom(rule, s, t, position) for s, t in dynamic]
+        for key in keys:
+            guard = f"(> {self._cnt(key, position)} 0)"
             term = self._val(key, position)
             if self.tx_sorts.get(key, INT) == INT:
                 if effective_transforms(rule):
                     raise Abstracted(
-                        f"transforms applied to Int-sorted {collection}.{variable.part}"
+                        f"transforms applied to Int-sorted {key[0]}.{key[1]}"
                     )
-                return self._numeric_atom(rule, term, position)
-            return self._string_atom(rule, term)
+                atoms.append(f"(and {guard} {self._numeric_atom(rule, term, position)})")
+            else:
+                atoms.append(f"(and {guard} {self._string_atom(rule, term)})")
+        return atoms[0] if len(atoms) == 1 else "(or " + " ".join(atoms) + ")"
+
+    def _target_atom(self, rule: SecRule, variable: SecRuleVariable, position: int,
+                     exclusions: Sequence[TargetRef] = ()) -> str:
+        collection = variable.name.lower()
+        if collection in STATEFUL_COLLECTIONS and variable.part:
+            part = variable.part
+            if len(part) > 1 and part.startswith("/") and part.endswith("/"):
+                return self._stateful_scan_atom(
+                    rule, collection, part[1:-1], variable.counter, position
+                )
+            key = (collection, part.lower())
+            # A run-time-computed name may be exactly the one asked for here,
+            # so the dynamic slots have to be considered alongside the keyed
+            # entry rather than instead of it.
+            dynamic = self._dynamic_matches(collection, None, exact=part.lower())
+
+            if variable.counter:
+                total = f"(ite (> {self._cnt(key, position)} 0) 1 0)"
+                if dynamic:
+                    terms = [total] + [
+                        f"(ite (and {d.live} {t}) 1 0)" for d, t in dynamic
+                    ]
+                    total = "(+ " + " ".join(terms) + ")"
+                    return self._numeric_atom(rule, total, position)
+                return self._numeric_atom(rule, self._cnt(key, position), position)
+
+            atoms = [self._dynamic_atom(rule, d, t, position) for d, t in dynamic]
+
+            # Only a name some directive actually writes can contribute a
+            # statically keyed disjunct. For any other name the variable
+            # cannot exist, so it contributes nothing --- and attempting it
+            # would guess a sort for a variable that was never written.
+            if key in self.tx_sorts:
+                term = self._val(key, position)
+                if self.tx_sorts[key] == INT:
+                    if effective_transforms(rule):
+                        raise Abstracted(
+                            f"transforms applied to Int-sorted "
+                            f"{collection}.{variable.part}"
+                        )
+                    body = self._numeric_atom(rule, term, position)
+                else:
+                    body = self._string_atom(rule, term)
+                atoms.insert(0, f"(and (> {self._cnt(key, position)} 0) {body})")
+            elif not atoms:
+                # Nothing writes this name, so the target resolves to no
+                # members and the operator cannot hold.
+                self._reads_before_write.setdefault(key, []).append(position)
+                return "false"
+
+            return atoms[0] if len(atoms) == 1 else "(or " + " ".join(atoms) + ")"
         return self._request_atom(rule, variable, position, exclusions)
 
     def _rule_match(self, rule: SecRule, position: int) -> str:
@@ -988,16 +1163,77 @@ class StatefulEncoder:
 
     # -- state updates -----------------------------------------------------
 
+    def _state_macro(self, text: str) -> Optional[TxKey]:
+        """Key a macro refers to, but only if it names a writable collection.
+
+        ``%{rule.msg}``, ``%{MATCHED_VAR}`` and the like are engine-provided
+        values, not state. Resolving them through :meth:`_val` would invent a
+        state variable and pin it to the empty initial value --- an
+        under-approximation, and the unsafe direction. They must become
+        unknowns instead.
+        """
+        key = macro_key(text)
+        if key is None or key[0] not in STATEFUL_COLLECTIONS:
+            return None
+        return key
+
+    def _key_term(self, name: str, position: int) -> str:
+        """SMT String term for a run-time-computed state name.
+
+        The literal fragments are concatenated with the macros' current
+        values, so ``hdr_%{tx.1}`` becomes ``(str.++ "hdr_" v_tx_1_1)``. A
+        macro naming something the model does not track contributes an unknown
+        instead, which keeps the key a free string rather than a wrong one.
+        """
+        pieces: list[str] = []
+        last = 0
+        for m in _MACRO_PIECE.finditer(name):
+            if m.start() > last:
+                pieces.append('"' + name[last:m.start()].replace('"', '""') + '"')
+            src = (m.group(1).lower(), m.group(2).lower())
+            if src[0] in STATEFUL_COLLECTIONS and self.tx_sorts.get(src) == STRING:
+                pieces.append(self._val(src, position, record=False))
+            else:
+                pieces.append(self._fresh_const(STRING))
+            last = m.end()
+        if last < len(name):
+            pieces.append('"' + name[last:].replace('"', '""') + '"')
+        if not pieces:
+            return '""'
+        return pieces[0] if len(pieces) == 1 else "(str.++ " + " ".join(pieces) + ")"
+
+    def _write_dynamic(self, op: SetVarOp, position: int, block: PositionBlock) -> None:
+        """Record a write whose key is computed at run time."""
+        fire = self._fire[position]
+        sort = self.tx_sorts.get((op.collection, op.name), STRING)
+        tag = self._sanitise((op.collection, f"dyn{len(self._dynamic_slots)}"))
+        key_sym, val_sym, live_sym = f"k_{tag}", f"v_{tag}", f"live_{tag}"
+        block.declarations.append(f"(declare-const {key_sym} String)")
+        block.declarations.append(f"(declare-const {val_sym} {sort})")
+        block.declarations.append(f"(declare-const {live_sym} Bool)")
+        block.definitions.append(
+            f"(assert (= {key_sym} {self._key_term(op.name, position)}))"
+        )
+        value = ('""' if sort == STRING else "0") if op.op == "unset" else \
+            self._rhs_term(op, (op.collection, op.name), position)
+        block.definitions.append(f"(assert (= {val_sym} {value}))")
+        live = "false" if op.op == "unset" else fire
+        block.definitions.append(f"(assert (= {live_sym} {live}))")
+        self._dynamic_slots.append(DynamicSlot(
+            collection=op.collection, key=key_sym, value=val_sym,
+            live=live_sym, sort=sort, source=op.name,
+        ))
+
     def _rhs_term(self, op: SetVarOp, key: TxKey, position: int) -> str:
         sort = self.tx_sorts.get(key, INT)
         if sort == INT:
             if _rhs_is_integer(op.rhs):
                 return op.rhs.strip()
-            src = macro_key(op.rhs)
+            src = self._state_macro(op.rhs)
             if src is not None and self.tx_sorts.get(src, INT) == INT:
                 return self._val(src, position)
             return self._fresh_const(INT)
-        src = macro_key(op.rhs)
+        src = self._state_macro(op.rhs)
         if src is not None and self.tx_sorts.get(src, INT) == STRING:
             return self._val(src, position)
         if "%{" in op.rhs:
@@ -1008,6 +1244,9 @@ class StatefulEncoder:
         fire = self._fire[position]
         for op in directive.setvars:
             if op.collection not in STATEFUL_COLLECTIONS:
+                continue
+            if name_is_dynamic(op.name):
+                self._write_dynamic(op, position, block)
                 continue
             key = (op.collection, op.name)
             sort = self.tx_sorts.get(key, INT)
@@ -1152,6 +1391,7 @@ class StatefulEncoder:
             closed=self.closed,
             open_targets=sorted(n for n, b in self.bounds.items() if not b.closed),
             bounds=dict(self.bounds),
+            dynamic_slots=list(self._dynamic_slots),
         )
 
     def _preamble(self) -> tuple[dict[str, str], dict[str, list[str]]]:
