@@ -85,6 +85,17 @@ def _build_parser() -> argparse.ArgumentParser:
              "order-aware whole-ruleset state model (implies --stateful).",
     )
     p.add_argument(
+        "--include-actions",
+        action="store_true",
+        help=(
+            "Also analyse SecAction directives, not just rules. A SecAction is "
+            "unconditional, so its reachability is a fact about control flow "
+            "rather than about the directive -- but an unreachable one means "
+            "its setvar initialisers never run, which is usually the cause of "
+            "whatever dead rules follow it."
+        ),
+    )
+    p.add_argument(
         "--stateful",
         action="store_true",
         help=(
@@ -553,6 +564,7 @@ def _encoding_summary(encoding) -> dict:
 def _reachability_json(res) -> dict:
     return {
         "rule_id": res.rule_id,
+        "directive_kind": res.directive.kind,
         "position": res.position,
         "label": res.directive.label(),
         "lineno": res.directive.lineno,
@@ -566,7 +578,11 @@ def _reachability_json(res) -> dict:
 
 
 def _run_reachability(
-    confs: list[Path], solver: SubprocessSolver, verbosity: int = 0, as_json: bool = False
+    confs: list[Path],
+    solver: SubprocessSolver,
+    verbosity: int = 0,
+    as_json: bool = False,
+    include_actions: bool = False,
 ) -> int:
     start = time.monotonic()
     encoding = _build_encoding(confs)
@@ -580,7 +596,9 @@ def _run_reachability(
         (lambda r: _print_json({"kind": "rule", **_reachability_json(r)}))
         if as_json else None
     )
-    results = checker.find_dead(encoding, on_result=on_result)
+    results = checker.find_dead(
+        encoding, on_result=on_result, include_actions=include_actions
+    )
 
     dead = [r for r in results if r.is_dead]
     unreachable = [r for r in dead if r.verdict == UNREACHABLE]
@@ -594,8 +612,16 @@ def _run_reachability(
             "analysis": "reachability",
             "elapsed_sec": round(time.monotonic() - start, 3),
             **_encoding_summary(encoding),
-            "rules_checked": len(results),
-            "rules_dead": len(dead),
+            "include_actions": include_actions,
+            "rules_checked": sum(1 for r in results if r.directive.kind == "rule"),
+            "actions_checked": sum(1 for r in results if r.directive.kind == "action"),
+            "directives_checked": len(results),
+            # Counted over whatever was checked; with --include-actions that
+            # includes SecAction directives, so the per-kind splits are given
+            # alongside rather than folding actions into "rules".
+            "rules_dead": sum(1 for r in dead if r.directive.kind == "rule"),
+            "actions_dead": sum(1 for r in dead if r.directive.kind == "action"),
+            "directives_dead": len(dead),
             "rules_unreachable": len(unreachable),
             "rules_impossible_match": len(impossible),
             "rules_unknown": len(unknown),
@@ -607,10 +633,11 @@ def _run_reachability(
 
     if verbosity >= 1:
         print(f"\n{_SEP}")
+    noun = "directive" if include_actions else "rule"
     if not dead:
-        print(f"No dead rules found  ({len(results)} rule(s) checked).")
+        print(f"No dead {noun}s found  ({len(results)} {noun}(s) checked).")
     else:
-        print(f"Dead rules  ({len(dead)} of {len(results)} checked)\n")
+        print(f"Dead {noun}s  ({len(dead)} of {len(results)} checked)\n")
         if unreachable:
             print("  Never executed (control flow):")
             for r in unreachable:
@@ -659,6 +686,7 @@ def _run_stateful_pairs(
     mode: str,
     verbosity: int = 0,
     as_json: bool = False,
+    include_actions: bool = False,
 ) -> int:
     start = time.monotonic()
     encoding = _build_encoding(confs, pairwise=True)
@@ -672,7 +700,9 @@ def _run_stateful_pairs(
         (lambda r: _print_json({"kind": "pair", **_stateful_pair_json(r)}))
         if as_json else None
     )
-    results = checker.find_pairs(encoding, on_result=on_result)
+    kinds = ("rule", "action") if include_actions else ("rule",)
+    positions = [i for i, d in enumerate(encoding.order) if d.kind in kinds]
+    results = checker.find_pairs(encoding, on_result=on_result, positions=positions)
 
     holding = [r for r in results if r.holds]
     unknown = [r for r in results if r.result == SolverResult.UNKNOWN]
@@ -737,10 +767,14 @@ def main(argv: list[str] | None = None) -> int:
     verbosity = 2 if args.verbose2 else (1 if args.verbose else 0)
 
     if args.analysis == "reachability":
-        return _run_reachability(args.conf, solver, verbosity=verbosity, as_json=args.json)
+        return _run_reachability(
+            args.conf, solver, verbosity=verbosity, as_json=args.json,
+            include_actions=args.include_actions,
+        )
     if args.stateful and args.analysis in ("subsumption", "intersection", "contradiction"):
         return _run_stateful_pairs(
-            args.conf, solver, args.analysis, verbosity=verbosity, as_json=args.json
+            args.conf, solver, args.analysis, verbosity=verbosity, as_json=args.json,
+            include_actions=args.include_actions,
         )
     if args.analysis == "subsumption":
         return _run_subsumption(args.conf, solver, verbosity=verbosity, as_json=args.json)

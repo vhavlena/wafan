@@ -17,6 +17,7 @@ from wafan.state import (
     STRING,
     member_bounds,
     encode_ruleset,
+    capture_writes,
     infer_tx_sorts,
     is_multi_valued,
     resolve_target,
@@ -182,6 +183,75 @@ class TestSSA:
             SecRule TX:a "@eq 1" "id:2,phase:1,pass,setvar:tx.a=99"
         """)
         assert "(assert (= match_1 (= v_tx_a_1 1)))" in defs_of(enc)
+
+
+class TestCaptureWrites:
+    """`capture` is the second way a rule writes state, alongside `setvar`."""
+
+    def _rule(self, tmp_path, text):
+        from wafan.parser import parse_file
+        path = tmp_path / "c.conf"
+        path.write_text(textwrap.dedent(text).lstrip())
+        return parse_file(path)[0]
+
+    def test_slot_per_group_plus_whole_match(self, tmp_path):
+        r = self._rule(tmp_path, 'SecRule ARGS "@rx (a)(b)" "id:1,phase:2,pass,capture"\n')
+        assert capture_writes(r) == ["0", "1", "2"]
+
+    def test_no_groups_still_writes_slot_zero(self, tmp_path):
+        r = self._rule(tmp_path, 'SecRule ARGS "@rx abc" "id:1,phase:2,pass,capture"\n')
+        assert capture_writes(r) == ["0"]
+
+    def test_without_the_action_nothing_is_written(self, tmp_path):
+        r = self._rule(tmp_path, 'SecRule ARGS "@rx (a)" "id:1,phase:2,pass"\n')
+        assert capture_writes(r) == []
+
+    def test_only_regex_operators_capture(self, tmp_path):
+        r = self._rule(tmp_path, 'SecRule ARGS "@streq a" "id:1,phase:2,pass,capture"\n')
+        assert capture_writes(r) == []
+
+    def test_slots_are_string_sorted(self, tmp_path):
+        """Captured text is arbitrary, so a numeric read of it is abstracted
+        rather than given a bogus integer reading."""
+        enc = encode(tmp_path, 'SecRule ARGS "@rx (a)" "id:1,phase:2,pass,capture"\n')
+        assert enc.tx_sorts[("tx", "1")] == STRING
+
+    def test_write_is_guarded_and_holds_an_unknown(self, tmp_path):
+        enc = encode(tmp_path, 'SecRule ARGS "@rx (a)" "id:1,phase:2,pass,capture"\n')
+        body = defs_of(enc)
+        assert "(assert (= cnt_tx_1_1 (ite fire_0 1 0)))" in body
+        assert "(ite fire_0 unknown_" in body      # value is a fresh constant
+
+    def test_later_chain_link_sees_the_captured_value(self, tmp_path):
+        """capture fills the slots when the matching link's operator runs, so
+        the rest of the chain reads them -- not the state the chain began in.
+        CRS rule 920190 captures two numbers and compares them in link two."""
+        enc = encode(tmp_path, """
+            SecRule ARGS "@rx (a)(b)" "id:1,phase:2,pass,capture,chain"
+                SecRule TX:2 "@streq x"
+        """)
+        body = defs_of(enc)
+        # the second link compares against the fresh capture, not the initial ""
+        assert '(= unknown_3 "x")' in body
+        assert '(= "" "x")' not in body
+
+    def test_commit_guards_the_slot_for_later_directives(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecRule ARGS "@rx (a)" "id:1,phase:2,pass,capture"
+            SecRule TX:1 "@streq y" "id:2,phase:2,pass"
+        """)
+        body = defs_of(enc)
+        assert "(assert (= v_tx_1_1 (ite fire_0 unknown_" in body
+        assert "(= v_tx_1_1 \"y\")" in body      # rule 2 reads the published version
+
+    def test_reader_of_a_slot_is_not_reported_unwritten(self, tmp_path):
+        """Regression: with capture unmodelled, TX:1 resolved to the empty
+        initial state and a rule reading it was reported dead."""
+        enc = encode(tmp_path, """
+            SecRule ARGS "@rx (a)(b)" "id:1,phase:2,pass,capture,chain"
+                SecRule TX:2 "@streq x"
+        """)
+        assert ("tx", "2") not in enc.never_written()
 
 
 class TestMacroResolution:

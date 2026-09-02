@@ -210,6 +210,54 @@ def macro_key(text: str) -> Optional[TxKey]:
 # Sort inference
 # ---------------------------------------------------------------------------
 
+# ModSecurity fills TX:0 through TX:9 from a regex match, TX:0 being the whole
+# match and TX:1..TX:9 the capture groups.
+CAPTURE_SLOTS = 10
+
+
+def _rx_group_count(pattern: str) -> int:
+    """Number of capture groups in an ``@rx`` pattern.
+
+    Falls back to every slot when the count cannot be determined, which is
+    the safe direction: a slot wrongly treated as written holds an unknown
+    value, whereas a slot wrongly treated as unwritten is pinned to the empty
+    initial state and can make a live rule look dead.
+    """
+    try:
+        return re.compile(_cached_pcre_to_ecma2020(pattern).pattern).groups
+    except Exception:
+        return CAPTURE_SLOTS - 1
+
+
+def capture_writes(rule: SecRule) -> list[str]:
+    """``TX`` names the ``capture`` action fills when *rule* matches.
+
+    ``capture`` is the second way a rule writes state, alongside ``setvar``:
+    it copies the regex match and its groups into ``TX:0``..``TX:9``. Only
+    regex operators produce captures.
+
+    The values are not modelled --- the encoder stores a fresh unknown in each
+    slot --- but recording that the slots are *written at all* is what matters.
+    Without it they resolve to the empty initial state, and a rule reading a
+    capture slot is reported dead when it is not.
+    """
+    if not any(a.name == "capture" for a in rule.actions):
+        return []
+    if _normalize_operator(rule.operator)[0] != "rx":
+        return []
+    groups = min(_rx_group_count(rule.operator_argument), CAPTURE_SLOTS - 1)
+    return [str(i) for i in range(groups + 1)]
+
+
+def capture_written_keys(ruleset: Ruleset) -> set[TxKey]:
+    """Every ``TX`` key some ``capture`` action in *ruleset* can write."""
+    keys: set[TxKey] = set()
+    for directive in ruleset.directives:
+        for link in directive.chain:
+            keys.update(("tx", name) for name in capture_writes(link))
+    return keys
+
+
 def _rhs_is_integer(rhs: str) -> bool:
     return bool(re.fullmatch(r"[+-]?\d+", rhs.strip()))
 
@@ -231,6 +279,11 @@ def infer_tx_sorts(ruleset: Ruleset) -> dict[TxKey, str]:
     sorts: dict[TxKey, str] = {key: INT for key in writers}
     copies: dict[TxKey, list[TxKey]] = {}
 
+    # Capture slots hold arbitrary text, so they are String regardless of how
+    # they are later read; a numeric operator on one is abstracted rather than
+    # given a bogus integer reading.
+    captured = capture_written_keys(ruleset)
+
     for key, directives in writers.items():
         for d in directives:
             for op in d.setvars:
@@ -245,6 +298,9 @@ def infer_tx_sorts(ruleset: Ruleset) -> dict[TxKey, str]:
                     copies.setdefault(key, []).append(src)
                     continue
                 sorts[key] = STRING  # a literal string, or unresolvable text
+
+    for key in captured:
+        sorts[key] = STRING
 
     # Propagate String through copy chains until stable.
     changed = True
@@ -570,6 +626,10 @@ class StatefulEncoder:
         # Running "the transaction has not been ended yet" term; see _reach_expr.
         self._alive: str = "true"
         self._reads_before_write: dict[TxKey, list[int]] = {}
+        # Capture slots filled during the chain walk of the directive being
+        # encoded: key -> (fresh value symbol, value before the directive).
+        self._pending_captures: dict[TxKey, tuple[str, str]] = {}
+        self._cnt_before_captures: dict[TxKey, str] = {}
         self._fresh = 0
 
     # -- naming ------------------------------------------------------------
@@ -850,8 +910,38 @@ class StatefulEncoder:
         return atoms[0] if len(atoms) == 1 else "(or " + " ".join(atoms) + ")"
 
     def _chain_match(self, chain: Sequence[SecRule], position: int) -> str:
-        atoms = [self._rule_match(r, position) for r in chain]
+        """Conjoin the links, threading each link's captures to the next.
+
+        ``capture`` fills ``TX:0``..``TX:9`` the moment the matching link's
+        operator runs, so a later link of the same chain reads the captured
+        values, not the state the chain started with. CRS relies on this: rule
+        $920190$ captures two numbers in its first link and compares them in
+        its second.
+        """
+        atoms = []
+        for link in chain:
+            atoms.append(self._rule_match(link, position))
+            self._stage_captures(link, position)
         return atoms[0] if len(atoms) == 1 else "(and " + " ".join(atoms) + ")"
+
+    def _stage_captures(self, link: SecRule, position: int) -> None:
+        """Make *link*'s capture slots readable by the rest of the chain.
+
+        The captured text depends on where the pattern matched, which the
+        encoding does not track, so each slot becomes a fresh unconstrained
+        value. Within the chain it is used unguarded --- the chain only gets
+        this far if the link matched --- while :meth:`_commit_captures` adds
+        the firing guard for the benefit of later directives.
+        """
+        for name in capture_writes(link):
+            key = ("tx", name)
+            if key in self._pending_captures:
+                continue  # an earlier link of this chain already filled it
+            before = self._val(key, position, record=False)
+            fresh = self._fresh_const(self.tx_sorts.get(key, STRING))
+            self._pending_captures[key] = (fresh, before)
+            self._val_term[key] = fresh
+            self._cnt_term[key] = "1"
 
     # -- reachability ------------------------------------------------------
 
@@ -951,6 +1041,32 @@ class StatefulEncoder:
             )
             self._val_term[key] = val_sym
 
+    def _commit_captures(self, position: int, block: PositionBlock) -> None:
+        """Publish the staged capture slots to subsequent directives.
+
+        Inside the chain the fresh value was used unguarded; a later directive
+        must only see it if this directive actually fired, so each slot gets
+        the usual guarded SSA version here.
+        """
+        fire = self._fire[position]
+        for key, (fresh, before) in self._pending_captures.items():
+            sort = self.tx_sorts.get(key, STRING)
+            cnt_before = self._cnt_before_captures.get(key, "0")
+            cnt_sym = self._next_version("cnt_" + self._sanitise(key))
+            block.declarations.append(f"(declare-const {cnt_sym} Int)")
+            block.definitions.append(
+                f"(assert (= {cnt_sym} (ite {fire} 1 {cnt_before})))"
+            )
+            self._cnt_term[key] = cnt_sym
+
+            val_sym = self._next_version("v_" + self._sanitise(key))
+            block.declarations.append(f"(declare-const {val_sym} {sort})")
+            block.definitions.append(
+                f"(assert (= {val_sym} (ite {fire} {fresh} {before})))"
+            )
+            self._val_term[key] = val_sym
+        self._pending_captures = {}
+
     # -- driver ------------------------------------------------------------
 
     def encode(self) -> StateEncoding:
@@ -979,6 +1095,11 @@ class StatefulEncoder:
 
             # SecAction has no operator: its match condition is vacuously true.
             match_sym = "true"
+            self._pending_captures = {}
+            self._cnt_before_captures = {
+                ("tx", name): self._cnt_term.get(("tx", name), "0")
+                for link in directive.chain for name in capture_writes(link)
+            }
             if directive.kind == "rule":
                 match_sym = f"match_{position}"
                 block.declarations.append(f"(declare-const {match_sym} Bool)")
@@ -1005,6 +1126,7 @@ class StatefulEncoder:
                 )
 
             self._fire[position] = fire_sym
+            self._commit_captures(position, block)
             self._apply_setvars(directive, position, block)
             self._advance_alive(directive, position, block)
             self._blocks.append(block)

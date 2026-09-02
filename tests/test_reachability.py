@@ -225,6 +225,16 @@ CASES = [
         expected={"1340": OK},
     ),
     ReachCase(
+        name="capture_slots_are_written_state",
+        rules="""
+            SecRule ARGS "@rx (\\d+)-(\\d+)" "id:1350,phase:2,pass,nolog,capture,chain"
+                SecRule TX:2 "@streq 5"
+        """,
+        # `capture` fills TX:1 and TX:2 from the groups. Modelling only
+        # `setvar` left them at the empty initial state, making this dead.
+        expected={"1350": OK},
+    ),
+    ReachCase(
         name="unsupported_operator_stays_reachable",
         rules="""
             SecRule ARGS "@detectSQLi" "id:1200,phase:2,pass,nolog"
@@ -275,6 +285,27 @@ def test_dead_rules_are_reported_as_dead(tmp_path):
     results = ReachabilityChecker(make_solver()).find_dead(encode_ruleset(conf))
     dead = {r.rule_id for r in results if r.is_dead}
     assert dead == {"1"}
+
+
+def test_unreachable_secaction_is_the_cause_of_the_dead_rules_after_it(tmp_path):
+    """The finding worth surfacing: a dead initialiser, not just its symptoms.
+
+    Rule 3 being dead is a consequence; SecAction 2 never running is why.
+    """
+    conf = write(tmp_path, """
+        SecAction "id:1,phase:2,deny"
+        SecAction "id:2,phase:2,pass,nolog,setvar:tx.never_runs=1"
+        SecRule TX:never_runs "@eq 1" "id:3,phase:2,pass,nolog,t:none"
+    """)
+    encoding = encode_ruleset(conf)
+    checker = ReachabilityChecker(make_solver())
+
+    rules_only = {r.rule_id: r.verdict for r in checker.find_dead(encoding)}
+    assert rules_only == {"3": UNREACHABLE}          # only the symptom
+
+    with_actions = {r.rule_id: r.verdict
+                    for r in checker.find_dead(encoding, include_actions=True)}
+    assert with_actions == {"1": OK, "2": UNREACHABLE, "3": UNREACHABLE}
 
 
 def test_sec_actions_skipped_by_default(tmp_path):

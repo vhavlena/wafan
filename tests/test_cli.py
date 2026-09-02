@@ -33,6 +33,14 @@ class TestArgumentParser:
         args = _build_parser().parse_args([str(REAL_CONF)])
         assert args.stateful is False
 
+    def test_include_actions_defaults_off(self):
+        args = _build_parser().parse_args([str(REAL_CONF)])
+        assert args.include_actions is False
+
+    def test_include_actions_flag(self):
+        args = _build_parser().parse_args([str(REAL_CONF), "--include-actions"])
+        assert args.include_actions is True
+
     def test_stateful_flag(self):
         args = _build_parser().parse_args([str(REAL_CONF), "--stateful"])
         assert args.stateful is True
