@@ -81,6 +81,13 @@ from .smt import (
 
 INT, STRING = "Int", "String"
 
+# Used by StateEncoding._index to slice a query down to the directives it can
+# reach: the first captures a declared symbol's name, the second every
+# identifier-shaped token in an expression (filtered against the declared set,
+# so SMT operators and string literals fall away).
+_DECLARE_RE = re.compile(r"^\(declare-(?:const|fun)\s+([A-Za-z_][A-Za-z0-9_]*)")
+_SYMBOL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
 # Collections that can hold more than one member in a single transaction, and
 # so are modelled as a bounded array (see `members` below). Everything not
 # listed here --- REQUEST_METHOD, REQUEST_URI, REQUEST_FILENAME, RESPONSE_BODY,
@@ -529,6 +536,7 @@ class StateEncoding:
     bounds: dict[str, SpecBound] = field(default_factory=dict)  # per-target model
     dynamic_slots: list[DynamicSlot] = field(default_factory=list)  # run-time-named
     # state entries, whose keys are SMT terms rather than literals
+    _dependencies: Optional[tuple] = field(default=None, repr=False, compare=False)
 
     def never_written(self) -> set[TxKey]:
         """State keys some rule reads that *no* rule in the ruleset writes.
@@ -548,38 +556,122 @@ class StateEncoding:
                 return pos
         return None
 
-    def script(self, assertions: Sequence[str], upto: Optional[int] = None) -> str:
-        """Render a check-sat-ready SMT-LIB2 script.
+    def _index(self) -> tuple:
+        """Symbol tables for dependency slicing, built once per encoding."""
+        if self._dependencies is not None:
+            return self._dependencies
 
-        Only positions up to *upto* (inclusive) are emitted. State flows
-        strictly forward, so nothing after the queried position can influence
-        it — slicing here is what keeps a query proportional to the rule's
-        depth in the ruleset rather than to the whole file.
+        block_declares: list[set[str]] = []
+        symbols: set[str] = set()
+        for block in self.blocks:
+            declared = {
+                m.group(1) for line in block.declarations
+                if (m := _DECLARE_RE.match(line))
+            }
+            block_declares.append(declared)
+            symbols |= declared
+
+        global_declares: dict[str, str] = {}
+        for line in self.globals:
+            m = _DECLARE_RE.match(line)
+            if m:
+                global_declares[m.group(1)] = line
+        symbols |= set(global_declares)
+
+        def mentioned(lines: Sequence[str]) -> set[str]:
+            return {t for line in lines for t in _SYMBOL_RE.findall(line)} & symbols
+
+        block_uses = [mentioned(b.definitions) for b in self.blocks]
+        global_uses = [mentioned([line]) for line in self.global_definitions]
+
+        owner = {sym: i for i, d in enumerate(block_declares) for sym in d}
+        constrained_by: dict[str, list[int]] = {}
+        for j, used in enumerate(global_uses):
+            for sym in used:
+                constrained_by.setdefault(sym, []).append(j)
+
+        self._dependencies = (
+            block_uses, global_uses, global_declares,
+            owner, constrained_by, mentioned,
+        )
+        return self._dependencies
+
+    def script(self, assertions: Sequence[str], upto: Optional[int] = None,
+               slice_dependencies: bool = True) -> str:
+        """Render a check-sat-ready SMT-LIB2 script for *assertions*.
+
+        Positions after *upto* are never emitted: state flows strictly
+        forward, so nothing ordered later can influence the query.
+
+        With *slice_dependencies* -- the default -- the script is narrowed
+        further, to the directives the query can actually reach. Every block
+        assertion *defines* symbols that same block declares, so the encoding
+        is a DAG of definitions and dropping one the query cannot reach removes
+        no information about it. The global constraints (a collection's prefix
+        closure and its count link) are not definitions, so one is kept
+        whenever any symbol it mentions survives.
+
+        This matters at scale: a whole-corpus query otherwise carries every
+        earlier rule's regex machinery, and the solver drowns in it long before
+        reaching a contradiction the query itself makes obvious.
         """
         limit = len(self.order) - 1 if upto is None else upto
+        in_range = [i for i, b in enumerate(self.blocks) if b.position <= limit]
 
-        needed: list[str] = []
-        for position, keys in self.transform_keys_by_position.items():
-            if position > limit:
-                continue
-            for key in keys:
-                if key not in needed:
-                    needed.append(key)
+        if not slice_dependencies:
+            keep_blocks = in_range
+            keep_globals = list(range(len(self.global_definitions)))
+            keep_symbols = None
+        else:
+            (block_uses, global_uses, _global_declares,
+             owner, constrained_by, mentioned) = self._index()
+            allowed = set(in_range)
+            kept_blocks: set[int] = set()
+            kept_globals: set[int] = set()
+            needed = mentioned([f"(assert {a})" for a in assertions])
+            frontier = list(needed)
+            while frontier:
+                sym = frontier.pop()
+                owning = owner.get(sym)
+                if (owning is not None and owning in allowed
+                        and owning not in kept_blocks):
+                    kept_blocks.add(owning)
+                    fresh = block_uses[owning] - needed
+                    needed |= fresh
+                    frontier.extend(fresh)
+                for j in constrained_by.get(sym, ()):
+                    if j in kept_globals:
+                        continue
+                    kept_globals.add(j)
+                    fresh = global_uses[j] - needed
+                    needed |= fresh
+                    frontier.extend(fresh)
+            keep_blocks = sorted(kept_blocks)
+            keep_globals = sorted(kept_globals)
+            keep_symbols = needed
+
+        transforms: list[str] = []
+        for i in keep_blocks:
+            for key in self.transform_keys_by_position.get(self.blocks[i].position, ()):
+                if key not in transforms:
+                    transforms.append(key)
 
         lines = [f"(set-logic {SMT_LOGIC})"]
-        for key in needed:
+        for key in transforms:
             decl = self.fun_declarations_by_key.get(key)
             if decl:
                 lines.append(decl)
-        for key in needed:
+        for key in transforms:
             lines += self.axioms_by_key.get(key, [])
-        lines += self.globals
-        lines += self.global_definitions
-        for block in self.blocks:
-            if block.position > limit:
-                break
-            lines += block.declarations
-            lines += block.definitions
+
+        for line in self.globals:
+            m = _DECLARE_RE.match(line)
+            if keep_symbols is None or m is None or m.group(1) in keep_symbols:
+                lines.append(line)
+        lines += [self.global_definitions[j] for j in keep_globals]
+        for i in keep_blocks:
+            lines += self.blocks[i].declarations
+            lines += self.blocks[i].definitions
         lines += [f"(assert {a})" for a in assertions]
         lines.append("(check-sat)")
         return "\n".join(lines)

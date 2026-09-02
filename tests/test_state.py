@@ -678,13 +678,18 @@ class TestScript:
         assert "fire_1" not in sliced
         assert "fire_2" not in sliced
 
-    def test_full_script_has_all_positions(self, tmp_path):
+    def test_omitting_upto_allows_every_position(self, tmp_path):
+        """Without a position limit the whole file is in range; what actually
+        gets emitted is then decided by dependency slicing."""
         enc = encode(tmp_path, """
             SecRule ARGS "@streq a" "id:1,phase:2,pass"
             SecRule ARGS "@streq b" "id:2,phase:2,pass"
         """)
-        full = enc.script([enc.fire[1]])
-        assert "fire_0" in full and "fire_1" in full
+        unsliced = enc.script([enc.fire[1]], slice_dependencies=False)
+        assert "fire_0" in unsliced and "fire_1" in unsliced
+        # rule 2 does not depend on rule 1, so slicing drops it
+        sliced = enc.script([enc.fire[1]])
+        assert "fire_1" in sliced and "fire_0" not in sliced
 
     def test_script_is_well_formed(self, tmp_path):
         enc = encode(tmp_path, 'SecRule ARGS "@streq a" "id:1,phase:2,pass"\n')
@@ -704,6 +709,79 @@ class TestScript:
     def test_value_match_is_guarded_by_member_presence(self, tmp_path):
         enc = encode(tmp_path, 'SecRule ARGS "@streq a" "id:1,phase:2,pass"\n')
         assert "(and live_ARGS_1 (= ARGS_1 \"a\"))" in defs_of(enc)
+
+
+class TestDependencySlicing:
+    """A query carries only the directives it can reach.
+
+    Every block assertion defines symbols that same block declares, so the
+    encoding is a DAG of definitions and dropping an unreachable one removes
+    no information about the query.
+    """
+
+    def _conf(self, tmp_path):
+        return """
+            SecAction "id:1,phase:1,pass,t:none,setvar:tx.a=1"
+            SecRule ARGS "@streq irrelevant" "id:2,phase:2,pass,t:none"
+            SecRule REQUEST_COOKIES "@streq also_irrelevant" "id:3,phase:2,pass,t:none"
+            SecRule TX:a "@eq 1" "id:4,phase:2,pass,t:none"
+        """
+
+    def test_unrelated_directives_are_dropped(self, tmp_path):
+        enc = encode(tmp_path, self._conf(tmp_path))
+        p = enc.position_of_rule_id("4")
+        sliced = enc.script([enc.fire[p]], upto=p)
+        # rule 4 depends on the SecAction's write, not on rules 2 or 3
+        assert "v_tx_a_1" in sliced
+        assert "irrelevant" not in sliced
+        assert "also_irrelevant" not in sliced
+
+    def test_unrelated_globals_are_dropped(self, tmp_path):
+        enc = encode(tmp_path, self._conf(tmp_path))
+        p = enc.position_of_rule_id("4")
+        sliced = enc.script([enc.fire[p]], upto=p)
+        assert "REQUEST_COOKIES" not in sliced
+
+    def test_slicing_can_be_turned_off(self, tmp_path):
+        enc = encode(tmp_path, self._conf(tmp_path))
+        p = enc.position_of_rule_id("4")
+        full = enc.script([enc.fire[p]], upto=p, slice_dependencies=False)
+        assert "irrelevant" in full and "REQUEST_COOKIES" in full
+        assert len(full) > len(enc.script([enc.fire[p]], upto=p))
+
+    def test_dependencies_are_followed_transitively(self, tmp_path):
+        enc = encode(tmp_path, """
+            SecAction "id:1,phase:1,pass,t:none,setvar:tx.a=1"
+            SecAction "id:2,phase:1,pass,t:none,setvar:'tx.b=%{tx.a}'"
+            SecRule TX:b "@eq 1" "id:3,phase:2,pass,t:none"
+        """)
+        p = enc.position_of_rule_id("3")
+        sliced = enc.script([enc.fire[p]], upto=p)
+        # b's definition mentions a, so a's block must come along
+        assert "v_tx_b_1" in sliced and "v_tx_a_1" in sliced
+
+    def test_collection_constraints_survive_with_their_symbols(self, tmp_path):
+        """The prefix closure and count link are constraints, not definitions,
+        so they must be kept whenever a symbol they mention is kept."""
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq a" "id:1,phase:2,pass,t:none,chain"
+                SecRule ARGS "@streq b"
+        """)
+        p = enc.position_of_rule_id("1")
+        sliced = enc.script([enc.fire[p]], upto=p)
+        assert "(assert (=> live_ARGS_2 live_ARGS_1))" in sliced
+        assert "cnt_ARGS" in sliced
+
+    def test_transform_preamble_follows_the_slice(self, tmp_path):
+        """A transform is only declared if a surviving block uses it."""
+        enc = encode(tmp_path, """
+            SecRule ARGS "@streq x" "id:1,phase:2,pass,t:urlDecode"
+            SecRule REQUEST_METHOD "@streq POST" "id:2,phase:2,pass,t:none"
+        """)
+        p = enc.position_of_rule_id("2")
+        assert "t_urlDecode" not in enc.script([enc.fire[p]], upto=p)
+        q = enc.position_of_rule_id("1")
+        assert "t_urlDecode" in enc.script([enc.fire[q]], upto=q)
 
 
 class TestPositionLookup:
