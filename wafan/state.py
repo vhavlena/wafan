@@ -441,6 +441,12 @@ class StateEncoding:
     bounds: dict[str, SpecBound] = field(default_factory=dict)  # per-target model
     dynamic_slots: list[DynamicSlot] = field(default_factory=list)  # run-time-named
     # state entries, whose keys are SMT terms rather than literals
+    blocked_by: dict[int, list[int]] = field(default_factory=dict)
+    # position -> the positions whose firing stops it from running (skipAfter,
+    # skip, ctl:ruleRemoveById), carried over from ControlFlow. Together with
+    # Directive.terminates this is what lets a pairwise query decide statically
+    # whether one directive pre-empts another, without re-resolving control
+    # flow or asking the solver (see wafan.analyses.stateful.preempts).
     witness: dict[int, dict[str, list[str]]] = field(default_factory=dict)
     # position -> address -> the conditions under which the directive there
     # witnesses its match at that address (see witness_map). An *address* is
@@ -1493,6 +1499,7 @@ class StatefulEncoder:
             open_targets=sorted(n for n, b in self.bounds.items() if not b.closed),
             bounds=dict(self.bounds),
             dynamic_slots=list(self._dynamic_slots),
+            blocked_by={q: list(ps) for q, ps in self.cf.blocked_by.items()},
         )
 
     def _preamble(self) -> tuple[dict[str, str], dict[str, list[str]]]:

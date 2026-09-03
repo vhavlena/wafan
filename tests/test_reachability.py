@@ -27,6 +27,8 @@ from wafan.analyses.stateful import (
     SHADOWING,
     SUBSUMPTION,
     StatefulPairChecker,
+    common_witness,
+    preempts,
 )
 from wafan.state import encode_ruleset
 
@@ -586,6 +588,96 @@ def test_shadowing_absent_when_patterns_are_disjoint(tmp_path):
     pairs = _pairs(conf, SHADOWING)
     assert pairs[("1", "2")].result.value == "unsat"
     assert pairs[("1", "2")].holds is False
+
+
+def test_shadowing_by_skipping_over_a_deny(tmp_path):
+    """A `pass` rule can shadow too, by jumping over the rule that would deny.
+
+    Nothing terminates here, so the dispositions do not conflict in the
+    accept-versus-deny sense: rule 1 is a `pass`. It still decides the request,
+    because `skipAfter` means rule 2 never executes on a `/static/` URI that
+    carries the argument it would have blocked.
+    """
+    conf = write(tmp_path, """
+        SecRule REQUEST_URI "@beginsWith /static/" "id:1,phase:2,pass,nolog,skipAfter:END-CHECKS"
+        SecRule ARGS "@streq a" "id:2,phase:2,deny"
+        SecMarker "END-CHECKS"
+    """)
+    pairs = _pairs(conf, SHADOWING)
+    result = pairs[("1", "2")]
+    assert result.preemption == "skips over it"
+    assert result.result.value == "sat"
+    # `pass` is not an explicit accept, so this is not a disposition conflict;
+    # the verdict still changes, because nothing decides in rule 2's place.
+    assert result.dispositions_conflict is False
+    assert result.verdict_differs is True
+    assert result.holds is True
+    assert result.outcome == "shadowing"
+
+
+def test_shadowing_needs_no_target_in_common(tmp_path):
+    """The archetype: an allowlist on one collection pre-empting a deny on another.
+
+    Unlike intersection, shadowing is not a question about the two rules
+    reading the same data, so it is not refined to a common address --- doing
+    so would settle exactly this pair as "no common target".
+    """
+    conf = write(tmp_path, """
+        SecRule REMOTE_ADDR "@ipMatch 10.0.0.0/8" "id:1,phase:2,allow"
+        SecRule ARGS "@streq a" "id:2,phase:2,deny"
+    """)
+    encoding = encode_ruleset(conf)
+    p, q = _positions(encoding, "1", "2")
+    assert common_witness(encoding, p, q) == []
+
+    result = StatefulPairChecker(make_solver(), SHADOWING).check_pair(encoding, p, q)
+    assert result.derived is False
+    assert result.result.value == "sat"
+    assert result.holds is True
+    assert result.outcome == "shadowing"
+
+
+def test_no_shadowing_without_preemption(tmp_path):
+    """`fire_A and match_B` is not enough, and costs no solver call to reject.
+
+    Rule 1 is a `pass` that neither terminates nor skips, so rule 2 runs on
+    exactly the requests rule 1 fires on. The conditions overlap completely and
+    there is still no precedence to report.
+    """
+    conf = write(tmp_path, """
+        SecRule ARGS "@streq a" "id:1,phase:2,pass,nolog"
+        SecRule ARGS "@streq a" "id:2,phase:2,deny"
+    """)
+    encoding = encode_ruleset(conf)
+    p, q = _positions(encoding, "1", "2")
+    assert preempts(encoding, p, q) == ""
+
+    solver = make_solver()
+    result = StatefulPairChecker(solver, SHADOWING).check_pair(encoding, p, q)
+    assert result.derived is True
+    assert "cannot pre-empt" in result.derived_reason
+    assert result.holds is False
+    assert result.outcome == "no_shadowing"
+    assert result.elapsed_sec == 0.0
+
+
+def test_shadowing_ignores_a_redundant_deny(tmp_path):
+    """Two denies pre-empt each other, but the request is blocked either way.
+
+    That is redundancy, which subsumption is the analysis for; reporting it as
+    shadowing would bury the order-decided defects in CRS's overlapping denies.
+    """
+    conf = write(tmp_path, """
+        SecRule ARGS "@streq a" "id:1,phase:2,deny"
+        SecRule ARGS "@streq a" "id:2,phase:2,deny"
+    """)
+    pairs = _pairs(conf, SHADOWING)
+    result = pairs[("1", "2")]
+    assert result.preemption == "terminates"
+    assert result.result.value == "sat"
+    assert result.verdict_differs is False
+    assert result.holds is False
+    assert result.outcome == "overlap_no_conflict"
 
 
 def test_approximate_flag_set_when_a_side_is_abstracted(tmp_path):

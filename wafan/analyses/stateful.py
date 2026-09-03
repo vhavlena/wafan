@@ -19,11 +19,17 @@ using the whole-ruleset model from :mod:`wafan.state`.
     every member A matched among those B reads?
 
 ``shadowing``
-    For an earlier rule A and a later rule B whose dispositions conflict
-    (one accepts, one denies): is there a request where A fires *and* B would
-    also have matched? A is disruptive, so it ends the transaction and B's
-    opposite decision never happens. The outcome is decided by rule order
-    alone — which is the ordered-execution analogue of a contradiction.
+    For an earlier rule A that *pre-empts* a later rule B — A ends the
+    transaction, or A skips over B — is there a request where A fires *and* B
+    would also have matched? B never runs, so its decision is lost and the
+    outcome is settled by rule order alone, which is the ordered-execution
+    analogue of a contradiction.
+
+    Both halves are load-bearing. ``fire_A ∧ match_B`` on its own says
+    nothing about precedence: a ``pass`` rule that fires leaves B to run as
+    usual, so the query would hold for any overlapping pair whatever. The
+    pre-emption side condition is what makes it a statement about the pair,
+    and it is static — see :func:`preempts`.
 
 Why "shadowing" and not "contradiction"
     In an ordered model, two genuinely disruptive rules can never both fire:
@@ -31,16 +37,20 @@ Why "shadowing" and not "contradiction"
     unsatisfiable by construction and a literal "both fire with conflicting
     actions" query is vacuous. The real defect is not simultaneity but a
     silent precedence: two rules disagree about a request and the file order
-    quietly picks the winner. Querying ``fire_A ∧ match_B`` — B's match
-    condition with reachability factored out — is what exposes that, and is
+    quietly picks the winner. Querying ``fire_A ∧ match_B`` under pre-emption
+    — B's match condition with reachability factored out — is what exposes
+    that, and is
     why :class:`~wafan.state.StateEncoding` carries ``match`` terms separately
     from ``fire``.
 
 Two rules with no request variable in common can still interact through
 ``TX``, so nothing here is pruned by comparing variable *names*. What does
-settle a pair without a solver call is having no address in common at all
-(see :func:`common_witness`), which is the query's own answer rather than a
-filter in front of it. Everything else is a genuine O(n²) sweep of solver
+settle an ``intersection`` or ``subsumption`` pair without a solver call is
+having no address in common at all (see :func:`common_witness`), which is the
+query's own answer rather than a filter in front of it. Shadowing is the
+exception twice over: it is settled instead by pre-emption, and it is not
+refined to a common address at all, since two rules can share no data and
+still have one silently decide for the other. Everything else is a genuine O(n²) sweep of solver
 calls; :mod:`wafan.analyses.reachability` is O(n) and finds the dead-code
 class of defect, so prefer it for a first pass over a large ruleset, then use
 ``positions=`` here to focus on what it flagged.
@@ -120,6 +130,43 @@ def witness_incomplete(encoding: StateEncoding, p: int, q: int) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Pre-emption
+# ---------------------------------------------------------------------------
+
+
+def preempts(encoding: StateEncoding, p: int, q: int) -> str:
+    """How the directive at *p* stops the one at *q* running, or ``""``.
+
+    Shadowing is only a question about a pair when firing *p* is what keeps
+    *q* from executing, and there are exactly two ways for that to happen:
+
+    * *p* ends the transaction, so ``fire_p`` falsifies the ``alive`` chain at
+      every later position;
+    * *p* jumps over or removes *q* (``skipAfter``, ``skip``,
+      ``ctl:ruleRemoveById``), so ``reach_q`` carries ``(not fire_p)``
+      directly.
+
+    Either way ``fire_p ⇒ ¬reach_q``, which is why the query itself need not
+    assert ``¬reach_q``: doing so would also admit models where some *third*
+    directive between *p* and *q* is the one that terminated, reporting *p* as
+    the shadower of a rule it never pre-empted.
+
+    Nothing else counts. A ``pass`` rule that neither skips nor removes lets
+    *q* run on exactly the requests it fires on, so however much the two
+    patterns overlap there is no precedence to report --- and that is the
+    great majority of pairs, which is why this is checked before the solver
+    rather than after it.
+    """
+    if q <= p:
+        return ""
+    if encoding.order[p].terminates:
+        return "terminates"
+    if p in encoding.blocked_by.get(q, []):
+        return "skips over it"
+    return ""
+
+
 INTERSECTION = "intersection"
 SUBSUMPTION = "subsumption"
 SHADOWING = "shadowing"
@@ -149,6 +196,9 @@ class StatefulPairResult:
     # read, with no solver call needed (see StatefulPairChecker.check_pair).
     derived: bool = False
     derived_reason: str = ""
+    # Shadowing only: how the earlier directive stops the later one running
+    # ("terminates" / "skips over it"), or "" when it does not (see preempts).
+    preemption: str = ""
 
     @property
     def rule_ids(self) -> tuple[str, str]:
@@ -166,12 +216,36 @@ class StatefulPairResult:
         return set(self.dispositions) == {"allow", "deny"}
 
     @property
+    def verdict_differs(self) -> bool:
+        """Shadowing only: would the shadowed rule have decided differently?
+
+        :func:`preempts` has already settled that the later rule does not run;
+        this is the severity question layered on it. Two overlapping ``deny``
+        rules pre-empt each other all over CRS and the request is blocked
+        either way --- that is redundancy, and subsumption is the analysis for
+        it. What makes an order-decided outcome a defect is the verdict
+        changing.
+        """
+        first, second = self.dispositions
+        if second == "unknown":
+            # Nothing in the shadowed rule says what it would have decided, so
+            # losing it costs setvars and log lines but no verdict.
+            return False
+        if first == "unknown":
+            # An earlier directive with no explicit accept-or-deny still
+            # pre-empted this one --- by skipping over it, or by terminating
+            # with an action chain_disposition does not classify (redirect,
+            # proxy). Either way nothing decides the request in its place.
+            return True
+        return first != second
+
+    @property
     def holds(self) -> bool:
         """True when the queried relation holds for this pair."""
         if self.mode == SUBSUMPTION:
             return self.result == SolverResult.UNSAT
         if self.mode == SHADOWING:
-            return self.result == SolverResult.SAT and self.dispositions_conflict
+            return self.result == SolverResult.SAT and self.verdict_differs
         return self.result == SolverResult.SAT
 
     @property
@@ -188,7 +262,7 @@ class StatefulPairResult:
         if self.mode == SHADOWING:
             if self.result == SolverResult.UNSAT:
                 return "no_shadowing"
-            return "shadowing" if self.dispositions_conflict else "overlap_no_conflict"
+            return "shadowing" if self.verdict_differs else "overlap_no_conflict"
         # Not "both_fire"/"never_both_fire": the query asks whether one
         # member witnesses both, and two rules that overlap nowhere can still
         # fire in the same transaction on two different members.
@@ -216,11 +290,12 @@ class StatefulPairChecker:
         *refine* off falls back to the co-firing forms, which is what an
         incomplete address map leaves available.
 
-        None means the addresses alone decide it: for intersection and
-        shadowing there is no common one, so no member can witness both; for
-        subsumption there is nothing to contain, and what remains is whether
-        the first directive can fire at all --- a question about one rule,
-        which reachability answers.
+        None means the addresses alone decide it: for intersection there is no
+        common one, so no member can witness both; for subsumption there is
+        nothing to contain, and what remains is whether the first directive
+        can fire at all --- a question about one rule, which reachability
+        answers. Shadowing never returns None; what settles it without the
+        solver is pre-emption, which check_pair has already tested.
         """
         fire_p, fire_q = encoding.fire[p], encoding.fire[q]
         if self._mode == SUBSUMPTION:
@@ -234,11 +309,20 @@ class StatefulPairChecker:
             return [fire_p], [f"(not {fire_q})", *escaping]
 
         if self._mode == SHADOWING:
-            # p fires (and, being disruptive, ends the transaction) on a
-            # request that q would also have matched.
-            head = [fire_p, encoding.match[q]]
-        else:
-            head = [fire_p, fire_q]
+            # p fires on a request q would also have matched. That p firing is
+            # what keeps q from running is not asserted here: check_pair has
+            # already established it statically, and that is what makes
+            # `fire_p implies not reach_q` hold (see preempts).
+            #
+            # Deliberately *not* refined to a common witness. Unlike
+            # intersection, shadowing is not a question about the two rules
+            # reading the same data: the archetype is an allowlist on
+            # REMOTE_ADDR pre-empting a deny on ARGS, which shares no address
+            # with it at all. Demanding a common member would answer "no
+            # shadowing" for precisely the pairs the analysis exists to find.
+            return [fire_p, encoding.match[q]], []
+
+        head = [fire_p, fire_q]
         if not refine:
             return head, []
         shared = common_witness(encoding, p, q)
@@ -289,8 +373,42 @@ class StatefulPairChecker:
             if pos in encoding.abstracted
         ]
 
+        preemption = preempts(encoding, p, q) if self._mode == SHADOWING else ""
+        if self._mode == SHADOWING and not preemption:
+            # Settled by control flow, and cheaply: firing d1 leaves d2 to run,
+            # so file order decides nothing between them however much their
+            # conditions overlap. Checked ahead of the solver because it rules
+            # out most pairs -- `fire_p and match_q` on its own is satisfied by
+            # any overlapping pair whatever, which is why the pre-emption side
+            # condition belongs in the query rather than in a filter over its
+            # results (see preempts).
+            res = StatefulPairResult(
+                mode=self._mode,
+                directive1=d1,
+                directive2=d2,
+                position1=p,
+                position2=q,
+                result=SolverResult.UNSAT,
+                approximate=bool(reasons),
+                approximate_reasons=reasons,
+                derived=True,
+                derived_reason=(
+                    f"#{d1.rule_id} neither terminates nor skips over "
+                    f"#{d2.rule_id}: it cannot pre-empt it"
+                ),
+            )
+            if self._verbosity >= 1:
+                print(
+                    f"  #{d1.rule_id} {_SYMBOL[self._mode]} #{d2.rule_id}"
+                    f"  [{res.outcome}]  ({res.derived_reason})",
+                    flush=True,
+                )
+            return res
+
         incomplete = witness_incomplete(encoding, p, q)
-        if incomplete:
+        if incomplete and self._mode != SHADOWING:
+            # Shadowing is not refined to an address in the first place, so an
+            # incomplete map costs it no precision and the note would mislead.
             reasons.append(f"address map incomplete ({incomplete}): co-firing only")
         query = self._query(encoding, p, q, refine=not incomplete)
 
@@ -346,6 +464,7 @@ class StatefulPairChecker:
             ),
             approximate=bool(reasons),
             approximate_reasons=reasons,
+            preemption=preemption,
         )
         if self._verbosity >= 1:
             print(

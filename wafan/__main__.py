@@ -677,6 +677,8 @@ def _stateful_pair_json(res) -> dict:
         "approximate_reasons": res.approximate_reasons,
         "derived": res.derived,
         "derived_reason": res.derived_reason,
+        # Shadowing only: how the earlier rule pre-empts the later one.
+        "preemption": res.preemption,
         "elapsed_sec": round(res.elapsed_sec, 3),
         "error": res.error,
     }
@@ -736,7 +738,7 @@ def _run_stateful_pairs(
     heading = {
         "subsumption": "Pairs where every transaction firing A also fires B",
         "intersection": "Pairs that can both fire on one common member",
-        "contradiction": "Pairs where the earlier rule shadows a conflicting later one",
+        "contradiction": "Pairs where the earlier rule pre-empts a later one that decides differently",
     }[mode]
     if not holding:
         print(f"None found  ({len(results)} pair(s) checked).")
@@ -747,7 +749,10 @@ def _run_stateful_pairs(
             print(f"  {r.directive1.label()}")
             print(f"    {symbol}  {r.directive2.label()}{flag}")
     if derived:
-        print(f"\n{len(derived)} pair(s) settled without the solver (no common target).")
+        why = (
+            "no pre-emption" if mode == "contradiction" else "no common target"
+        )
+        print(f"\n{len(derived)} pair(s) settled without the solver ({why}).")
     if unknown:
         print(f"{len(unknown)} pair(s) returned unknown (solver timeout or unknown result).")
     for caveat in encoding.caveats():

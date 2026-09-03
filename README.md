@@ -131,9 +131,18 @@ wafan call a rule dead that a later request can fire.
 
 For pairs, `contradiction` changes shape rather than precision: in an ordered model
 two disruptive rules can never both fire, since the first ends the transaction, so
-the query becomes **shadowing** — "A fires on a request B would also have matched".
-The member-level readings above carry over, a member here being a *slot* of a
-collection's array (or a name, for `TX`).
+the query becomes **shadowing** — "A fires on a request B would also have matched,
+where A *pre-empts* B". Pre-emption is the side condition that makes this a
+statement about the pair: A ends the transaction, or A skips over B. Without it a
+`pass` rule would shadow every later rule it overlaps, since B runs anyway.
+
+Unlike `intersection`, shadowing is *not* refined to a common member, and the
+target-sharing pruning does not apply to it. The archetype shares no data at all —
+an `allow` on `REMOTE_ADDR` pre-empting a `deny` on `ARGS` — so requiring a common
+target would answer "no shadowing" for exactly the interesting pairs. A pair is
+reported when the verdict changes: two overlapping `deny` rules pre-empt each other
+and the request is blocked either way, which is redundancy for `subsumption` to
+find, not shadowing.
 
 ### Reachability
 
