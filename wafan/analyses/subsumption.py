@@ -29,8 +29,11 @@ from .common import (
     _operator_assertion,
     _print_smt_block,
     _rule_label,
-    chains_share_variable,
+    chain_escaping_witness,
+    chains_share_target,
     rules_share_variable,
+    solve_any,
+    solver_timed_out,
 )
 from .solver import SolverBackend, SolverResult
 
@@ -77,21 +80,51 @@ def subsumption_smt2(rule1: SecRule, rule2: SecRule) -> str:
     return "\n".join(lines)
 
 
+def subsumption_alternatives(
+    chain1: Sequence[SecRule],
+    chain2: Sequence[SecRule],
+    f1: SmtFormula,
+    f2: SmtFormula,
+) -> list[str]:
+    """The ways ``chain1 subsumed by chain2`` can fail, as a disjunction.
+
+    Either chain2 does not fire where chain1 does, or it does not match a
+    member chain1 matched. A single escaping term equal to ``chain1 and not
+    chain2`` is dropped: with one shared address that is what the first
+    disjunct already says under chain1's asserted condition.
+    """
+    refused = f"(not {f2.assertion})"
+    escaping = chain_escaping_witness(chain1, chain2)
+    if len(escaping) == 1 and escaping[0] == f"(and {f1.assertion} {refused})":
+        return [refused]
+    return [refused, *escaping]
+
+
 def chain_subsumption_smt2(
     chain1: Sequence[SecRule],
     chain2: Sequence[SecRule],
     f1: SmtFormula | None = None,
     f2: SmtFormula | None = None,
+    alternatives: Sequence[str] | None = None,
 ) -> str:
     """Return an SMT-LIB2 string that is UNSAT iff chain1 is subsumed by chain2.
 
-    Each chain matches only if all of its links match (logical AND, see
-    chain_to_smt). The query asks: does there exist an input that satisfies
-    chain1's conjunction but not chain2's?  If UNSAT, chain1 ⊆ chain2.
+    Subsumption is containment of witnesses: chain2 matches every member
+    chain1 matches, which is what makes chain1 redundant. So the refutation
+    asks for either of the two ways it can fail --- an input satisfying
+    chain1's conjunction but not chain2's, or an address at which chain1
+    matches and chain2 does not (see
+    :func:`~wafan.analyses.common.chain_escaping_witness`). Each chain matches
+    only if all of its links match (logical AND, see chain_to_smt), and both
+    conditions are evaluated against one request, the two sides sharing the
+    address symbols of every collection they both read.
 
-    Declarations for ModSecurity variables shared by name between the two
-    chains are merged, so both chains' conditions are evaluated against the
-    same request.
+    Containment is asked at the targets both chains read: a collection chain2
+    never looks at is no evidence that it misses anything, and counting it
+    would leave a chain guarded on ``TX:flag`` un-subsumable by the plain rule
+    whose pattern it repeats. Whether the pair shares a target at all is
+    settled before the query is built --- with none, containment is vacuous
+    and what is left is chain1's own satisfiability.
 
     *f1*/*f2* may be precomputed chain_to_smt() results (e.g. shared across
     multiple pairwise comparisons); if omitted, they are computed here. Their
@@ -102,13 +135,28 @@ def chain_subsumption_smt2(
     pair (see ``_joint_transform_preamble``) so that a transform shared by
     both chains gets exactly one, consistent declaration.
 
+    *alternatives* restricts the refutation to the given disjuncts, which is
+    how a caller asks about one of them at a time when the solver cannot
+    decide the whole disjunction --- and a refined refutation usually needs
+    that, a negated regex membership under a disjunction being where
+    z3-noodler gives up (see :func:`~wafan.analyses.common.solve_any`). By
+    default it is chain2 failing to fire, plus one escaping term per target
+    both chains read.
+
     Raises UnsupportedTransformError if any link uses an unknown transform.
     """
     f1 = f1 if f1 is not None else chain_to_smt(chain1)
     f2 = f2 if f2 is not None else chain_to_smt(chain2)
+    if alternatives is None:
+        alternatives = subsumption_alternatives(chain1, chain2, f1, f2)
 
     declarations = _merge_unique(f1.declarations, f2.declarations)
     fun_decls, axioms = _joint_transform_preamble(chain1, chain2)
+
+    refutation = (
+        alternatives[0] if len(alternatives) == 1
+        else "(or " + " ".join(alternatives) + ")"
+    )
 
     lines = [
         f"(set-logic {SMT_LOGIC})",
@@ -118,7 +166,7 @@ def chain_subsumption_smt2(
         *axioms,
         *declarations,
         f"(assert {f1.assertion})",
-        f"(assert (not {f2.assertion}))",
+        f"(assert {refutation})",
         "(check-sat)",
     ]
     return "\n".join(lines)
@@ -257,19 +305,43 @@ class SubsumptionChecker:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported operator)")
             return ChainSubsumptionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True, skip_reason="unsupported operator")
 
-        if not chains_share_variable(chain1, chain2):
+        if not chains_share_target(chain1, chain2):
+            # With no target in common there is nothing to contain: the
+            # query would degenerate into chain1's own satisfiability (with
+            # disjoint symbols, `F1 => F2` is valid iff F1 is unsatisfiable
+            # or F2 valid), so what is left is a dead-code question about one
+            # rule and not a relation between the pair. Reported as skipped
+            # rather than as a subsumption, so a dead chain doesn't come out
+            # "redundant" given every unrelated rule.
             if self._verbosity >= 1:
-                print(f"{prefix}  [{'skipped':<12}]  (no shared variable)")
-            return ChainSubsumptionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True, skip_reason="no shared variable")
+                print(f"{prefix}  [{'skipped':<12}]  (no common target)")
+            return ChainSubsumptionResult(
+                chain1, chain2, SolverResult.UNKNOWN,
+                skipped=True,
+                skip_reason="no common target: subsumption could only hold degenerately",
+            )
 
         try:
-            smt2 = chain_subsumption_smt2(chain1, chain2, f1, f2)
+            f1 = f1 if f1 is not None else chain_to_smt(chain1)
+            f2 = f2 if f2 is not None else chain_to_smt(chain2)
+            alternatives = subsumption_alternatives(chain1, chain2, f1, f2)
+            smt2 = chain_subsumption_smt2(chain1, chain2, f1, f2, alternatives)
         except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
             return ChainSubsumptionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True, skip_reason=str(exc))
 
+        timeouts = getattr(self._solver, "timeout_count", 0)
         result = self._solver.solve(smt2)
+        if (result == SolverResult.UNKNOWN and len(alternatives) > 1
+                and not solver_timed_out(self._solver, timeouts)):
+            # One way of failing at a time. The refutation is a disjunction
+            # carrying negated regex memberships, which the solver answers
+            # `unknown` to while deciding each branch of it.
+            result = solve_any(self._solver, [
+                chain_subsumption_smt2(chain1, chain2, f1, f2, [alt])
+                for alt in alternatives
+            ])
         if self._verbosity >= 1:
             outcome = {
                 SolverResult.UNSAT: "SUBSUMED",

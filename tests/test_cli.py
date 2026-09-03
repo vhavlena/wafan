@@ -18,7 +18,32 @@ class TestArgumentParser:
 
     def test_conf_positional(self):
         args = _build_parser().parse_args([str(REAL_CONF)])
-        assert args.conf == REAL_CONF
+        assert args.conf == [REAL_CONF]
+
+    def test_multiple_conf_paths_accepted(self):
+        """Include order matters for TX state, so several files can be passed."""
+        args = _build_parser().parse_args([str(REAL_CONF), str(REAL_CONF)])
+        assert args.conf == [REAL_CONF, REAL_CONF]
+
+    def test_analysis_reachability(self):
+        args = _build_parser().parse_args([str(REAL_CONF), "--analysis", "reachability"])
+        assert args.analysis == "reachability"
+
+    def test_stateful_defaults_off(self):
+        args = _build_parser().parse_args([str(REAL_CONF)])
+        assert args.stateful is False
+
+    def test_include_actions_defaults_off(self):
+        args = _build_parser().parse_args([str(REAL_CONF)])
+        assert args.include_actions is False
+
+    def test_include_actions_flag(self):
+        args = _build_parser().parse_args([str(REAL_CONF), "--include-actions"])
+        assert args.include_actions is True
+
+    def test_stateful_flag(self):
+        args = _build_parser().parse_args([str(REAL_CONF), "--stateful"])
+        assert args.stateful is True
 
     def test_default_analysis_is_subsumption(self):
         args = _build_parser().parse_args([str(REAL_CONF)])

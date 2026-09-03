@@ -324,6 +324,64 @@ CASES: list[E2ECase] = [
         not_subsumed={("701", "700"), ("700", "701")},
     ),
 
+    # ------------------------------------------------------------------
+    # Selectors on one collection: a pair's verdict has to be about the
+    # member they can share, not just about the request
+    # ------------------------------------------------------------------
+    E2ECase(
+        name="common_target_selectors",
+        rules=textwrap.dedent("""\
+            SecRule ARGS:id "@rx select" \
+                "id:9100,phase:2,deny,msg:'select in ARGS:id'"
+            SecRule ARGS:user "@rx select" \
+                "id:9200,phase:2,deny,msg:'select in ARGS:user'"
+            SecRule ARGS "@rx select" \
+                "id:9300,phase:2,deny,msg:'select in any argument'"
+            SecRule ARGS:/^id/ "@rx select" \
+                "id:9400,phase:2,deny,msg:'select in an id-prefixed argument'"
+        """),
+        intersecting={
+            _fs("9100", "9300"),  # an argument named id satisfies both
+            _fs("9100", "9400"),  # "id" matches the /^id/ selector
+            _fs("9300", "9400"),
+        },
+        disjoint={
+            # No single member is named both id and user, whatever the
+            # request carries -- the two rules can co-fire but never overlap.
+            _fs("9100", "9200"),
+        },
+        subsumed={
+            ("9100", "9300"),  # ARGS:id ⊆ ARGS: the same members, filtered
+            ("9200", "9300"),
+            ("9400", "9300"),
+            ("9100", "9400"),  # a literal name inside a regex selector
+        },
+        not_subsumed={
+            ("9300", "9100"),  # an argument named q matches 9300 only
+            ("9400", "9100"),  # ARGS:idx matches 9400 only
+            ("9100", "9200"),
+        },
+        has_witness={"9100", "9200", "9300", "9400"},
+    ),
+
+    # ------------------------------------------------------------------
+    # Overlapping target lists: co-firing is easy, overlapping is not
+    # ------------------------------------------------------------------
+    E2ECase(
+        name="common_target_multi_spec",
+        rules=textwrap.dedent("""\
+            SecRule ARGS|REQUEST_URI "@rx ^aaa$" \
+                "id:9500,phase:2,deny,msg:'aaa in ARGS or URI'"
+            SecRule REQUEST_URI|REQUEST_HEADERS "@rx ^bbb$" \
+                "id:9600,phase:2,deny,msg:'bbb in URI or headers'"
+        """),
+        # Both fire on a request whose ARGS is aaa and whose headers hold
+        # bbb, but their only common target is REQUEST_URI, which cannot be
+        # both -- so there is no member they both match.
+        disjoint={_fs("9500", "9600")},
+        has_witness={"9500", "9600"},
+    ),
+
 ]
 
 

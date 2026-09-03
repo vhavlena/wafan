@@ -29,8 +29,11 @@ from .common import (
     _operator_assertion,
     _print_smt_block,
     _rule_label,
-    chains_share_variable,
+    chain_common_witness,
+    chains_share_target,
     rules_share_variable,
+    solve_any,
+    solver_timed_out,
 )
 from .solver import SolverBackend, SolverResult
 
@@ -80,14 +83,19 @@ def chain_intersection_smt2(
     chain2: Sequence[SecRule],
     f1: SmtFormula | None = None,
     f2: SmtFormula | None = None,
+    alternatives: Sequence[str] | None = None,
 ) -> str:
-    """Return an SMT-LIB2 string that is SAT iff chain1 and chain2 have a
-    non-empty intersection (some input triggers both chains simultaneously).
+    """Return an SMT-LIB2 string that is SAT iff chain1 and chain2 intersect.
 
-    Each chain matches only if all of its links match (logical AND, see
-    chain_to_smt). Declarations for ModSecurity variables shared by name
-    between the two chains are merged, so both chains' conditions are
-    evaluated against the same request.
+    Intersecting means more than both firing on one request: some member of
+    some collection is matched by both chains. Each chain matches only if all
+    of its links match (logical AND, see chain_to_smt), and both conditions
+    are evaluated against one request --- the two sides share the address
+    symbols of every collection they both read --- with a third assertion
+    requiring a witness they have in common (see
+    :func:`~wafan.analyses.common.chain_common_witness`). Chains reading
+    disjoint targets therefore come out ``unsat``: they can co-occur, but they
+    do not overlap.
 
     *f1*/*f2* may be precomputed chain_to_smt() results (e.g. shared across
     multiple pairwise comparisons); if omitted, they are computed here. Their
@@ -98,10 +106,18 @@ def chain_intersection_smt2(
     pair (see ``_joint_transform_preamble``) so that a transform shared by
     both chains gets exactly one, consistent declaration.
 
+    *alternatives* restricts the shared-witness requirement to the given
+    terms, which is how a caller asks about one target at a time when the
+    solver cannot decide the whole disjunction (see
+    :func:`~wafan.analyses.common.solve_any`); by default every target both
+    chains read contributes one.
+
     Raises UnsupportedTransformError if any link uses an unknown transform.
     """
     f1 = f1 if f1 is not None else chain_to_smt(chain1)
     f2 = f2 if f2 is not None else chain_to_smt(chain2)
+    if alternatives is None:
+        alternatives = chain_common_witness(chain1, chain2)
 
     declarations = _merge_unique(f1.declarations, f2.declarations)
     fun_decls, axioms = _joint_transform_preamble(chain1, chain2)
@@ -115,8 +131,24 @@ def chain_intersection_smt2(
         *declarations,
         f"(assert {f1.assertion})",
         f"(assert {f2.assertion})",
-        "(check-sat)",
     ]
+    # A single term equal to the two conditions conjoined says nothing they
+    # do not: two single-target rules have one address to witness at, so
+    # asserting it again would only duplicate the formula.
+    implied = (
+        len(alternatives) == 1
+        and alternatives[0] == f"(and {f1.assertion} {f2.assertion})"
+    )
+    if not implied:
+        common = (
+            "false" if not alternatives
+            else alternatives[0] if len(alternatives) == 1
+            else "(or " + " ".join(alternatives) + ")"
+        )
+        lines.append("; and both must witness at one common address, which is what")
+        lines.append("; separates an overlap from two rules that merely co-fire")
+        lines.append(f"(assert {common})")
+    lines.append("(check-sat)")
     return "\n".join(lines)
 
 
@@ -258,19 +290,37 @@ class IntersectionChecker:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported operator)")
             return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True, skip_reason="unsupported operator")
 
-        if not chains_share_variable(chain1, chain2):
+        if not chains_share_target(chain1, chain2):
+            # Derived, not guessed: with no target in common the query's
+            # shared-witness assertion is `false` (see chain_common_witness),
+            # so the pair is disjoint whatever the two conditions say. The
+            # solver is skipped because the answer is already settled, not
+            # because the question was dodged.
             if self._verbosity >= 1:
-                print(f"{prefix}  [{'skipped':<12}]  (no shared variable)")
-            return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True, skip_reason="no shared variable")
+                print(f"{prefix}  [{'disjoint':<12}]  (no common target)")
+            return ChainIntersectionResult(
+                chain1, chain2, SolverResult.UNSAT,
+                skipped=True, skip_reason="no common target: witness sets are disjoint",
+            )
 
         try:
-            smt2 = chain_intersection_smt2(chain1, chain2, f1, f2)
+            alternatives = chain_common_witness(chain1, chain2)
+            smt2 = chain_intersection_smt2(chain1, chain2, f1, f2, alternatives)
         except (UnsupportedTransformError, UnsupportedOperatorError) as exc:
             if self._verbosity >= 1:
                 print(f"{prefix}  [{'skipped':<12}]  (unsupported transform: {exc})")
             return ChainIntersectionResult(chain1, chain2, SolverResult.UNKNOWN, skipped=True, skip_reason=str(exc))
 
+        timeouts = getattr(self._solver, "timeout_count", 0)
         result = self._solver.solve(smt2)
+        if (result == SolverResult.UNKNOWN and len(alternatives) > 1
+                and not solver_timed_out(self._solver, timeouts)):
+            # One target at a time: the disjunction over targets can defeat
+            # the solver where each of its branches does not.
+            result = solve_any(self._solver, [
+                chain_intersection_smt2(chain1, chain2, f1, f2, [alt])
+                for alt in alternatives
+            ])
         if self._verbosity >= 1:
             outcome = {
                 SolverResult.SAT: "INTERSECTING",

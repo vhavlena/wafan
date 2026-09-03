@@ -147,6 +147,10 @@ def _parse_get_value_output(text: str) -> dict[str, str] | None:
         ((VAR1 "value1")
          (VAR2 "value2"))
 
+    Integer bindings are printed unquoted and parsed too, since a ``&`` spec
+    reads a cardinality rather than a member value (see
+    ``wafan.smt.count_symbol``).
+
     Returns None if parsing fails.
     """
     result: dict[str, str] = {}
@@ -154,4 +158,6 @@ def _parse_get_value_output(text: str) -> dict[str, str] | None:
         name = m.group(1)
         value = m.group(2).replace('\\"', '"').replace("\\\\", "\\")
         result[name] = value
+    for m in _re.finditer(r"\((\w+)\s+(-?\d+)\)", text):
+        result.setdefault(m.group(1), m.group(2))
     return result if result else None

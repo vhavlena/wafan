@@ -2,231 +2,245 @@
 
 [![Test](https://github.com/vhavlena/wafan/actions/workflows/python-tests.yml/badge.svg)](https://github.com/vhavlena/wafan/actions/workflows/python-tests.yml)
 
-**wafan** is a command-line tool for analysing ModSecurity WAF rule files. Given a `.conf` file containing `SecRule` directives, it automatically checks whether rules overlap, subsume each other, or can be triggered at all — helping you catch redundancies, dead rules, and unexpected interactions before they affect a live deployment.
+**wafan** analyses ModSecurity WAF rule files with an SMT solver. Point it at your
+`.conf` files and it answers questions you cannot check by eye: which rules are
+redundant, which overlap, which can never fire, and what request triggers a given
+rule. Rule conditions are translated into formulas over the theory of strings, and
+the solver returns a proof or a counterexample.
 
-## What it does
-
-WAF rule sets grow large quickly, and subtle interactions between rules are hard to spot by eye. wafan uses an SMT solver to answer three questions about any pair of rules:
-
-- **Subsumption** — Is every request that triggers rule A also guaranteed to trigger rule B? If so, rule A is redundant given rule B (everything A blocks, B already blocks).
-- **Intersection** — Is there any request that triggers both rules at the same time? Overlapping rules may indicate redundancy or conflicting actions.
-- **Contradiction** — Like intersection, but does it also matter: is there a shared request where one rule accepts (`allow`/`pass`) and the other denies (`deny`/`drop`/`block`)? This flags genuine conflicts, not just harmless overlap.
-- **Witness** — What is a concrete example request that triggers each rule? This lets you verify a rule behaves as intended and generate test cases.
-
-The tool parses the rule file, translates each rule's matching conditions into a logical formula, and asks an SMT solver to find a proof or a counterexample. Results are printed directly to the terminal.
-
-## Requirements
-
-- Python ≥ 3.10
-- [z3-noodler](https://github.com/VeriFIT/z3-noodler) — an SMT solver with full support for the ECMA 2020 regex standard used by ModSecurity `@rx` rules. Standard `z3` works only for rules using non-regex operators (`@streq`, `@contains`, etc.).
-
-  You don't need to install it yourself: on first run, wafan automatically downloads a prebuilt `z3-noodler` binary matching your platform (Linux x86_64, macOS arm64, or macOS x86_64) and caches it under `~/.cache/wafan` (`~/Library/Caches/wafan` on macOS). On other platforms (e.g. Windows, Linux ARM), or if the download fails, wafan falls back to a `z3` binary on `PATH`. Use `--no-auto-solver` to skip the download and always use `--solver`/`WAFAN_Z3_PATH`/`z3`.
-
-  To pre-fetch the binary ahead of time (e.g. in a CI job or Docker image build, so the first real run doesn't need network access), run:
-
-  ```bash
-  wafan-download-solver
-  ```
-
-  Pass `--version TAG` to fetch a specific z3-noodler release instead of the pinned default (or set `WAFAN_Z3_NOODLER_VERSION`).
-
-## Installation
+## Install
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install .
 ```
 
-After installation the `wafan` command is available in the activated virtual environment. You can also run it without installing: `python -m wafan`.
+Regex rules (`@rx`) need [z3-noodler](https://github.com/VeriFIT/z3-noodler), which
+supports the ECMA 2020 regex dialect ModSecurity uses; mainstream `z3` handles only
+the non-regex operators. You don't have to install it: on first run wafan downloads
+a prebuilt binary for your platform (Linux x86_64, macOS arm64/x86_64) and caches it
+under `~/.cache/wafan` (`~/Library/Caches/wafan` on macOS). Run
+`wafan-download-solver` to pre-fetch it (CI, Docker builds), or `--no-auto-solver`
+to use `--solver`/`WAFAN_Z3_PATH`/`z3` instead.
 
 ## Usage
 
 ```
-wafan [options] <conf>
+wafan [options] <conf> [<conf> ...]
 ```
 
-| Argument | Default | Description |
+Pass the `.conf` files **in the order the web server includes them** — `crs-setup.conf`
+first, so its `SecAction` initialisers are visible to the rules that read them.
+
+| Option | Default | Description |
 |---|---|---|
-| `conf` | *(required)* | Path to the ModSecurity `.conf` file to analyse |
-| `--analysis` | `subsumption` | Which analysis to run: `subsumption`, `intersection`, `contradiction`, or `witness` |
-| `--solver PATH` | *(auto)* | Path to the SMT solver binary. Falls back to the `WAFAN_Z3_PATH` environment variable, then an auto-downloaded `z3-noodler` build, then `z3` on `PATH`. |
-| `--no-auto-solver` | off | Disable the automatic `z3-noodler` download; use `--solver`/`WAFAN_Z3_PATH`/`z3` instead |
-| `--solver-args ARGS` | *(none)* | Extra space-separated flags forwarded to the solver |
-| `--timeout SEC` | `30` | Per-query solver time limit in seconds |
-| `-v` | off | Verbose: print each rule (pair) being checked and its result |
-| `-v2` | off | Like `-v`, but also print the raw SMT formula for each query |
+| `--analysis` | `subsumption` | `subsumption`, `intersection`, `contradiction`, `witness` or `reachability` |
+| `--stateful` | off | Analyse the ruleset as an ordered program with `TX` as mutable state; `reachability` implies it |
+| `--include-actions` | off | Also analyse `SecAction` directives, not just rules |
+| `--solver PATH` | *(auto)* | Solver binary; falls back to `WAFAN_Z3_PATH`, the downloaded z3-noodler, then `z3` |
+| `--no-auto-solver` | off | Never download a solver |
+| `--solver-args ARGS` | *(none)* | Extra flags forwarded to the solver |
+| `--timeout SEC` | `30` | Per-query solver time limit |
+| `--json` | off | Newline-delimited JSON instead of a report, flushed per result — for batch runs |
+| `-v` / `-v2` | off | Print each pair and its verdict; `-v2` also prints the SMT formula |
 
 ## Analyses
 
-### Subsumption
+| Analysis | Question |
+|---|---|
+| `subsumption` | Does rule B match every member rule A matches? Then A is redundant. |
+| `intersection` | Is there one member both rules match? |
+| `contradiction` | Do they overlap *and* disagree — one accepts, the other denies? |
+| `witness` | What concrete input triggers each rule? |
+| `reachability` | Can this rule ever fire at all? |
 
-Finds rule pairs where one rule's trigger set is entirely contained within another's. If rule R1 is subsumed by rule R2 (written R1 ⊆ R2), then every request that matches R1 also matches R2. This often indicates a redundant, overly specific rule.
+```console
+$ wafan rules/01-subsumption-basic.conf --analysis subsumption
+Subsumed pairs  (4 found)
 
-```bash
-wafan rules/my-rules.conf --solver z3-noodler --analysis subsumption
-```
-
-Example output:
-```
-Subsumed pairs  (2 found)
-
-  ARGS @rx ^select$  [id:1100]
-    ⊆  ARGS @rx select|insert|delete  [id:1200]
-
-  ARGS @rx select|insert|delete  [id:1200]
-    ⊆  ARGS @rx .+  [id:1400]
-
-4 pair(s) checked and found not subsumed.
-```
-
-### Intersection
-
-Finds rule pairs that share at least one common triggering input. Intersecting rules may indicate redundancy or — when the rules have conflicting actions — unexpected behaviour.
-
-```bash
-wafan rules/my-rules.conf --solver z3-noodler --analysis intersection
-```
-
-Example output:
-```
-Intersecting pairs  (4 found)
-
-  ARGS @rx select  [id:1100]
-    ∩  ARGS @rx select|insert|delete  [id:1200]
-
-  ARGS @rx select  [id:1100]
-    ∩  ARGS @rx .+  [id:1400]
-
+  #1100 [ARGS @rx "select"]
+    ⊆  #1200 [ARGS @rx "select|insert|delete"]
+  #1300 [ARGS @rx "union"]
+    ⊆  #1400 [ARGS @rx ".+"]
   ...
 
-2 pair(s) checked and found disjoint.
-```
+8 pair(s) checked and found not subsumed.
 
-### Contradiction
-
-Like intersection, but with an extra check: it only flags a pair if the two rules also disagree on what to do with the shared input — one rule's actions accept it (`allow`/`pass`) while the other's deny it (`deny`/`drop`/`block`). This surfaces genuine conflicts between rules rather than mere harmless overlap.
-
-```bash
-wafan rules/my-rules.conf --solver z3-noodler --analysis contradiction
-```
-
-Example output:
-```
-Contradicting pairs  (1 found)
-
-  ARGS @rx select  [id:1100]  [deny]
-    ⨯  ARGS @rx .+  [id:1450]  [allow]
-
-3 intersecting pair(s) with no action conflict, 2 disjoint pair(s) checked.
-```
-
-### Witness
-
-Finds a concrete example string that would trigger each rule. Useful for writing test cases, verifying that a new rule actually fires, or understanding what a complex regex matches in practice.
-
-```bash
-wafan rules/my-rules.conf --solver z3-noodler --analysis witness
-```
-
-Example output:
-```
-Concrete triggering inputs  (3 rule(s))
-
-  ARGS @rx select  [id:1100]
-    ARGS = "select"
-
-  ARGS @rx select|insert|delete  [id:1200]
-    ARGS = "select"
-
-  ARGS @rx .+  [id:1400]
-    ARGS = "a"
-
-Rules that never match  (0)
-```
-
-## Worked example
-
-The `rules/` directory contains annotated example rule files. Here is a complete walkthrough using `rules/01-subsumption-basic.conf`, which defines four SQL-keyword detection rules:
-
-```apache
-SecRule ARGS "@rx select"          "id:1100, phase:2, deny"
-SecRule ARGS "@rx select|insert|delete"  "id:1200, phase:2, deny"
-SecRule ARGS "@rx union"           "id:1300, phase:2, deny"
-SecRule ARGS "@rx .+"              "id:1400, phase:2, deny"
-```
-
-**Find all overlapping rule pairs:**
-
-```bash
-wafan rules/01-subsumption-basic.conf --solver z3-noodler --analysis intersection -v
-```
-
-```
-Loaded 4 rules from rules/01-subsumption-basic.conf
-──────────────────────────────────────────────────────────────────
-Intersecting pairs  (4 found)
-
-  ARGS @rx select  [id:1100]
-    ∩  ARGS @rx select|insert|delete  [id:1200]
-
-  ARGS @rx select  [id:1100]
-    ∩  ARGS @rx .+  [id:1400]
-
-  ARGS @rx select|insert|delete  [id:1200]
-    ∩  ARGS @rx .+  [id:1400]
-
-  ARGS @rx union  [id:1300]
-    ∩  ARGS @rx .+  [id:1400]
-
-2 pair(s) checked and found disjoint.
-```
-
-This immediately shows that rule 1400 (`.+`) overlaps with everything — it is a catch-all that fires on any non-empty input. Rules 1100 and 1300 are disjoint (a request containing "select" will never contain only "union" and vice versa).
-
-**Generate example triggering inputs:**
-
-```bash
-wafan rules/01-subsumption-basic.conf --solver z3-noodler --analysis witness
-```
-
-```
+$ wafan rules/01-subsumption-basic.conf --analysis witness
 Concrete triggering inputs  (4 rule(s))
 
-  ARGS @rx select  [id:1100]
-    ARGS = "select"
-
-  ARGS @rx select|insert|delete  [id:1200]
-    ARGS = "select"
-
-  ARGS @rx union  [id:1300]
-    ARGS = "union"
-
-  ARGS @rx .+  [id:1400]
-    ARGS = "a"
+  #1100 [ARGS @rx "select"]
+    ARGS = 'select'
+  ...
 ```
+
+### Overlap is about members, not requests
+
+A rule's condition is existential over the members its targets resolve to, so
+"both rules fire" is weaker than "both rules match the same thing". Two rules on
+`ARGS` both fire on `?x=select&y=union` while matching different arguments; two
+rules on unrelated targets both fire on a request that happens to satisfy each.
+Neither is an overlap, so the queries ask for a **shared witness**:
+
+- `ARGS:id` and `ARGS:user` never intersect — no member is named both.
+- `ARGS:id` does intersect `ARGS`, on a member named `id` matching both patterns,
+  and is *subsumed* by it: the same members, filtered.
+- `ARGS|REQUEST_URI` against `REQUEST_URI|REQUEST_HEADERS` intersects only if one
+  URI satisfies both patterns.
+- Rules sharing no target are reported disjoint (for subsumption, skipped) without
+  a solver call: with no member in common the verdict is already settled.
+
+The solver decides all of this, rather than a comparison of target names: every
+spec on a collection reads the same member, with a selector as a constraint on its
+name (`ARGS:/^id/` against `ARGS:idx` is a regex question). A `&` count is the
+exception — it reads how many members there are, not what one of them says, so it
+never supplies a shared witness. For subsumption, coverage is judged where B
+looks: a chain guarded on `TX:flag` is still subsumed by the plain rule repeating
+its pattern, since deleting it changes no verdict.
+
+## Stateful analysis
+
+By default rules are compared over free variables — right for request-derived
+targets like `ARGS`, whose values a client picks freely, wrong for `TX`, which
+exists only because an earlier rule ran `setvar`. `--stateful` (and
+`reachability`, which always uses it) instead walks the ruleset in ModSecurity's
+execution order and derives, per directive,
+
+```
+fire_p  = reach_p ∧ match_p
+reach_p = no earlier rule ended the transaction, and nothing skipped or removed p
+```
+
+with `TX` in SSA form, so each write is a new version guarded by its writer's own
+firing condition: `v_tx_score_2 = (ite fire_17 (+ v_tx_score_1 5) v_tx_score_1)`.
+
+| Construct | Handling |
+|---|---|
+| Execution order | Phases 1→5, file order within a phase |
+| `SecAction` | Fires whenever reached, running its `setvar` initialisers |
+| `skipAfter:M` / `SecMarker` / `skip:N` | Firing the skip suppresses what it jumps over |
+| `ctl:ruleRemoveById=X` | Suppresses rule `X` for the rest of the transaction |
+| `deny` / `drop` / `allow` / `redirect` / `proxy` | Ends the transaction |
+| `setvar:tx.x=V`, `=+V`, `=-V`, `!tx.x` | New SSA version; typed `Int` or `String` by inference |
+| `&TX:x`, `%{tx.x}` | Count and value at the reader's position — including as an operator argument, which is what makes `@lt %{tx.threshold}` analysable |
+| `ARGS`, `REQUEST_HEADERS`, … | Bounded array of members; scalars like `REQUEST_METHOD` stay single-valued |
+| `IP` / `SESSION` / `USER` / `GLOBAL` | Like `TX`, but with an **unknown** initial state — ModSecurity persists them across requests |
+
+Only `TX` is assumed to start empty; pinning a persistent collection to 0 would let
+wafan call a rule dead that a later request can fire.
+
+For pairs, `contradiction` changes shape rather than precision: in an ordered model
+two disruptive rules can never both fire, since the first ends the transaction, so
+the query becomes **shadowing** — "A fires on a request B would also have matched,
+where A *pre-empts* B". Pre-emption is the side condition that makes this a
+statement about the pair: A ends the transaction, or A skips over B. Without it a
+`pass` rule would shadow every later rule it overlaps, since B runs anyway.
+
+Unlike `intersection`, shadowing is *not* refined to a common member, and the
+target-sharing pruning does not apply to it. The archetype shares no data at all —
+an `allow` on `REMOTE_ADDR` pre-empting a `deny` on `ARGS` — so requiring a common
+target would answer "no shadowing" for exactly the interesting pairs. A pair is
+reported when the verdict changes: two overlapping `deny` rules pre-empt each other
+and the request is blocked either way, which is redundancy for `subsumption` to
+find, not shadowing.
+
+### Reachability
+
+Separates **unreachable** (control flow never gets there) from
+**impossible_match** (it runs, but the condition cannot hold given the state the
+ruleset can produce). In this `example.conf`, nothing writes `tx.crs_setup_version`,
+so the guard holds, the skip fires, and the initialiser it jumps over never runs:
+
+```apache
+SecRule &TX:crs_setup_version "@eq 0" "id:901001,phase:1,pass,skipAfter:END-SETUP"
+SecAction                             "id:901100,phase:1,pass,setvar:tx.paranoia_level=1"
+SecMarker "END-SETUP"
+SecRule TX:paranoia_level "@ge 2"     "id:942100,phase:2,deny"
+```
+
+```console
+$ wafan example.conf --analysis reachability
+Dead rules  (1 of 2 checked)
+
+  Executed, but the condition can never hold:
+    #942100 [TX:paranoia_level @ge "2"]  line 4
+```
+
+`SecAction`s are excluded by default — being unconditional, their reachability is a
+fact about control flow rather than about the directive. `--include-actions` checks
+them too, which is usually what explains the dead rules downstream: here the skip
+above `#901100` means its `setvar` never runs, which is *why* `#942100`'s guard can
+never hold.
+
+```console
+$ wafan example.conf --analysis reachability --include-actions
+Dead directives  (2 of 3 checked)
+
+  Never executed (control flow):
+    SecAction #901100  line 2
+
+  Executed, but the condition can never hold:
+    #942100 [TX:paranoia_level @ge "2"]  line 4
+```
+
+Reachability costs O(n) solver calls, which makes it the practical first pass over
+a large ruleset: run it, then point the `--stateful` pairwise analyses at what it
+flagged.
+
+### Collections as bounded arrays
+
+ModSecurity applies an operator to *every* member of a target, so a collection is a
+list of `(name, value)` pairs and not one value: `?x=a&y=b` fires a chain demanding
+`ARGS "@streq a"` and `ARGS "@streq b"`, which a single-value model reports dead.
+Each multi-valued collection therefore becomes `k` slots carrying a value, a name
+and a presence flag, and a match is a disjunction over the live ones. `ARGS`,
+`ARGS:id`, `ARGS:/re/`, `!ARGS:/re/` and `ARGS_NAMES` all read that one array,
+which is what makes `ARGS:id ⊆ ARGS` and `&ARGS = &ARGS_NAMES` hold by
+construction; scalars keep a single value, so no chain can demand a request that is
+both `GET` and `POST`. `k` is derived per target from the widest chain and any
+literal cardinality bound — past a small ceiling a target stays *open* instead, its
+count bounded below rather than exact, and each run names the targets affected. See
+`wafan/state.py` for the derivation and `wafan/targets.py` for how specs resolve.
+
+### Soundness and cost
+
+Anything the encoder cannot model faithfully — an unsupported operator, an
+unresolvable macro, `ctl:ruleRemoveTargetById` — is over-approximated, so **a rule
+reported dead is genuinely dead**, while a rule reported live may only be beyond
+the model's precision. Such results carry an `approximate` flag, and each run
+prints its caveats:
+
+```
+note: 4 directive(s) abstracted to a free Boolean (unsupported construct); they are assumed able to fire
+```
+
+Most CRS files finish well under a second. The slow ones are dominated by
+individual hard queries — a large `@pmFromFile` phrase list, or `t:urlDecodeUni`,
+whose precise definition is one rewrite pass per BMP codepoint. Cap them with
+`--timeout`.
 
 ## Supported rule features
 
-wafan supports the most common ModSecurity rule constructs:
+**Operators:** `@rx`, `@streq`, `@contains`, `@beginsWith`, `@endsWith`, `@within`,
+`@pm`, `@pmFromFile`, and `@eq`/`@ge`/`@gt`/`@le`/`@lt`, each with optional `!`.
 
-**Operators:** `@rx` (regex), `@streq` (exact match), `@contains` (substring), `@beginsWith`, `@endsWith`, `@within`, `@pm` (phrase match), `@eq`/`@ge`/`@gt`/`@le`/`@lt` (numeric comparison). All operators support `!` negation.
+**Transforms (`t:`):** exact in SMT — `lowercase`, `uppercase`, `urlDecode`,
+`urlDecodeUni`, `htmlEntityDecode`, `none`; approximated by uninterpreted functions
+with partial axioms — `trim`, `trimLeft`, `trimRight`, `removeWhitespace`,
+`compressWhitespace`, `removeNulls`, `normalizePath`, `normalizePathWin`.
 
-**Transforms (`t:`):** Three levels of support:
+**Chains:** a chain is one unit that fires only when every link matches.
 
-- *Precisely formalized in SMT:* `lowercase`, `uppercase`, `htmlEntityDecode`, `urlDecode`, `urlDecodeUni`, `none`
-- *Accepted but approximated* (modeled as uninterpreted functions with partial axioms — analysis results may be imprecise): `removeWhitespace`, `compressWhitespace`, `removeNulls`, `trim`, `trimLeft`, `trimRight`, `normalizePath`, `normalizePathWin`
+Rules using anything unsupported are skipped and reported as unknown.
 
-**Rule chaining:** Chained rules (linked with the `chain` action) are treated as a single unit — a chain fires only when all of its links match, mirroring ModSecurity semantics.
+## OWASP Core Rule Set
 
-Rules that use unsupported operators or transforms are skipped and reported as unknown.
-
-## Running on OWASP ModSecurity Core Rule Set
-
-The `owasp-rules/` directory contains the OWASP CRS rule files. You can run any analysis directly against them:
+`owasp-rules/` holds the CRS files, `rules/` small annotated examples.
 
 ```bash
-wafan owasp-rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf \
-      --solver z3-noodler --analysis intersection -v
+wafan crs-setup.conf owasp-rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf \
+      --analysis intersection -v
 ```
 
-Note that large rule files with many rules will produce a large number of pairwise checks. Use `--timeout` to cap the time spent per query.
+A large file means many pairwise checks, so start with `reachability` and use
+`--timeout`.
